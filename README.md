@@ -101,6 +101,23 @@ Choose a different adapter or scan duration when needed:
 
 The tool prints each matching device's family, Bluetooth address, advertised name, and signal strength. It does not connect to or modify any device.
 
+## MQTT check
+
+Use the MQTT check tool to verify the broker connection and observe project topics:
+
+```sh
+.venv/bin/python tools/mqtt_check.py
+```
+
+Choose a different broker, credentials, topic prefix, or wait time when needed:
+
+```sh
+.venv/bin/python tools/mqtt_check.py \
+	--host localhost --port 1883 --base-topic rv --timeout 5
+```
+
+The tool subscribes to `<base-topic>/#` and prints retained or live topics received during the check. MQTT does not provide a portable command to list empty topics, so a topic with no retained message and no activity during the timeout cannot be reported by this tool.
+
 ## Configuration
 
 Edit only the sections for hardware installed in the RV. Source settings use `enabled = true` or `enabled = false`.
