@@ -85,6 +85,22 @@ rv-control --verbose --config config.ini run
 
 Stop a foreground process with `Ctrl+C`. The process stops source threads, disconnects MQTT, and exits cleanly.
 
+## Bluetooth discovery
+
+Use the lightweight discovery tool to find nearby devices that advertise names associated with Renogy or Hughes Power Watchdog hardware:
+
+```sh
+.venv/bin/python tools/bt_discovery.py
+```
+
+Choose a different adapter or scan duration when needed:
+
+```sh
+.venv/bin/python tools/bt_discovery.py --adapter hci0 --timeout 15
+```
+
+The tool prints each matching device's family, Bluetooth address, advertised name, and signal strength. It does not connect to or modify any device.
+
 ## Configuration
 
 Edit only the sections for hardware installed in the RV. Source settings use `enabled = true` or `enabled = false`.
