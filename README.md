@@ -21,11 +21,11 @@ The editable install provides both `rv-control` and `rvcontrol` commands. The eq
 
 ## Commands
 
-Copy the example configuration before editing it:
+Copy the anonymized example configuration to create your local configuration:
 
 ```sh
-cp config.ini config.local.ini
-$EDITOR config.local.ini
+cp config-example.ini config.ini
+$EDITOR config.ini
 ```
 
 Show the available global options and commands:
@@ -41,22 +41,22 @@ rv-control run --help
 Validate the configuration without opening CAN, Bluetooth, or MQTT connections:
 
 ```sh
-rv-control --config config.local.ini check
+rv-control --config config.ini check
 ```
 
-The check command prints the resolved config path and whether each source is enabled. All sources are disabled in the example configuration, so the expected output is similar to:
+The check command prints the resolved config path and whether each source is enabled. With the supplied example configuration, the expected output is similar to:
 
 ```text
-Configuration OK: /path/to/config.local.ini
+Configuration OK: /path/to/config.ini
 rv_c: disabled
 renogy: disabled
-hughes: disabled
+hughes: enabled
 ```
 
 Check communications for every configured source without starting the service:
 
 ```sh
-rv-control --config config.local.ini comms-check
+rv-control --config config.ini comms-check
 ```
 
 Enabled RV-C checks open and close the configured SocketCAN interface and verify the DGN spec file. Enabled Bluetooth checks contact the local Bluetooth stack, scan for the configured device address, and verify its advertised name when configured. The command exits with status `1` if an enabled source fails.
@@ -66,7 +66,7 @@ Renogy's communication check also lists the register blocks exposed by the confi
 Interrogate every enabled source to perform live reads and print all returned attributes as formatted JSON:
 
 ```sh
-rv-control --config config.local.ini interrogate
+rv-control --config config.ini interrogate
 ```
 
 Renogy interrogation connects once, reads every register block defined by the configured Renogy client type, and prints the decoded state. Hughes connects once, waits for a complete notification packet, and prints its decoded power attributes. RV-C listens for `interrogate_seconds` (10 by default), decodes received DGN frames, and prints the latest state for each DGN/source combination. The command exits with status `1` if an enabled source cannot be interrogated.
@@ -74,13 +74,13 @@ Renogy interrogation connects once, reads every register block defined by the co
 Run the collectors in the foreground:
 
 ```sh
-rv-control --config config.local.ini run
+rv-control --config config.ini run
 ```
 
 Enable diagnostic logging while troubleshooting hardware or MQTT connections:
 
 ```sh
-rv-control --verbose --config config.local.ini run
+rv-control --verbose --config config.ini run
 ```
 
 Stop a foreground process with `Ctrl+C`. The process stops source threads, disconnects MQTT, and exits cleanly.
@@ -108,8 +108,8 @@ write_enabled = false
 [renogy]
 enabled = true
 adapter = hci0
-mac_addr = 10:CA:BF:AA:96:EC
-alias = BT-TH-BFAA96EC
+mac_addr = AA:BB:CC:DD:EE:FF
+alias = BT-TH-EXAMPLE
 type = RNG_CTRL
 device_id = 255
 max_retry = 3
@@ -129,7 +129,7 @@ The Renogy section is self-contained. `type` can be `RNG_CTRL`, `RNG_CTRL_HIST`,
 enabled = true
 adapter = hci0
 address = AA:BB:CC:DD:EE:FF
-name = PMD      082CF8E30C
+name = PMD-EXAMPLE
 persistent_connection =
 topic = hughes
 write_enabled = false
@@ -236,8 +236,6 @@ Stop or restart the daemon with:
 sudo systemctl stop rv-control
 sudo systemctl restart rv-control
 ```
-
-## Attribution
 
 ## Third-party acknowledgements
 
