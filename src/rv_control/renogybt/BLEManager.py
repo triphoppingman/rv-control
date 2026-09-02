@@ -1,0 +1,95 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import sys
+from typing import Any, Awaitable, Callable
+from bleak import BleakClient, BleakScanner, BLEDevice
+
+DISCOVERY_TIMEOUT = 5 # max wait time to complete the bluetooth scanning (seconds)
+
+class BLEManager:
+    def __init__(self, mac_address: str, alias: str, on_data: Callable[[bytes | bytearray], Awaitable[None]], on_connect_fail: Callable[[Any], None], on_disconnect: Callable[[], None], write_service_uuid: str, notify_char_uuid: str, write_char_uuid: str, adapter: str = 'hci0') -> None:
+        """Configure BLE discovery, connection callbacks, and characteristic identifiers."""
+        self.mac_address = mac_address
+        self.device_alias = alias
+        self.adapter = adapter
+        self.data_callback = on_data
+        self.connect_fail_callback = on_connect_fail
+        self.disconnect_callback = on_disconnect
+        self.write_service_uuid = write_service_uuid
+        self.notify_char_uuid = notify_char_uuid
+        self.write_char_uuid = write_char_uuid
+        self.write_char_handle = None
+        self.device: BLEDevice = None
+        self.client: BleakClient = None
+        self.discovered_devices = []
+        self._intentional_disconnect = False
+
+    async def discover(self) -> None:
+        """Discover the configured BLE device and retain the matching device record."""
+        mac_address = self.mac_address.upper()
+        logging.info("Starting discovery...")
+        self.discovered_devices = await BleakScanner.discover(timeout=DISCOVERY_TIMEOUT, adapter=self.adapter)
+        logging.info("Devices found: %s", len(self.discovered_devices))
+
+        for dev in self.discovered_devices:
+            if dev.address != None and (dev.address.upper() == mac_address or (dev.name and dev.name.strip() == self.device_alias)):
+                logging.info(f"Found matching device {dev.name} => {dev.address}")
+                self.device = dev
+
+    async def connect(self) -> None:
+        """Connect to the discovered device and subscribe to its notifications."""
+        if not self.device: return logging.error("No device connected!")
+
+        self._intentional_disconnect = False
+        self.client = BleakClient(self.device, disconnected_callback=self._on_disconnected)
+        try:
+            await self.client.connect()
+            logging.info(f"Client connection: {self.client.is_connected}")
+            if not self.client.is_connected: return logging.error("Unable to connect")
+
+            for service in self.client.services:
+                for characteristic in service.characteristics:
+                    if characteristic.uuid == self.notify_char_uuid:
+                        await self.client.start_notify(characteristic,  self.notification_callback)
+                        logging.info(f"subscribed to notification {characteristic.uuid}")
+                    if characteristic.uuid == self.write_char_uuid and service.uuid == self.write_service_uuid:
+                        self.write_char_handle = characteristic.handle
+                        logging.info(f"found write characteristic {characteristic.uuid}, service {service.uuid}")
+
+        except Exception:
+            logging.error(f"Error connecting to device")
+            self.connect_fail_callback(sys.exc_info())
+
+    def _on_disconnected(self, client: Any) -> None:
+        """Notify the owner when the BLE client disconnects unexpectedly."""
+        if self._intentional_disconnect:
+            logging.info("Disconnected intentionally.")
+        else:
+            logging.warning(f"Unexpected disconnect from device: {client.address}")
+            if self.disconnect_callback:
+                self.disconnect_callback()
+
+    async def notification_callback(self, characteristic: Any, data: bytearray) -> None:
+        """Forward one BLE notification payload to the asynchronous data callback."""
+        logging.info("notification_callback")
+        await self.data_callback(data)
+
+    async def characteristic_write_value(self, data: bytes | bytearray | list[int]) -> None:
+        """Write a request to the configured characteristic and allow its response time."""
+        try:
+            logging.info(f'writing to {self.write_char_uuid} {data}')
+            await self.client.write_gatt_char(self.write_char_handle, bytearray(data), response=False)
+            logging.info('characteristic_write_value succeeded')
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            logging.info(f'characteristic_write_value failed {e}')
+
+    async def disconnect(self) -> None:
+        """Mark shutdown intentional and disconnect the active BLE client."""
+        if self.client:
+            self._intentional_disconnect = True
+            if self.client.is_connected:
+                logging.info(f"Exit: Disconnecting device: {self.device.name} {self.device.address}")
+                await self.client.disconnect()

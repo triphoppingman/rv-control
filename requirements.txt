@@ -1,0 +1,6 @@
+click>=8.1
+paho-mqtt>=2.0
+python-can>=4.3
+ruamel.yaml>=0.18
+bleak>=0.22
+pytest>=8.0

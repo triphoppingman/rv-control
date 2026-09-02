@@ -1,0 +1,15 @@
+[Unit]
+Description=RV Control telemetry service
+After=network-online.target bluetooth.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/rv-control
+ExecStart=/opt/rv-control/.venv/bin/rv-control --config /opt/rv-control/config.ini run
+Restart=always
+RestartSec=10
+User=rv-control
+
+[Install]
+WantedBy=multi-user.target
