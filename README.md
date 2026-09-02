@@ -262,3 +262,92 @@ This project explicitly acknowledges and incorporates work from the following op
 - [IAmTheMitchell/Hughes-Power-Watchdog](https://github.com/IAmTheMitchell/Hughes-Power-Watchdog): Hughes Power Watchdog BLE protocol reference and device-generation behavior. The standalone implementation in `src/rv_control/hughes.py` follows that protocol documentation. The upstream project is licensed under the [MIT License](https://github.com/IAmTheMitchell/Hughes-Power-Watchdog/blob/main/LICENSE).
 
 The copied and derived components under `src/rv_control` retain the applicable upstream license notices. When redistributing this project, preserve those notices and continue to provide the upstream license terms for the corresponding components.
+
+## Raspberry Pi 4 addendum
+
+The service is intended to run on Raspberry Pi OS 64-bit on a Raspberry Pi 4. The following host details are important:
+
+### Operating-system packages
+
+Install the system packages required by SocketCAN, Bluetooth, Mosquitto, and Python virtual environments:
+
+```sh
+sudo apt update
+sudo apt install -y \
+	can-utils bluez bluetooth mosquitto python3-venv python3-dev build-essential
+```
+
+Enable and start the local broker and Bluetooth service:
+
+```sh
+sudo systemctl enable --now mosquitto
+sudo systemctl enable --now bluetooth
+```
+
+### MCP2515 and SocketCAN
+
+An MCP2515 board needs a matching device-tree overlay, oscillator frequency, and interrupt GPIO for the specific CAN board. Do not copy those values blindly from another board. On current Raspberry Pi OS releases, edit `/boot/firmware/config.txt`; older releases may use `/boot/config.txt`.
+
+For example, a board using a 16 MHz oscillator and GPIO 25 may require a line similar to:
+
+```ini
+dtoverlay=mcp2515-can0,oscillator=16000000,interrupt=25
+```
+
+Reboot after changing the overlay, then bring up the interface with the bitrate required by the RV-C installation:
+
+```sh
+sudo reboot
+sudo ip link set can0 up type can bitrate 250000
+ip -details link show can0
+```
+
+The bitrate must match the RV-C network. Confirm the interface before starting the service:
+
+```sh
+ip link show can0
+candump can0
+```
+
+If `can0` is missing, check the overlay name, oscillator value, interrupt GPIO wiring, SPI enablement, and `dmesg` output before troubleshooting this application.
+
+### Bluetooth and permissions
+
+The Renogy and Hughes sources use BlueZ through the `hci0` adapter by default. Confirm the adapter is powered and visible:
+
+```sh
+bluetoothctl list
+bluetoothctl show
+```
+
+When running under systemd, the service account must be able to access the Bluetooth stack and SocketCAN device. Add the account to the relevant groups on the image, commonly `bluetooth`, `dialout`, and `gpio` where applicable, then log out and back in or restart the service. Keep the adapter setting explicit if more than one adapter is installed:
+
+```ini
+[renogy]
+adapter = hci0
+
+[hughes]
+adapter = hci0
+```
+
+Run `comms-check` interactively first. It performs fresh discovery and is useful for confirming that the Pi sees the configured BLE addresses before enabling daemon mode.
+
+### Installation location and service startup
+
+For a system service, install the project at a stable path such as `/opt/rv-control`, use a virtual environment inside that directory, and ensure `deploy/rv-control.service` points to the same path. Copy `config-example.ini` to the service account's `config.ini`; do not place passwords or real device identifiers in the example file.
+
+The Pi's onboard Bluetooth and SPI devices can take a moment to appear during boot. The supplied systemd unit starts after `bluetooth.target` and `network-online.target`; `Restart=always` and `RestartSec=10` allow the process to recover from early hardware or broker availability failures.
+
+### Raspberry Pi troubleshooting
+
+Use these checks before changing application settings:
+
+```sh
+systemctl status bluetooth mosquitto
+rfkill list
+ip -details link show can0
+dmesg | grep -Ei 'mcp2515|can0|spi|bluetooth'
+sudo journalctl -u rv-control -f
+```
+
+Avoid running multiple Bluetooth clients against the same Renogy or Hughes device at once. Mobile applications can hold the device connection and prevent the Pi from connecting.
