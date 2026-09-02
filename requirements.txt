@@ -4,3 +4,4 @@ python-can>=4.3
 ruamel.yaml>=0.18
 bleak>=0.22
 pytest>=8.0
+requests

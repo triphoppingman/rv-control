@@ -126,7 +126,7 @@ class HughesSource(Source, source_name="hughes"):
                 raise ValueError("[hughes] address is required")
             asyncio.run(self._run_ble(BleakClient, address))
         except Exception:
-            LOGGER.exception("Hughes source stopped")
+            LOGGER.exception("Hughes source instance %s stopped", self.section_name)
 
     async def _run_ble(self, client_class: Callable[..., Any], address: str) -> None:
         """Maintain a Hughes session, reconnecting with bounded exponential backoff."""
@@ -159,14 +159,23 @@ class HughesSource(Source, source_name="hughes"):
     async def _run_ble_session(self, client_class: Callable[..., Any], address: str, section: Any) -> None:
         """Run one Hughes notification session until the shared stop event is set."""
         async with client_class(address) as client:
-            def callback(_sender: Any, payload: bytearray) -> None:
-                """Decode a notification and publish it under the Hughes topic."""
-                decoded = self.decode(bytes(payload))
-                if decoded:
-                    self.publisher.publish(section.get("topic", "hughes"), decoded)
             services = client.services
             modern = any(str(service.uuid).lower() == "000000ff-0000-1000-8000-00805f9b34fb" for service in services)
             tx = "0000ff01-0000-1000-8000-00805f9b34fb" if modern else "0000ffe2-0000-1000-8000-00805f9b34fb"
+            legacy_buffer = bytearray()
+
+            def callback(_sender: Any, payload: bytearray) -> None:
+                """Buffer and decode notifications, publishing complete measurements."""
+                nonlocal legacy_buffer
+                data = bytes(payload)
+                decoded = self.decode(data)
+                if decoded is None and not modern:
+                    legacy_buffer.extend(data)
+                    if len(legacy_buffer) >= 40:
+                        decoded = self.decode(bytes(legacy_buffer[:40]))
+                        del legacy_buffer[:40]
+                if decoded:
+                    self.publisher.publish(section.get("topic", "hughes"), decoded)
             await client.start_notify(tx, callback)
             if modern:
                 await client.write_gatt_char(tx, b"!%!%,protocol,open,")

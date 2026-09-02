@@ -101,6 +101,7 @@ class Source(threading.Thread, ABC):
         source_map = {}
         for name, source_type in cls.enabled_sources(config):
             source = source_type(config, publisher, stop_event, name)
+            LOGGER.info("Starting source instance %s (%s)", name, source_type.source_name)
             source.start()
             sources.append(source)
             source_map[name] = source
