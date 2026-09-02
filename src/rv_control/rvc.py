@@ -64,7 +64,7 @@ class RvcSource(Source, source_name="rvc"):
 
     def handle_command(self, payload: dict[str, Any]) -> None:
         """Validate and send a configured RV-C CAN command when writes are enabled."""
-        section = self.config["rv_c"]
+        section = self.section
         if not section.getboolean("write_enabled", fallback=False) or self.bus is None:
             LOGGER.warning("RV-C write ignored because it is disabled or unavailable")
             return
@@ -83,7 +83,7 @@ class RvcSource(Source, source_name="rvc"):
         import can
         from ruamel.yaml import YAML
 
-        section = self.config["rv_c"]
+        section = self.section
         with open(section["specfile"], encoding="utf-8") as handle:
             spec = YAML(typ="safe").load(handle)
         duration = section.getfloat("interrogate_seconds", fallback=10.0)
@@ -112,7 +112,7 @@ class RvcSource(Source, source_name="rvc"):
 
     def comms_check(self) -> dict[str, Any]:
         """Validate the RV-C specification and test access to the configured CAN bus."""
-        section = self.config["rv_c"]
+        section = self.section
         try:
             import can
             from ruamel.yaml import YAML
@@ -129,7 +129,7 @@ class RvcSource(Source, source_name="rvc"):
         try:
             import can
             from ruamel.yaml import YAML
-            section = self.config["rv_c"]
+            section = self.section
             with open(section["specfile"], encoding="utf-8") as handle:
                 spec = YAML(typ="safe").load(handle)
             self.bus = can.Bus(interface="socketcan", channel=section.get("interface", "can0"))

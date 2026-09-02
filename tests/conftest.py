@@ -15,17 +15,19 @@ port = 1883
 base_topic = rv
 write_enabled = true
 
+[source]
+enabled-sources = renogy
+
 [rv_c]
-enabled = false
 interface = can0
 specfile = src/rv_control/data/rvc-spec.yml
 
 [renogy]
-enabled = true
+type = renogy
+device-type = RNG_CTRL
 adapter = hci0
 mac_addr = 10:CA:BF:AA:96:EC
 alias = BT-TH-BFAA96EC
-type = RNG_CTRL
 device_id = 255
 max_retry = 3
 persistent_connection =
@@ -35,7 +37,7 @@ temperature_unit = F
 fields =
 
 [hughes]
-enabled = false
+type = hughes
 adapter = hci0
 address =
 name =

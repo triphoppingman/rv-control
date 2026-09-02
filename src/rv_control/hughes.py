@@ -45,14 +45,14 @@ class HughesSource(Source, source_name="hughes"):
 
     def interrogate(self) -> dict[str, Any]:
         """Connect once and return the first complete power measurement."""
-        address = self.config["hughes"].get("address", "").strip()
+        address = self.section.get("address", "").strip()
         if not address:
             raise ValueError("Hughes address is required")
         return asyncio.run(self._interrogate_ble(address))
 
     async def _comms_check(self) -> dict[str, Any]:
         """Discover the configured Hughes device and report protocol capabilities."""
-        section = self.config["hughes"]
+        section = self.section
         try:
             from bleak import BleakScanner
             address = section.get("address", "").strip()
@@ -77,7 +77,7 @@ class HughesSource(Source, source_name="hughes"):
         """Connect to one Hughes device and await its first complete measurement."""
         from bleak import BleakClient
 
-        section = self.config["hughes"]
+        section = self.section
         packet = asyncio.get_running_loop().create_future()
         legacy_buffer = bytearray()
         async with BleakClient(address) as client:
@@ -121,7 +121,7 @@ class HughesSource(Source, source_name="hughes"):
         """Run the Hughes collector and log failures that stop its thread."""
         try:
             from bleak import BleakClient
-            address = self.config["hughes"].get("address")
+            address = self.section.get("address")
             if not address:
                 raise ValueError("[hughes] address is required")
             asyncio.run(self._run_ble(BleakClient, address))
@@ -130,7 +130,7 @@ class HughesSource(Source, source_name="hughes"):
 
     async def _run_ble(self, client_class: Callable[..., Any], address: str) -> None:
         """Maintain a Hughes session, reconnecting with bounded exponential backoff."""
-        section = self.config["hughes"]
+        section = self.section
         persistent = section.get("persistent_connection", "").strip()
         if not persistent:
             persistent = self.config["service"].get("daemon_mode", "true")

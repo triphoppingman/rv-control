@@ -43,5 +43,5 @@ def test_mqtt_command_routes_to_source() -> None:
     config = ConfigParser()
     config["mqtt"] = {"base_topic": "rv", "write_enabled": "true"}
     source = SourceStub()
-    _handle_command(config, {"renogy": source}, "rv/renogy/set", {"register": 256})
+    _handle_command(config, {"renogy_controller": source}, "rv/renogy_controller/set", {"register": 256})
     assert source.payload == {"register": 256}

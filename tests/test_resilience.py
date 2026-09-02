@@ -20,9 +20,10 @@ def test_source_supervisor_restarts_dead_source() -> None:
         config_section = "fake"
         instances = 0
 
-        def __init__(self, _config: Any, _publisher: Any, event: threading.Event) -> None:
+        def __init__(self, _config: Any, _publisher: Any, event: threading.Event, section_name: str = "fake") -> None:
             """Track fake instances and retain the supervisor stop event."""
             self.event = event
+            self.section_name = section_name
             RestartableSource.instances += 1
 
         def start(self) -> None:
@@ -49,6 +50,18 @@ def test_renogy_config_propagates_adapter_and_one_shot_mode(config_file: Path) -
     client_config = source._client_config(persistent_connection=False)
     assert client_config["device"]["adapter"] == "hci1"
     assert client_config["device"]["persistent_connection"] == "false"
+
+
+def test_multiple_source_sections_resolve_by_type(config_file: Path) -> None:
+    """Verify multiple configured sections instantiate the selected source type."""
+    config = load_config(str(config_file))
+    config["source"]["enabled-sources"] = "renogy_controller, renogy_battery"
+    config["renogy_controller"] = dict(config["renogy"])
+    config["renogy_battery"] = dict(config["renogy"])
+    configured = Source.enabled_sources(config)
+    source_map = {name: source_type(config, None, threading.Event(), name) for name, source_type in configured}
+    assert set(source_map) == {"renogy_controller", "renogy_battery"}
+    assert all(isinstance(source, RenogySource) for source in source_map.values())
 
 
 def test_hughes_reconnects_after_session_failure(config_file: Path) -> None:

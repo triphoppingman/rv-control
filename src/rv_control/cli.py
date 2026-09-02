@@ -30,8 +30,10 @@ def cli(context: click.Context, config_path: str, verbose: bool) -> None:
 def check(config: Any) -> None:
     """Validate configuration without opening hardware connections."""
     click.echo(f"Configuration OK: {config['_meta']['path']}")
-    for section in ("rv_c", "renogy", "hughes"):
-        click.echo(f"{section}: {'enabled' if config[section].getboolean('enabled') else 'disabled'}")
+    for section in config["source"].get("enabled-sources", "").split(","):
+        section = section.strip()
+        if section:
+            click.echo(f"{section}: {config[section].get('type', 'missing type')}")
 
 
 @cli.command("comms-check")

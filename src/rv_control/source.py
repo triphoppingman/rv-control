@@ -48,43 +48,50 @@ class Source(threading.Thread, ABC):
         return tuple(sorted(cls._registry))
 
     @classmethod
-    def enabled_sources(cls, config: ConfigParser) -> tuple[type[Source], ...]:
-        """Return registered source classes enabled by configuration."""
-        return tuple(
-            source_type
-            for source_type in cls._registry.values()
-            if config.has_section(source_type.config_section)
-            and config[source_type.config_section].getboolean("enabled", fallback=False)
-        )
+    def enabled_sources(cls, config: ConfigParser) -> tuple[tuple[str, type[Source]], ...]:
+        """Return configured source instances as section names and source classes."""
+        if not config.has_section("source"):
+            raise ValueError("Missing required [source] configuration section")
+        names = [name.strip() for name in config["source"].get("enabled-sources", "").split(",") if name.strip()]
+        if len(names) != len(set(names)):
+            raise ValueError("[source] enabled-sources contains duplicate sections")
+        sources = []
+        for name in names:
+            if not config.has_section(name):
+                raise ValueError(f"Enabled source section not found: {name}")
+            source_name = config[name].get("type", "").strip()
+            if not source_name:
+                raise ValueError(f"Source section [{name}] requires type")
+            sources.append((name, cls.source_class(source_name)))
+        return tuple(sources)
 
     @classmethod
     def create(cls, name: str, config: ConfigParser, publisher: Any, stop_event: threading.Event) -> Source:
-        """Construct a registered source by name."""
-        return cls.source_class(name)(config, publisher, stop_event)
+        """Construct a configured source instance by its section name."""
+        source_name = config[name].get("type", "").strip()
+        if not source_name:
+            raise ValueError(f"Source section [{name}] requires type")
+        return cls.source_class(source_name)(config, publisher, stop_event, name)
 
     @classmethod
     def check_communications(cls, config: ConfigParser) -> dict[str, dict[str, Any]]:
         """Run communication checks for every registered source."""
         results = {}
-        for name, source_type in cls._registry.items():
-            section = config[source_type.config_section]
-            if not section.getboolean("enabled", fallback=False):
-                results[name] = {"ok": True, "message": "disabled"}
-                continue
-            results[name] = source_type(config, None, threading.Event()).comms_check()
+        for name, source_type in cls.enabled_sources(config):
+            results[name] = source_type(config, None, threading.Event(), name).comms_check()
         return results
 
     @classmethod
     def interrogate_enabled(cls, config: ConfigParser) -> dict[str, dict[str, Any]]:
         """Interrogate every enabled source and return per-source results."""
         results = {}
-        for source_type in cls.enabled_sources(config):
-            source = source_type(config, None, threading.Event())
+        for name, source_type in cls.enabled_sources(config):
+            source = source_type(config, None, threading.Event(), name)
             try:
-                results[source_type.source_name] = {"ok": True, "data": source.interrogate()}
+                results[name] = {"ok": True, "data": source.interrogate()}
             except Exception as error:
-                LOGGER.exception("%s interrogation failed", source_type.source_name)
-                results[source_type.source_name] = {"ok": False, "message": str(error)}
+                LOGGER.exception("%s interrogation failed", name)
+                results[name] = {"ok": False, "message": str(error)}
         return results
 
     @classmethod
@@ -92,11 +99,11 @@ class Source(threading.Thread, ABC):
         """Start enabled sources and return them indexed by config section."""
         sources = []
         source_map = {}
-        for source_type in cls.enabled_sources(config):
-            source = source_type(config, publisher, stop_event)
+        for name, source_type in cls.enabled_sources(config):
+            source = source_type(config, publisher, stop_event, name)
             source.start()
             sources.append(source)
-            source_map[source_type.config_section] = source
+            source_map[name] = source
         return sources, source_map
 
     @classmethod
@@ -107,11 +114,11 @@ class Source(threading.Thread, ABC):
                 if source.is_alive() or stop_event.is_set():
                     continue
                 source_type = type(source)
-                LOGGER.error("Source %s stopped; restarting it", source_type.source_name)
-                replacement = source_type(config, publisher, stop_event)
+                LOGGER.error("Source %s stopped; restarting it", source.section_name)
+                replacement = source_type(config, publisher, stop_event, source.section_name)
                 replacement.start()
                 sources[index] = replacement
-                source_map[source_type.config_section] = replacement
+                source_map[replacement.section_name] = replacement
             stop_event.wait(1)
 
     @staticmethod
@@ -124,12 +131,18 @@ class Source(threading.Thread, ABC):
     def comms_check(self) -> dict[str, Any]:
         """Check local connectivity and configured device availability."""
 
-    def __init__(self, config: ConfigParser, publisher: Any, stop_event: threading.Event) -> None:
+    def __init__(self, config: ConfigParser, publisher: Any, stop_event: threading.Event, section_name: str | None = None) -> None:
         """Initialize a daemon source thread with shared configuration and shutdown state."""
-        super().__init__(name=self.source_name, daemon=True)
         self.config = config
+        self.section_name = section_name or self.config_section
+        super().__init__(name=self.section_name, daemon=True)
         self.publisher = publisher
         self.stop_event = stop_event
+
+    @property
+    def section(self) -> Any:
+        """Return this source instance's configuration section."""
+        return self.config[self.section_name]
 
     @abstractmethod
     def run(self) -> None:

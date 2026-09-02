@@ -23,14 +23,14 @@ class RenogySource(Source, source_name="renogy"):
         "RNG_SHNT": ("rv_control.renogybt.ShuntClient", "ShuntClient"),
     }
 
-    def __init__(self, config: Any, publisher: Any, stop_event: Any) -> None:
+    def __init__(self, config: Any, publisher: Any, stop_event: Any, section_name: str | None = None) -> None:
         """Initialize the Renogy source and defer BLE client creation until run time."""
-        super().__init__(config, publisher, stop_event)
+        super().__init__(config, publisher, stop_event, section_name)
         self.client = None
 
     def handle_command(self, payload: dict[str, Any]) -> None:
         """Validate and forward an enabled Renogy write command to the BLE client."""
-        section = self.config["renogy"]
+        section = self.section
         if not section.getboolean("write_enabled", fallback=False) or self.client is None or self.client.loop is None:
             LOGGER.warning("Renogy write ignored because it is disabled or unavailable")
             return
@@ -57,9 +57,9 @@ class RenogySource(Source, source_name="renogy"):
     def interrogate(self) -> dict[str, Any]:
         """Connect once, read all configured registers, and return the payload."""
         renogy_config = self._client_config(persistent_connection=False)
-        client_info = self.CLIENTS.get(renogy_config["device"].get("type", ""))
+        client_info = self.CLIENTS.get(renogy_config["device"].get("device_type", ""))
         if not client_info:
-            raise ValueError(f"Unknown Renogy device type: {renogy_config['device'].get('type')}")
+            raise ValueError(f"Unknown Renogy device type: {renogy_config['device'].get('device_type')}")
         module_name, class_name = client_info
         module = __import__(module_name, fromlist=[class_name])
         result = {}
@@ -77,7 +77,7 @@ class RenogySource(Source, source_name="renogy"):
 
     async def _comms_check(self) -> dict[str, Any]:
         """Discover the configured Renogy device and report its communication status."""
-        section = self.config["renogy"]
+        section = self.section
         try:
             from bleak import BleakScanner
             from configparser import ConfigParser
@@ -103,7 +103,7 @@ class RenogySource(Source, source_name="renogy"):
         """Build the BLE client configuration from source and service settings."""
         from configparser import ConfigParser
 
-        section = self.config["renogy"]
+        section = self.section
         renogy_config = ConfigParser(inline_comment_prefixes=("#",))
         if persistent_connection is None:
             persistent_connection = section.get("persistent_connection", "").strip()
@@ -115,7 +115,7 @@ class RenogySource(Source, source_name="renogy"):
             "adapter": section.get("adapter", "hci0"),
             "mac_addr": section.get("mac_addr", ""),
             "alias": section.get("alias", ""),
-            "type": section.get("type", "RNG_CTRL"),
+            "device_type": section.get("device-type", "RNG_CTRL"),
             "device_id": section.get("device_id", "255"),
             "max_retry": section.get("max_retry", "3"),
             "persistent_connection": persistent_connection,
@@ -133,7 +133,7 @@ class RenogySource(Source, source_name="renogy"):
 
     def _register_inventory(self, renogy_config: Any) -> list[dict[str, Any]]:
         """Describe the selected client’s readable registers and write commands."""
-        device_type = renogy_config["device"].get("type", "")
+        device_type = renogy_config["device"].get("device_type", "")
         client_info = self.CLIENTS.get(device_type)
         if not client_info:
             return []
@@ -161,11 +161,11 @@ class RenogySource(Source, source_name="renogy"):
     def run(self) -> None:
         """Start Renogy collection and log failures that terminate the source thread."""
         try:
-            section = self.config["renogy"]
+            section = self.section
             renogy_config = self._client_config()
-            client_info = self.CLIENTS.get(renogy_config["device"].get("type", ""))
+            client_info = self.CLIENTS.get(renogy_config["device"].get("device_type", ""))
             if not client_info:
-                raise ValueError(f"Unknown Renogy device type: {renogy_config['device'].get('type')}")
+                raise ValueError(f"Unknown Renogy device type: {renogy_config['device'].get('device_type')}")
             module_name, class_name = client_info
             child = __import__(module_name, fromlist=[class_name])
 

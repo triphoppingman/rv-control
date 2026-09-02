@@ -120,7 +120,7 @@ The tool subscribes to `<base-topic>/#` and prints retained or live topics recei
 
 ## Configuration
 
-Edit only the sections for hardware installed in the RV. Source settings use `enabled = true` or `enabled = false`.
+Edit only the sections for hardware installed in the RV. List enabled source sections in `[source]`; each listed section selects its implementation with `type`.
 
 ```ini
 [mqtt]
@@ -131,19 +131,21 @@ username =
 password =
 write_enabled = false
 
+[source]
+enabled-sources = renogy_controller
+
 [rv_c]
-enabled = true
 interface = can0
 specfile = src/rv_control/data/rvc-spec.yml
 parameterized_strings = true
 write_enabled = false
 
-[renogy]
-enabled = true
+[renogy_controller]
+type = renogy
+device-type = RNG_CTRL
 adapter = hci0
 mac_addr = AA:BB:CC:DD:EE:FF
 alias = BT-TH-EXAMPLE
-type = RNG_CTRL
 device_id = 255
 max_retry = 3
 persistent_connection =
@@ -155,11 +157,11 @@ topic = renogy
 write_enabled = false
 ```
 
-The Renogy section is self-contained. `type` can be `RNG_CTRL`, `RNG_CTRL_HIST`, `RNG_BATT`, `RNG_INVT`, `RNG_INVT_HF`, `RNG_DCC`, or `RNG_SHNT`. Use the Bluetooth adapter's address format exactly as reported by discovery tools. An empty `persistent_connection` inherits `[service] daemon_mode`; it defaults to enabled for daemon operation. When enabled, the initial BLE discovery is reused across reconnects instead of scanning again. Persistent mode also keeps polling active, so use `enable_polling = true` for continuous daemon telemetry.
+The Renogy section is self-contained. `device-type` can be `RNG_CTRL`, `RNG_CTRL_HIST`, `RNG_BATT`, `RNG_INVT`, `RNG_INVT_HF`, `RNG_DCC`, or `RNG_SHNT`. Use the Bluetooth adapter's address format exactly as reported by discovery tools. An empty `persistent_connection` inherits `[service] daemon_mode`; it defaults to enabled for daemon operation. When enabled, the initial BLE discovery is reused across reconnects instead of scanning again. Persistent mode also keeps polling active, so use `enable_polling = true` for continuous daemon telemetry.
 
 ```ini
-[hughes]
-enabled = true
+[hughes_power_watchdog]
+type = hughes
 adapter = hci0
 address = AA:BB:CC:DD:EE:FF
 name = PMD-EXAMPLE
@@ -202,14 +204,14 @@ mosquitto_pub -h localhost -t rv/rv_c/set \
 Send a raw Renogy BLE request:
 
 ```sh
-mosquitto_pub -h localhost -t rv/renogy/set \
+mosquitto_pub -h localhost -t rv/renogy_controller/set \
 	-m '{"bytes":"FF0301000022D1F1"}'
 ```
 
 Ask Renogy to generate a Modbus read request with its CRC:
 
 ```sh
-mosquitto_pub -h localhost -t rv/renogy/set \
+mosquitto_pub -h localhost -t rv/renogy_controller/set \
 	-m '{"register":256,"words":34,"function":3}'
 ```
 
