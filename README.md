@@ -237,6 +237,15 @@ Before enabling RV-C, confirm SocketCAN is available:
 ip link show can0
 ```
 
+Monitor RV-C traffic with decoded fields using:
+
+```sh
+PYTHONPATH=src .venv/bin/python tools/rvc_monitor.py
+PYTHONPATH=src .venv/bin/python tools/rvc_monitor.py --interface can1
+```
+
+The monitor prints every CAN frame in a candump-style format. Extended RV-C frames include the DGN name, source address, and decoded values; non-RV-C frames are shown as raw frames.
+
 Before enabling Bluetooth sources, confirm the adapter and device are visible:
 
 ```sh
