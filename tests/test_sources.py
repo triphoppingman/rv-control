@@ -8,6 +8,7 @@ from typing import Any
 from rv_control.config import load_config
 from rv_control.hughes import HughesSource
 from rv_control.renogy import RenogySource
+from rv_control.rvc import RvcSource
 from rv_control.source import Source
 
 
@@ -15,6 +16,16 @@ def test_source_registry_contains_concrete_sources() -> None:
     """Verify concrete telemetry sources are present in the source registry."""
     assert set(Source.list_sources()) >= {"hughes", "renogy", "rvc"}
     assert Source.source_class("renogy") is RenogySource
+
+
+def test_rvc_source_accepts_named_instance_section(config_file: Path) -> None:
+    """Verify RVC sources accept the section name used by the source manager."""
+    config = load_config(str(config_file))
+    config["source"]["enabled-sources"] = "rv_c_bus"
+    config["rv_c_bus"] = dict(config["renogy"])
+    config["rv_c_bus"]["type"] = "rvc"
+    source = RvcSource(config, None, threading.Event(), "rv_c_bus")
+    assert source.section_name == "rv_c_bus"
 
 
 def test_renogy_persistent_mode_enables_polling(config_file: Path) -> None:

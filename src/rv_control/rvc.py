@@ -57,9 +57,9 @@ class RvcSource(Source, source_name="rvc"):
     source_name = "rvc"
     config_section = "rv_c"
 
-    def __init__(self, config: Any, publisher: Any, stop_event: Any) -> None:
+    def __init__(self, config: Any, publisher: Any, stop_event: Any, section_name: str | None = None) -> None:
         """Initialize the RV-C source without opening the CAN bus yet."""
-        super().__init__(config, publisher, stop_event)
+        super().__init__(config, publisher, stop_event, section_name)
         self.bus = None
 
     def handle_command(self, payload: dict[str, Any]) -> None:
