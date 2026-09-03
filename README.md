@@ -246,6 +246,25 @@ PYTHONPATH=src .venv/bin/python tools/rvc_monitor.py --interface can1
 
 The monitor prints every CAN frame in a candump-style format. Extended RV-C frames include the DGN name, source address, and decoded values; non-RV-C frames are shown as raw frames.
 
+Read the controller date and time with:
+
+```sh
+PYTHONPATH=src .venv/bin/python tools/rvc_datetime.py
+```
+
+Set the controller date and time from the host clock with:
+
+```sh
+PYTHONPATH=src .venv/bin/python tools/rvc_datetime.py -s
+```
+
+The utility uses `can0` by default. Select another interface with `--interface` or provide a custom RV-C specification file as the final argument:
+
+```sh
+PYTHONPATH=src .venv/bin/python tools/rvc_datetime.py --interface can1
+PYTHONPATH=src .venv/bin/python tools/rvc_datetime.py /path/to/rvc-spec.yml
+```
+
 Before enabling Bluetooth sources, confirm the adapter and device are visible:
 
 ```sh
