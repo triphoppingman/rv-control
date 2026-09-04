@@ -130,3 +130,65 @@ def test_hughes_daemon_buffers_fragmented_legacy_packet(config_file: Path) -> No
     asyncio.run(source._run_ble_session(FakeClient, "AA:BB:CC:DD:EE:FF", source.section))
     assert published[0][0] == "hughes"
     assert published[0][1]["voltage"] == 120
+
+
+def test_hughes_daemon_combines_50a_legacy_legs(config_file: Path) -> None:
+    """Verify a 50A Hughes unit publishes both legacy legs in one MQTT message."""
+    config = load_config(str(config_file))
+    config["hughes"]["circuit_amps"] = "50"
+    published = []
+    source = HughesSource(config, type("Publisher", (), {"publish": lambda _self, topic, data: published.append((topic, data))})(), threading.Event(), "hughes")
+
+    def packet(line: int, voltage: int, current: int, energy: int) -> bytearray:
+        """Build one complete legacy packet for the requested electrical leg."""
+        data = bytearray(40)
+        data[:3] = b"\x01\x03\x20"
+        data[3:7] = voltage.to_bytes(4, "big", signed=True)
+        data[7:11] = current.to_bytes(4, "big", signed=True)
+        data[11:15] = (voltage * current).to_bytes(4, "big", signed=True)
+        data[15:19] = energy.to_bytes(4, "big", signed=True)
+        if line == 2:
+            data[37:40] = b"\x01\x01\x01"
+        return data
+
+    class FakeClient:
+        """Provide a notification session that delivers both 50A legs."""
+
+        def __init__(self, _address: str) -> None:
+            """Accept the BLE address used to create the client."""
+
+        async def __aenter__(self) -> "FakeClient":
+            """Enter the fake BLE session."""
+            return self
+
+        async def __aexit__(self, *_args: Any) -> bool:
+            """Exit the fake BLE session without suppressing errors."""
+            return False
+
+        @property
+        def services(self) -> list[Any]:
+            """Select the legacy Hughes protocol."""
+            return []
+
+        async def start_notify(self, _tx: str, callback: Any) -> None:
+            """Deliver a complete packet for each split-phase electrical leg."""
+            callback(None, packet(1, 1200000, 250000, 12345))
+            callback(None, packet(2, 1210000, 260000, 23456))
+            source.stop_event.set()
+
+        async def stop_notify(self, _tx: str) -> None:
+            """Accept notification cleanup."""
+
+    asyncio.run(source._run_ble_session(FakeClient, "AA:BB:CC:DD:EE:FF", source.section))
+    assert published == [("hughes", {
+        "voltage_line_1": 120,
+        "current_line_1": 25,
+        "power_line_1": 3000,
+        "energy_line_1": 1.2345,
+        "error_code_line_1": 0,
+        "voltage_line_2": 121,
+        "current_line_2": 26,
+        "power_line_2": 3146,
+        "energy_line_2": 2.3456,
+        "error_code_line_2": 0,
+    })]

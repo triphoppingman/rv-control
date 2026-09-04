@@ -117,6 +117,18 @@ class HughesSource(Source, source_name="hughes"):
             return {"line": 1, "voltage": int.from_bytes(data[9:13], "big") / 10000, "current": int.from_bytes(data[13:17], "big") / 10000, "power": int.from_bytes(data[17:21], "big") / 10000, "energy": int.from_bytes(data[21:25], "big") / 10000}
         return None
 
+    @staticmethod
+    def combine_legs(measurements: dict[int, dict[str, Any]], decoded: dict[str, Any]) -> dict[str, Any] | None:
+        """Store one 50A leg and return a combined payload after both legs arrive."""
+        measurements[decoded["line"]] = decoded
+        if not {1, 2}.issubset(measurements):
+            return None
+        combined = {}
+        for line in (1, 2):
+            combined.update({f"{key}_line_{line}": value for key, value in measurements[line].items() if key != "line"})
+        measurements.clear()
+        return combined
+
     def run(self) -> None:
         """Run the Hughes collector and log failures that stop its thread."""
         try:
@@ -163,6 +175,8 @@ class HughesSource(Source, source_name="hughes"):
             modern = any(str(service.uuid).lower() == "000000ff-0000-1000-8000-00805f9b34fb" for service in services)
             tx = "0000ff01-0000-1000-8000-00805f9b34fb" if modern else "0000ffe2-0000-1000-8000-00805f9b34fb"
             legacy_buffer = bytearray()
+            split_phase = not modern and section.getint("circuit_amps", fallback=30) == 50
+            leg_measurements: dict[int, dict[str, Any]] = {}
 
             def callback(_sender: Any, payload: bytearray) -> None:
                 """Buffer and decode notifications, publishing complete measurements."""
@@ -175,7 +189,9 @@ class HughesSource(Source, source_name="hughes"):
                         decoded = self.decode(bytes(legacy_buffer[:40]))
                         del legacy_buffer[:40]
                 if decoded:
-                    self.publisher.publish(section.get("topic", "hughes"), decoded)
+                    measurement = self.combine_legs(leg_measurements, decoded) if split_phase else decoded
+                    if measurement:
+                        self.publisher.publish(section.get("topic", "hughes"), measurement)
             await client.start_notify(tx, callback)
             if modern:
                 await client.write_gatt_char(tx, b"!%!%,protocol,open,")

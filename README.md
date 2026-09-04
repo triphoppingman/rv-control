@@ -184,10 +184,13 @@ type = hughes
 adapter = hci0
 address = AA:BB:CC:DD:EE:FF
 name = PMD-EXAMPLE
+circuit_amps = 30
 persistent_connection =
 topic = hughes
 write_enabled = false
 ```
+
+Set `circuit_amps = 50` for a split-phase Power Watchdog. The source then waits for both legacy line notifications and publishes them together using `voltage_line_1`, `current_line_1`, `power_line_1`, `energy_line_1`, and their `_line_2` counterparts. Leave this at `30` for a single-leg unit, which publishes each measurement immediately.
 
 WLED controllers use a named source section with a local JSON API base URL:
 
