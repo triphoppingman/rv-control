@@ -1,12 +1,13 @@
 # rv-control
 
-`rv-control` collects telemetry from an RV-C CAN bus, Renogy BLE devices, and a Hughes Power Watchdog, publishing each reading as JSON to Mosquitto.
+`rv-control` collects telemetry from an RV-C CAN bus, Renogy BLE devices, Hughes Power Watchdog devices, and WLED controllers, publishing each reading as JSON to Mosquitto.
 
 The runtime is self-contained and does not import code or configuration from external checkout directories:
 
 - `src/rv_control/data/rvc-spec.yml` is the project-owned RV-C DGN specification.
 - `src/rv_control/renogybt` contains the project-owned Renogy client implementation.
 - `src/rv_control/hughes.py` contains the standalone Hughes BLE implementation.
+- `src/rv_control/wled.py` contains the WLED local JSON API source.
 
 ## User guide
 
@@ -173,6 +174,52 @@ topic = hughes
 write_enabled = false
 ```
 
+WLED controllers use a named source section with a local JSON API base URL:
+
+```ini
+[wled_patio]
+type = wled
+base_url = http://wled.local
+timeout = 5
+poll_interval = 60
+topic = wled/patio
+write_enabled = false
+```
+
+Coach command mappings reference this section with `config_section: wled_patio`; they do not contain the WLED host or credentials.
+
+WLED `comms-check` requests `/json/info`, `interrogate` requests `/json/state`, and daemon mode polls `/json/state` at `poll_interval` seconds. State snapshots are published to the configured `topic`. WLED commands received on `<base_topic>/<source-section>/set` are sent to `/json/state` only when both global MQTT `write_enabled = true` and the WLED section's `write_enabled = true` are set.
+
+Use the standalone WLED tool for direct local control. It reads the same INI section used by the source:
+
+```sh
+PYTHONPATH=src .venv/bin/python tools/wled_tool.py \
+	--config config.ini --section wled_patio status
+PYTHONPATH=src .venv/bin/python tools/wled_tool.py \
+	--config config.ini --section wled_patio info
+```
+
+Basic controls are available with `on`, `off`, and brightness values from `0` through `255`:
+
+```sh
+PYTHONPATH=src .venv/bin/python tools/wled_tool.py \
+	--config config.ini --section wled_patio on
+PYTHONPATH=src .venv/bin/python tools/wled_tool.py \
+	--config config.ini --section wled_patio off
+PYTHONPATH=src .venv/bin/python tools/wled_tool.py \
+	--config config.ini --section wled_patio brightness 128
+```
+
+For advanced WLED state fields, send a JSON object with `state`:
+
+```sh
+PYTHONPATH=src .venv/bin/python tools/wled_tool.py \
+	--config config.ini --section wled_patio state \
+	'{"on":true,"bri":128,"seg":[{"col":[[255,80,20]]}]}'
+```
+
+Direct write commands require `write_enabled = true` in the selected WLED section. The tool does not embed controller addresses; `base_url`, timeout, and other connection details remain in `config.ini`.
+
 Hughes uses the same `persistent_connection` setting as Renogy. Runtime connects directly to the configured address without repeatedly scanning; when persistence is enabled, a dropped session reconnects to that address after `service.reconnect_delay` seconds. `comms-check` remains a one-shot scan and ignores daemon mode.
 
 Daemon retry behavior is configured in the service section:
@@ -187,7 +234,7 @@ max_reconnect_delay = 300
 
 `max_retry = 0` means unlimited retries. `max_reconnect_delay` caps the exponential backoff used by the Hughes source; source supervision also restarts a collector thread that exits unexpectedly.
 
-The MQTT `write_enabled` option is a global safety switch. RV-C and Renogy also require their own source-level `write_enabled = true` before accepting commands. Hughes is telemetry-only.
+The MQTT `write_enabled` option is a global safety switch. RV-C, Renogy, and WLED also require their own source-level `write_enabled = true` before accepting commands. Hughes is telemetry-only.
 
 Bluetooth access usually requires membership in the `bluetooth` group or appropriate Linux capabilities. RV-C requires a configured SocketCAN `can0` interface and the MCP2515 kernel overlay.
 
@@ -364,6 +411,35 @@ Keep device-specific field packing separate from the generic CAN transport helpe
 RV-C uses the J1939 address-management messages. `ADDRESS_CLAIM_DGN` (`0x0EE00`) carries a device's 64-bit NAME in an eight-byte little-endian payload. `REQUEST_DGN` (`0x0EA00`) requests address claims; its payload is the three-byte little-endian value `0x0EE00` when requesting all address claims.
 
 Use `RvcName` with `encode_rvc_name()` and `decode_rvc_name()` to work with NAME values. Use `is_address_claim()` or `address_claim_message()` when receiving frames, and `build_address_claim_message()` or `build_address_claim_request_message()` when preparing announcements and requests. These helpers validate NAME field widths and CAN payload sizes, while the caller remains responsible for handling address conflicts and choosing an available source address.
+
+### Coach command mappings
+
+Coach-specific semantic commands live under `src/rv_control/data/coaches/`. A mapping names the user-facing command, selects a `transport`, and keeps transport-specific details in a matching section. The semantic command layer therefore does not assume that every action is an RV-C frame.
+
+```yaml
+commands:
+	livingroom_lights:
+		transport: rvc
+		config_section: rv_c_bus
+		rvc:
+			command: dc_dimmer_command_2
+			dgn: 0x1FEDB
+			instance: 1
+			group: 1
+		actions:
+			toggle:
+				command: toggle
+```
+
+Supported transport sections are intended to include:
+
+- `rvc`: RV-C DGN, instance, group, and command payload fields.
+- `bluetooth`: adapter, device address, GATT service/characteristic, and action payloads.
+- `wled`: controller host, segment, and WLED action fields.
+
+Each command should include `config_section`, naming the corresponding `config.ini` section. Connection details belong in that INI section, not in the coach YAML: Bluetooth MAC addresses and adapters, WLED hosts and credentials, and RV-C CAN interfaces/spec paths must remain configuration values. The coach YAML should contain only the coach-specific semantic mapping and protocol payload fields.
+
+Future semantic command dispatch should select the handler from `transport`, load the referenced `config_section`, and then apply the action. It should not inspect RV-C fields for Bluetooth or WLED commands.
 
 ## systemd
 

@@ -13,6 +13,7 @@ from .hughes import HughesSource
 from .renogy import RenogySource
 from .rvc import RvcSource
 from .source import Source
+from .wled import WledSource
 
 
 @click.group()

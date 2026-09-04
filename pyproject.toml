@@ -24,7 +24,7 @@ rvcontrol = "rv_control.cli:cli"
 where = ["src"]
 
 [tool.setuptools.package-data]
-rv_control = ["data/*.yml"]
+rv_control = ["data/*.yml", "data/coaches/*.yml"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

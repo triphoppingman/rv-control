@@ -17,6 +17,7 @@ Telemetry is published as JSON to a local MQTT broker such as Mosquitto.
 - `src/rv_control/rvc.py`: RV-C decoding, CAN reads, interrogation, and optional writes.
 - `src/rv_control/renogy.py`: Renogy adapter, self-contained configuration mapping, register inventory, interrogation, and optional writes.
 - `src/rv_control/hughes.py`: Hughes BLE protocols, attribute inventory, interrogation, and daemon reconnects.
+- `src/rv_control/wled.py`: WLED local JSON API source, polling, interrogation, and guarded state writes.
 - `src/rv_control/renogybt/`: Project-owned Renogy client implementation.
 - `src/rv_control/data/rvc-spec.yml`: Project-owned RV-C DGN specification.
 - `src/rv_control/mqtt.py`: MQTT publishing and optional command subscription.

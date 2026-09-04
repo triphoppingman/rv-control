@@ -43,6 +43,14 @@ address =
 name =
 persistent_connection =
 
+[wled]
+type = wled
+base_url = http://wled.local
+timeout = 1
+poll_interval = 1
+topic = wled
+write_enabled = false
+
 [service]
 daemon_mode = true
 reconnect_delay = 1
