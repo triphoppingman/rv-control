@@ -8,6 +8,8 @@ The runtime is self-contained and does not import code or configuration from ext
 - `src/rv_control/renogybt` contains the project-owned Renogy client implementation.
 - `src/rv_control/hughes.py` contains the standalone Hughes BLE implementation.
 
+## User guide
+
 ## Install
 
 ```sh
@@ -48,9 +50,9 @@ The check command prints the resolved config path and whether each source is ena
 
 ```text
 Configuration OK: /path/to/config.ini
-rv_c: disabled
-renogy: disabled
-hughes: enabled
+rv_c_bus: rvc
+renogy_controller: renogy
+hughes_power_watchdog: hughes
 ```
 
 Check communications for every configured source without starting the service:
@@ -134,7 +136,8 @@ write_enabled = false
 [source]
 enabled-sources = renogy_controller
 
-[rv_c]
+[rv_c_bus]
+type = rvc
 interface = can0
 specfile = src/rv_control/data/rvc-spec.yml
 parameterized_strings = true
@@ -197,7 +200,7 @@ Bidirectional commands are opt-in. Set `mqtt.write_enabled = true` and the relev
 Send an extended RV-C CAN frame:
 
 ```sh
-mosquitto_pub -h localhost -t rv/rv_c/set \
+mosquitto_pub -h localhost -t rv/rv_c_bus/set \
 	-m '{"can_id":"0x19FEDB99","data":"02FFC803FF00FFFF"}'
 ```
 
@@ -322,9 +325,11 @@ Run with `--verbose` to see connection and parsing failures. A source error is l
 
 Install dependencies with `pip install -r requirements.txt`.
 
-## Developer addendum: RV-C utilities
+## Developer guide
 
-All reusable RV-C CAN functionality belongs in [src/rv_control/rvc.py](src/rv_control/rvc.py). Tools under `tools/` should import these helpers instead of implementing their own CAN identifier packing, payload validation, specification loading, frame decoding, or display formatting.
+### RV-C utilities
+
+All reusable RV-C CAN functionality belongs in [src/rv_control/rvc_util.py](src/rv_control/rvc_util.py). Tools under `tools/` should import these helpers instead of implementing their own CAN identifier packing, payload validation, specification loading, frame decoding, or display formatting. [src/rv_control/rvc.py](src/rv_control/rvc.py) owns the `RvcSource` lifecycle and re-exports utility names for compatibility.
 
 The transmit helpers are:
 
@@ -333,7 +338,19 @@ The transmit helpers are:
 - `build_can_message(priority, dgn, source, payload)`: creates a validated extended `python-can` message.
 - `send_can_message(bus, priority, dgn, source, payload)`: builds and sends one message, returning the message that was sent.
 
-RV-C identifiers use priority in bits 28-26, the 17-bit DGN in bits 25-8, and the 8-bit source address in bits 7-0. Future commands should add small, protocol-specific payload builders in `rvc.py`, then use `send_can_message()` for transmission:
+Protocol-specific builders currently include:
+
+- `dc_dimmer_payload()` and `build_dc_dimmer_message()` for `DC_DIMMER_COMMAND_2`.
+- `generator_payload()` for `GENERATOR_COMMAND`.
+- `circulation_pump_payload()` for `CIRCULATION_PUMP_COMMAND`.
+- `inverter_payload()` for `INVERTER_COMMAND`.
+- `charger_payload()` for `CHARGER_COMMAND`.
+- `load_payload()` for both `DC_LOAD_COMMAND` and `AC_LOAD_COMMAND`.
+- `indicator_payload()` for `GENERIC_INDICATOR_COMMAND`.
+
+These functions return validated payloads or complete CAN messages; they do not open interfaces or send hardware traffic. Callers use `send_can_message()` when a bus transmission is intended.
+
+RV-C identifiers use priority in bits 28-26, the 17-bit DGN in bits 25-8, and the 8-bit source address in bits 7-0. Future commands should add small, protocol-specific payload builders in `rvc_util.py`, then use `send_can_message()` for transmission:
 
 ```python
 payload = build_some_rvc_payload(...)
@@ -442,10 +459,10 @@ bluetoothctl show
 When running under systemd, the service account must be able to access the Bluetooth stack and SocketCAN device. Add the account to the relevant groups on the image, commonly `bluetooth`, `dialout`, and `gpio` where applicable, then log out and back in or restart the service. Keep the adapter setting explicit if more than one adapter is installed:
 
 ```ini
-[renogy]
+[renogy_controller]
 adapter = hci0
 
-[hughes]
+[hughes_power_watchdog]
 adapter = hci0
 ```
 
