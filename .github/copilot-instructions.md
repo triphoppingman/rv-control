@@ -32,6 +32,7 @@ The old `vendor/` directory has been removed. Do not recreate runtime dependenci
 - Add an expressive docstring to every function and method, including private methods and nested callbacks.
 - Preserve the `Source` ABC and register new sources through its registry mechanism. A source must provide `source_name`, `config_section`, `run`, and `comms_check`.
 - Keep protocol-specific behavior inside its source module. Do not put device logic in the CLI.
+- Keep shared RV-C utility functionality in `src/rv_control/rvc.py`; tools under `tools/` should call its canonical specification, CAN-frame, DGN, and protocol helper functions rather than duplicating them.
 - Keep `comms-check` and `interrogate` one-shot operations. They must not inherit daemon persistence or run indefinitely.
 - `run` is the long-lived daemon path. Avoid rereading static specifications or rebuilding static client configuration inside poll loops.
 - Keep write-back disabled by default. MQTT global `write_enabled` and source-level write flags must both be required.

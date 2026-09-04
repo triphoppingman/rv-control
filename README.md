@@ -246,6 +246,52 @@ PYTHONPATH=src .venv/bin/python tools/rvc_monitor.py --interface can1
 
 The monitor prints every CAN frame in a candump-style format. Extended RV-C frames include the DGN name, source address, and decoded values; non-RV-C frames are shown as raw frames.
 
+Send a raw payload for any DGN defined in the RV-C specification by number or name:
+
+```sh
+PYTHONPATH=src .venv/bin/python tools/rvc_send.py generic --dgn DATE_TIME_STATUS --data 1A0903050C223805
+PYTHONPATH=src .venv/bin/python tools/rvc_send.py --source 0x42 generic --dgn 0x1FF00 --data 01020304
+```
+
+Send a DC dimmer command using readable fields:
+
+```sh
+PYTHONPATH=src .venv/bin/python tools/rvc_send.py dc-dimmer \
+	--instance 2 --group 1 --level 50 --command on
+```
+
+Supported dimmer command names include `set-brightness`, `on-duration`, `on-delay`, `off`, `stop`, `toggle`, `memory-off`, `ramp-brightness`, `ramp-toggle`, `ramp-up`, `ramp-down`, `ramp-up-down`, `lock`, `unlock`, `flash`, and `flash-momentarily`. The dimmer payload builder is centralized in `rvc_util.py` and encodes level as RV-C half-percent units.
+
+Additional specification-backed command subcommands are available through the same sender:
+
+```sh
+PYTHONPATH=src .venv/bin/python tools/rvc_send.py generator --command start
+PYTHONPATH=src .venv/bin/python tools/rvc_send.py circulation-pump --instance 1 --mode on
+PYTHONPATH=src .venv/bin/python tools/rvc_send.py inverter --instance 1 --enable
+PYTHONPATH=src .venv/bin/python tools/rvc_send.py charger --instance 1 --status enable --auto-recharge
+PYTHONPATH=src .venv/bin/python tools/rvc_send.py dc-load --instance 1 --level 100 --command on
+PYTHONPATH=src .venv/bin/python tools/rvc_send.py ac-load --instance 1 --level 100 --command on --load-priority 1
+PYTHONPATH=src .venv/bin/python tools/rvc_send.py indicator --instance 1 --brightness 100 --function on
+```
+
+These builders validate ranges and encode the bit fields centrally in `rvc_util.py`. Commands not yet given a named builder can still be sent with the `generic` subcommand and a raw payload, provided their DGN is present in the selected specification.
+
+Request all devices to announce their dynamic addresses:
+
+```sh
+PYTHONPATH=src .venv/bin/python tools/rvc_send.py address-claim-request
+```
+
+Request and display the decoded system information from every responding device:
+
+```sh
+PYTHONPATH=src .venv/bin/python tools/rvc_send.py get-info --timeout 5
+```
+
+The `get-info` command sends an address-claim request, waits for responses, and displays each device's source address and decoded RV-C/J1939 NAME fields.
+
+The sender validates the DGN against the selected specification and accepts a raw hexadecimal payload. Use `--priority`, `--source`, or `--interface` when a device requires values other than the defaults. The final positional argument may provide a custom specification file.
+
 Read the controller date and time with:
 
 ```sh
@@ -275,6 +321,32 @@ bluetoothctl scan on
 Run with `--verbose` to see connection and parsing failures. A source error is logged independently; check that the configured address, interface, device ID, and source settings are correct.
 
 Install dependencies with `pip install -r requirements.txt`.
+
+## Developer addendum: RV-C utilities
+
+All reusable RV-C CAN functionality belongs in [src/rv_control/rvc.py](src/rv_control/rvc.py). Tools under `tools/` should import these helpers instead of implementing their own CAN identifier packing, payload validation, specification loading, frame decoding, or display formatting.
+
+The transmit helpers are:
+
+- `build_can_id(priority, dgn, source)`: validates the fields and packs an RV-C extended 29-bit identifier.
+- `normalize_can_payload(payload)`: converts byte-like input to `bytes` and rejects payloads longer than 8 bytes.
+- `build_can_message(priority, dgn, source, payload)`: creates a validated extended `python-can` message.
+- `send_can_message(bus, priority, dgn, source, payload)`: builds and sends one message, returning the message that was sent.
+
+RV-C identifiers use priority in bits 28-26, the 17-bit DGN in bits 25-8, and the 8-bit source address in bits 7-0. Future commands should add small, protocol-specific payload builders in `rvc.py`, then use `send_can_message()` for transmission:
+
+```python
+payload = build_some_rvc_payload(...)
+send_can_message(bus, priority=6, dgn=0x1FF00, source=0x00, payload=payload)
+```
+
+Keep device-specific field packing separate from the generic CAN transport helpers. Reuse `load_spec()`, `decode_message()`, `decode_dgn()`, and `format_message()` for tools that inspect or display RV-C traffic. The date/time helpers follow the same pattern with `datetime_payload()`, `decode_datetime()`, and `command_can_id()`.
+
+### Dynamic address management
+
+RV-C uses the J1939 address-management messages. `ADDRESS_CLAIM_DGN` (`0x0EE00`) carries a device's 64-bit NAME in an eight-byte little-endian payload. `REQUEST_DGN` (`0x0EA00`) requests address claims; its payload is the three-byte little-endian value `0x0EE00` when requesting all address claims.
+
+Use `RvcName` with `encode_rvc_name()` and `decode_rvc_name()` to work with NAME values. Use `is_address_claim()` or `address_claim_message()` when receiving frames, and `build_address_claim_message()` or `build_address_claim_request_message()` when preparing announcements and requests. These helpers validate NAME field widths and CAN payload sizes, while the caller remains responsible for handling address conflicts and choosing an available source address.
 
 ## systemd
 

@@ -9,6 +9,10 @@ from rv_control.config import load_config
 from rv_control.hughes import HughesSource
 from rv_control.renogy import RenogySource
 from rv_control.rvc import RvcSource
+from rv_control.rvc import (RvcName, address_claim_message,
+                            build_address_claim_message,
+                            build_dc_dimmer_message, decode_rvc_name,
+                            encode_rvc_name)
 from rv_control.source import Source
 
 
@@ -26,6 +30,27 @@ def test_rvc_source_accepts_named_instance_section(config_file: Path) -> None:
     config["rv_c_bus"]["type"] = "rvc"
     source = RvcSource(config, None, threading.Event(), "rv_c_bus")
     assert source.section_name == "rv_c_bus"
+
+
+def test_rvc_address_claim_name_round_trips() -> None:
+    """Verify the RV-C NAME fields survive little-endian encode and decode."""
+    name = RvcName(12345, 321, 2, 7, 128, 45, 3, 2, True)
+    assert decode_rvc_name(encode_rvc_name(name)) == name
+
+
+def test_rvc_address_claim_message_decodes() -> None:
+    """Verify an address-claim message exposes its source and decoded NAME."""
+    name = RvcName(1, 2, 0, 0, 128, 0, 0, 0, False)
+    message = build_address_claim_message(0x42, name)
+    claimed = address_claim_message(message)
+    assert claimed == (0x42, name)
+
+
+def test_rvc_dc_dimmer_command_builds_spec_payload() -> None:
+    """Verify readable dimmer fields encode into the RV-C command payload."""
+    message = build_dc_dimmer_message(2, 1, 50, "on")
+    assert message.arbitration_id == 0x19FEDB00
+    assert bytes(message.data) == bytes([2, 1, 100, 1, 0, 0])
 
 
 def test_renogy_persistent_mode_enables_polling(config_file: Path) -> None:
