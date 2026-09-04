@@ -34,6 +34,7 @@ The old `vendor/` directory has been removed. Do not recreate runtime dependenci
 - Preserve the `Source` ABC and register new sources through its registry mechanism. A source must provide `source_name`, `config_section`, `run`, and `comms_check`.
 - Keep protocol-specific behavior inside its source module. Do not put device logic in the CLI.
 - Keep shared RV-C utility functionality in `src/rv_control/rvc_util.py`; tools under `tools/` should call its canonical specification, CAN-frame, DGN, and protocol helper functions rather than duplicating them. Keep `src/rv_control/rvc.py` focused on `RvcSource` integration and compatibility re-exports.
+- Coach semantic mappings under `src/rv_control/coaches/` select transports (e.g. `rvc`, `wled`); the `[coach]` section in `config.ini` maps transport names to installation-specific INI sections (e.g. `rvc = rv_c_bus`). All source access from `Coach` must use the `Source` abstraction.
 - Keep `comms-check` and `interrogate` one-shot operations. They must not inherit daemon persistence or run indefinitely.
 - `run` is the long-lived daemon path. Avoid rereading static specifications or rebuilding static client configuration inside poll loops.
 - Keep write-back disabled by default. MQTT global `write_enabled` and source-level write flags must both be required.

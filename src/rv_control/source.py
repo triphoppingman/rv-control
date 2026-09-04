@@ -37,6 +37,12 @@ class Source(threading.Thread, ABC):
     @classmethod
     def source_class(cls, name: str) -> type[Source]:
         """Return the registered source class for a name."""
+        if name not in cls._registry:
+            try:
+                import importlib
+                importlib.import_module(f".{name}", package="rv_control")
+            except ImportError:
+                pass
         try:
             return cls._registry[name]
         except KeyError as error:

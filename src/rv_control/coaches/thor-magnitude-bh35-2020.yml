@@ -1,0 +1,94 @@
+# Coach-specific semantic mappings for a 2020 Thor Motor Coach Magnitude BH35.
+# A command selects a transport (e.g. rvc, wled); the [coach] section in config.ini
+# maps transport names to actual installation configuration sections (e.g. rvc = rv_c_bus).
+coach:
+  manufacturer: Thor Motor Coach
+  model: Magnitude BH35
+  model_year: 2020
+
+commands:
+  livingroom_lights:
+    description: Living room lighting group
+    transport: rvc
+    rvc:
+      command: dc_dimmer_command_2
+      dgn: 0x1FEDB
+      instance: 1
+      group: 1
+      defaults:
+        level: 100
+        delay: 0
+        interlock: 0
+    actions:
+      on:
+        command: on
+      off:
+        command: off
+      toggle:
+        command: toggle
+      brightness:
+        command: set-brightness
+
+  bedroom_lights:
+    description: Bedroom lighting group
+    transport: rvc
+    rvc:
+      command: dc_dimmer_command_2
+      dgn: 0x1FEDB
+      instance: 2
+      group: 1
+      defaults:
+        level: 100
+        delay: 0
+        interlock: 0
+    actions:
+      on:
+        command: on
+      off:
+        command: off
+      toggle:
+        command: toggle
+      brightness:
+        command: set-brightness
+
+  patio_lights:
+    description: Patio WLED lighting strip
+    transport: wled
+    actions:
+      on:
+        on: true
+      off:
+        on: false
+
+command_groups:
+  all_interior_lights:
+    description: All interior coach lighting groups
+    actions:
+      on:
+        - command: livingroom_lights
+          action: on
+        - command: bedroom_lights
+          action: on
+      off:
+        - command: livingroom_lights
+          action: off
+        - command: bedroom_lights
+          action: off
+      toggle:
+        - command: livingroom_lights
+          action: toggle
+        - command: bedroom_lights
+          action: toggle
+
+  evening_scene:
+    description: Evening ambient lighting scene
+    actions:
+      activate:
+        - command: livingroom_lights
+          action: brightness
+          params:
+            level: 30
+        - command: bedroom_lights
+          action: off
+        - command: patio_lights
+          action: on

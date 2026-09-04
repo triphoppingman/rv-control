@@ -7,6 +7,7 @@ from typing import Any
 
 import click
 
+from .coach import Coach
 from .config import load_config
 from .mqtt import MqttPublisher
 from .hughes import HughesSource
@@ -68,6 +69,49 @@ def interrogate(config: Any) -> None:
     click.echo(json.dumps(results, indent=2, sort_keys=True, default=str))
     if any(not result["ok"] for result in results.values()):
         raise click.exceptions.Exit(1)
+
+
+@cli.command("coach-list")
+@click.option("--coach-spec", default=None, help="Coach specification file path or model stem.")
+@click.pass_obj
+def coach_list(config: Any, coach_spec: str | None) -> None:
+    """List all available coach semantic commands and command groups."""
+    try:
+        coach = Coach.load(config, coach_spec)
+        result = {
+            "coach": coach.info,
+            "commands": coach.list_commands(),
+            "command_groups": coach.list_command_groups(),
+        }
+        click.echo(json.dumps(result, indent=2, sort_keys=True, default=str))
+    except (FileNotFoundError, ValueError, KeyError) as error:
+        raise click.ClickException(str(error)) from error
+
+
+@cli.command("coach-exec")
+@click.argument("target", type=str)
+@click.argument("action", type=str)
+@click.option("--coach-spec", default=None, help="Coach specification file path or model stem.")
+@click.option("--param", "-p", "params", multiple=True, type=(str, str), help="Extra key-value parameter pairs.")
+@click.pass_obj
+def coach_exec(config: Any, target: str, action: str, coach_spec: str | None, params: tuple[tuple[str, str], ...]) -> None:
+    """Execute a coach semantic command or command group action."""
+    kw: dict[str, Any] = {}
+    for key, val in params:
+        try:
+            kw[key] = int(val, 0)
+        except ValueError:
+            try:
+                kw[key] = float(val)
+            except ValueError:
+                kw[key] = val
+
+    try:
+        coach = Coach.load(config, coach_spec)
+        results = coach.execute(target, action, **kw)
+        click.echo(json.dumps(results, indent=2, sort_keys=True, default=str))
+    except (KeyError, ValueError, OSError, RuntimeError, PermissionError) as error:
+        raise click.ClickException(str(error)) from error
 
 
 @cli.command()

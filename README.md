@@ -38,6 +38,8 @@ rv-control --help
 rv-control check --help
 rv-control comms-check --help
 rv-control interrogate --help
+rv-control coach-list --help
+rv-control coach-exec --help
 rv-control run --help
 ```
 
@@ -73,6 +75,19 @@ rv-control --config config.ini interrogate
 ```
 
 Renogy interrogation connects once, reads every register block defined by the configured Renogy client type, and prints the decoded state. Hughes connects once, waits for a complete notification packet, and prints its decoded power attributes. RV-C listens for `interrogate_seconds` (10 by default), decodes received DGN frames, and prints the latest state for each DGN/source combination. The command exits with status `1` if an enabled source cannot be interrogated.
+
+List available coach semantic commands and command groups:
+
+```sh
+rv-control --config config.ini coach-list
+```
+
+Execute a coach semantic command or command group action:
+
+```sh
+rv-control --config config.ini coach-exec livingroom_lights toggle
+rv-control --config config.ini coach-exec evening_scene activate
+```
 
 Run the collectors in the foreground:
 
@@ -186,7 +201,14 @@ topic = wled/patio
 write_enabled = false
 ```
 
-Coach command mappings reference this section with `config_section: wled_patio`; they do not contain the WLED host or credentials.
+Coach specifications are configured in the `[coach]` section:
+
+```ini
+[coach]
+specfile = src/rv_control/coaches/thor-magnitude-bh35-2020.yml
+```
+
+Coach command mappings reference source sections (such as `config_section: wled_patio` or `config_section: rv_c_bus`); they do not contain device hosts, CAN interfaces, or credentials.
 
 WLED `comms-check` requests `/json/info`, `interrogate` requests `/json/state`, and daemon mode polls `/json/state` at `poll_interval` seconds. State snapshots are published to the configured `topic`. WLED commands received on `<base_topic>/<source-section>/set` are sent to `/json/state` only when both global MQTT `write_enabled = true` and the WLED section's `write_enabled = true` are set.
 
@@ -414,32 +436,32 @@ Use `RvcName` with `encode_rvc_name()` and `decode_rvc_name()` to work with NAME
 
 ### Coach command mappings
 
-Coach-specific semantic commands live under `src/rv_control/data/coaches/`. A mapping names the user-facing command, selects a `transport`, and keeps transport-specific details in a matching section. The semantic command layer therefore does not assume that every action is an RV-C frame.
+Coach-specific semantic commands live under `src/rv_control/coaches/`. A mapping names the user-facing command, selects a `transport` (e.g. `rvc`, `wled`, `bluetooth`), and specifies protocol-specific payload parameters:
 
 ```yaml
 commands:
-	livingroom_lights:
-		transport: rvc
-		config_section: rv_c_bus
-		rvc:
-			command: dc_dimmer_command_2
-			dgn: 0x1FEDB
-			instance: 1
-			group: 1
-		actions:
-			toggle:
-				command: toggle
+  livingroom_lights:
+    transport: rvc
+    rvc:
+      command: dc_dimmer_command_2
+      dgn: 0x1FEDB
+      instance: 1
+      group: 1
+    actions:
+      toggle:
+        command: toggle
 ```
 
-Supported transport sections are intended to include:
+To keep the coach YAML completely independent of specific installation configuration section names, transports or logical target names are mapped to actual `config.ini` sections inside the `[coach]` section of `config.ini`:
 
-- `rvc`: RV-C DGN, instance, group, and command payload fields.
-- `bluetooth`: adapter, device address, GATT service/characteristic, and action payloads.
-- `wled`: controller host, segment, and WLED action fields.
+```ini
+[coach]
+specfile = src/rv_control/coaches/thor-magnitude-bh35-2020.yml
+rvc = rv_c_bus
+wled = wled_patio
+```
 
-Each command should include `config_section`, naming the corresponding `config.ini` section. Connection details belong in that INI section, not in the coach YAML: Bluetooth MAC addresses and adapters, WLED hosts and credentials, and RV-C CAN interfaces/spec paths must remain configuration values. The coach YAML should contain only the coach-specific semantic mapping and protocol payload fields.
-
-Future semantic command dispatch should select the handler from `transport`, load the referenced `config_section`, and then apply the action. It should not inspect RV-C fields for Bluetooth or WLED commands.
+Connection details belong in those `config.ini` sections (Bluetooth MAC addresses, WLED hosts, SocketCAN interfaces), not in the coach YAML. When executing a command, `Coach` resolves `transport` or `target` through `[coach]` in `config.ini` to obtain the actual configuration section name, retrieves the corresponding `Source`, and dispatches the command.
 
 ## systemd
 

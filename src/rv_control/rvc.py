@@ -78,16 +78,27 @@ class RvcSource(Source, source_name="rvc"):
     def handle_command(self, payload: dict[str, Any]) -> None:
         """Validate and send a configured RV-C CAN command when writes are enabled."""
         section = self.section
-        if not section.getboolean("write_enabled", fallback=False) or self.bus is None:
-            LOGGER.warning("RV-C write ignored because it is disabled or unavailable")
+        if not section.getboolean("write_enabled", fallback=False):
+            LOGGER.warning("RV-C write ignored because it is disabled")
             return
         try:
             can_id = int(str(payload["can_id"]), 0)
             data = bytes.fromhex(str(payload["data"]))
             if not 0 <= can_id <= 0x1FFFFFFF or len(data) > 8:
                 raise ValueError("CAN ID or data length is out of range")
-            send_can_message(self.bus, (can_id >> 26) & 0x7, (can_id >> 8) & 0x1FFFF, can_id & 0xFF, data)
-        except (KeyError, TypeError, ValueError) as error:
+            bus = payload.get("bus") or self.bus
+            if bus is not None:
+                send_can_message(bus, (can_id >> 26) & 0x7, (can_id >> 8) & 0x1FFFF, can_id & 0xFF, data)
+            else:
+                import can
+
+                interface = section.get("interface", "can0")
+                transient_bus = can.Bus(interface="socketcan", channel=interface)
+                try:
+                    send_can_message(transient_bus, (can_id >> 26) & 0x7, (can_id >> 8) & 0x1FFFF, can_id & 0xFF, data)
+                finally:
+                    transient_bus.shutdown()
+        except (KeyError, TypeError, ValueError, OSError, can.CanError) as error:
             LOGGER.warning("Invalid RV-C command: %s", error)
 
     def interrogate(self) -> dict[str, Any]:

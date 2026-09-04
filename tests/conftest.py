@@ -51,6 +51,11 @@ poll_interval = 1
 topic = wled
 write_enabled = false
 
+[coach]
+specfile = src/rv_control/coaches/thor-magnitude-bh35-2020.yml
+rvc = rv_c_bus
+wled = wled_patio
+
 [service]
 daemon_mode = true
 reconnect_delay = 1
