@@ -504,6 +504,10 @@ The copied and derived components under `src/rv_control` retain the applicable u
 
 The service is intended to run on Raspberry Pi OS 64-bit on a Raspberry Pi 4. The following host details are important:
 
+![Raspberry Pi with CAN HAT and power supply](images/raspberry-pi-can-hat.jpg)
+
+A completed Raspberry Pi with an MCP2515-based CAN HAT and power supply. The CAN HAT terminal block exposes the CAN+ and CAN- connections to the RV-C bus.
+
 ### Operating-system packages
 
 Install the system packages required by SocketCAN, Bluetooth, Mosquitto, and Python virtual environments:
