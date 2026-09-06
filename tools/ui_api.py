@@ -21,7 +21,7 @@ def _set_host(context: click.Context, parameter: click.Parameter, host: str | No
 
 host_option = click.option(
     "--host",
-    default="192.168.8.72",
+    default="192.168.77.1",
     show_default=True,
     callback=_set_host,
     expose_value=False,
