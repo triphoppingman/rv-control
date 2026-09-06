@@ -142,6 +142,19 @@ Retrieve all retained or live values received for one exact MQTT topic:
 
 Without `--topic`, the tool subscribes to `<base-topic>/#` and prints retained or live topics received during the check. With `--topic`, it subscribes to that exact topic and prints every value received. Values delivered as retained MQTT messages are marked `[retained]`, distinguishing them from live publications received during the check. MQTT does not provide a portable command to list empty topics, so a topic with no retained message and no activity during the timeout cannot be reported by this tool.
 
+## UI configuration API
+
+Use the UI API helper to inspect or configure the `rv-control-ui` device over its local HTTP API. Its default host is `192.168.8.72`; every subcommand also accepts `--host` for another device address.
+
+```sh
+.venv/bin/python tools/ui_api.py info
+.venv/bin/python tools/ui_api.py get-config -o config.json
+.venv/bin/python tools/ui_api.py set-config --host 192.168.8.72 -i config.json
+.venv/bin/python tools/ui_api.py restart
+```
+
+`get-config` writes the device's complete configuration to `config.json` by default; use `-o` to select another local destination. This file includes Wi-Fi and MQTT credentials, so keep it private and do not commit it. `set-config` requires `-i` to name the complete local JSON file to upload. The UI validates the file, stores it, and restarts when the upload succeeds. `info` and `get-config` are read-only; `set-config` and `restart` change the running device.
+
 ## Configuration
 
 Edit only the sections for hardware installed in the RV. List enabled source sections in `[source]`; each listed section selects its implementation with `type`.
