@@ -50,9 +50,15 @@ class MqttTopicProbe:
         self.topics.add(topic)
         self.values.setdefault(topic, []).append(payload)
 
-    def check(self, base_topic: str, timeout: float, full: bool = False) -> set[str] | dict[str, list[str]]:
+    def check(
+        self,
+        base_topic: str,
+        timeout: float,
+        full: bool = False,
+        topic: str | None = None,
+    ) -> set[str] | dict[str, list[str]]:
         """Connect, subscribe, collect topics or values, and close the connection."""
-        topic_filter = f"{base_topic.strip('/')}/#"
+        topic_filter = topic.strip("/") if topic else f"{base_topic.strip('/')}/#"
         try:
             self.client.connect(self.host, self.port, keepalive=30)
             self.client.loop_start()
@@ -77,19 +83,31 @@ class MqttTopicProbe:
 @click.option("--username", default="", help="MQTT username.")
 @click.option("--password", default="", help="MQTT password.", hide_input=True)
 @click.option("--base-topic", default="rv", show_default=True, help="Topic prefix to inspect.")
+@click.option("--topic", default=None, help="Exact MQTT topic whose values to retrieve.")
 @click.option("--timeout", default=5.0, show_default=True, type=click.FloatRange(min=1.0), help="Seconds to wait for connection and topics.")
 @click.option("--full", is_flag=True, help="Print every received value for each topic and subtopic.")
-def main(host: str, port: int, username: str, password: str, base_topic: str, timeout: float, full: bool) -> None:
+def main(
+    host: str,
+    port: int,
+    username: str,
+    password: str,
+    base_topic: str,
+    topic: str | None,
+    timeout: float,
+    full: bool,
+) -> None:
     """Check MQTT connectivity and inspect topics observed under BASE_TOPIC."""
     probe = MqttTopicProbe(host, port, username, password)
+    show_values = full or topic is not None
     try:
-        observed = probe.check(base_topic, timeout, full=full)
+        observed = probe.check(base_topic, timeout, full=show_values, topic=topic)
     except (OSError, RuntimeError) as error:
         raise click.ClickException(str(error)) from error
     click.echo(f"MQTT connection to {host}:{port}: OK")
     if observed:
-        click.echo(f"Observed {len(observed)} topic(s) under {base_topic.strip('/')}/#:")
-        if full:
+        inspected_filter = topic.strip("/") if topic else f"{base_topic.strip('/')}/#"
+        click.echo(f"Observed {len(observed)} topic(s) under {inspected_filter}:")
+        if show_values:
             for topic in sorted(observed):
                 for value in observed[topic]:
                     click.echo(f"  {topic} = {value}")
@@ -97,7 +115,8 @@ def main(host: str, port: int, username: str, password: str, base_topic: str, ti
             for topic in sorted(observed):
                 click.echo(f"  {topic}")
     else:
-        click.echo(f"No retained or live topics observed under {base_topic.strip('/')}/# in {timeout:g} seconds.")
+        inspected_filter = topic.strip("/") if topic else f"{base_topic.strip('/')}/#"
+        click.echo(f"No retained or live topics observed under {inspected_filter} in {timeout:g} seconds.")
 
 
 if __name__ == "__main__":
