@@ -6,14 +6,19 @@ import sys
 from typing import Any, Awaitable, Callable
 from bleak import BleakClient, BleakScanner, BLEDevice
 
+from ..bluetooth import BluetoothAdapterRegistry
+
 DISCOVERY_TIMEOUT = 5 # max wait time to complete the bluetooth scanning (seconds)
 
 class BLEManager:
-    def __init__(self, mac_address: str, alias: str, on_data: Callable[[bytes | bytearray], Awaitable[None]], on_connect_fail: Callable[[Any], None], on_disconnect: Callable[[], None], write_service_uuid: str, notify_char_uuid: str, write_char_uuid: str, adapter: str = 'hci0') -> None:
+    def __init__(self, mac_address: str, alias: str, on_data: Callable[[bytes | bytearray], Awaitable[None]], on_connect_fail: Callable[[Any], None], on_disconnect: Callable[[], None], write_service_uuid: str, notify_char_uuid: str, write_char_uuid: str, adapter: str = 'hci0', discovery_timeout: float = DISCOVERY_TIMEOUT, write_settle_delay: float = 0.5) -> None:
         """Configure BLE discovery, connection callbacks, and characteristic identifiers."""
         self.mac_address = mac_address
         self.device_alias = alias
         self.adapter = adapter
+        self.discovery_timeout = discovery_timeout
+        self.write_settle_delay = write_settle_delay
+        self.coordinator = BluetoothAdapterRegistry.for_adapter(adapter)
         self.data_callback = on_data
         self.connect_fail_callback = on_connect_fail
         self.disconnect_callback = on_disconnect
@@ -30,7 +35,9 @@ class BLEManager:
         """Discover the configured BLE device and retain the matching device record."""
         mac_address = self.mac_address.upper()
         logging.info("Starting discovery...")
-        self.discovered_devices = await BleakScanner.discover(timeout=DISCOVERY_TIMEOUT, adapter=self.adapter)
+        self.device = None
+        async with self.coordinator.scan_slot():
+            self.discovered_devices = await BleakScanner.discover(timeout=self.discovery_timeout, adapter=self.adapter)
         logging.info("Devices found: %s", len(self.discovered_devices))
 
         for dev in self.discovered_devices:
@@ -42,12 +49,15 @@ class BLEManager:
         """Connect to the discovered device and subscribe to its notifications."""
         if not self.device: return logging.error("No device connected!")
 
-        self._intentional_disconnect = False
-        self.client = BleakClient(self.device, disconnected_callback=self._on_disconnected)
         try:
-            await self.client.connect()
+            self._intentional_disconnect = False
+            self.write_char_handle = None
+            async with self.coordinator.connect_slot():
+                self.client = BleakClient(self.device, disconnected_callback=self._on_disconnected)
+                await self.client.connect()
             logging.info(f"Client connection: {self.client.is_connected}")
-            if not self.client.is_connected: return logging.error("Unable to connect")
+            if not self.client.is_connected:
+                raise ConnectionError("Unable to connect")
 
             for service in self.client.services:
                 for characteristic in service.characteristics:
@@ -82,7 +92,7 @@ class BLEManager:
             logging.info(f'writing to {self.write_char_uuid} {data}')
             await self.client.write_gatt_char(self.write_char_handle, bytearray(data), response=False)
             logging.info('characteristic_write_value succeeded')
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(self.write_settle_delay)
         except Exception as e:
             logging.info(f'characteristic_write_value failed {e}')
 

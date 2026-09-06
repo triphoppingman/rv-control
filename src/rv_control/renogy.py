@@ -104,6 +104,7 @@ class RenogySource(Source, source_name="renogy"):
         from configparser import ConfigParser
 
         section = self.section
+        service = self.config["service"]
         renogy_config = ConfigParser(inline_comment_prefixes=("#",))
         if persistent_connection is None:
             persistent_connection = section.get("persistent_connection", "").strip()
@@ -118,6 +119,10 @@ class RenogySource(Source, source_name="renogy"):
             "device_type": section.get("device-type", "RNG_CTRL"),
             "device_id": section.get("device_id", "255"),
             "max_retry": section.get("max_retry", "3"),
+            "reconnect_delay": section.get("reconnect_delay", "").strip() or service.get("reconnect_delay", "2"),
+            "max_reconnect_delay": section.get("max_reconnect_delay", "").strip() or service.get("max_reconnect_delay", "300"),
+            "discovery_timeout": section.get("discovery_timeout", "5"),
+            "reconnect_jitter": section.get("reconnect_jitter", "0.1"),
             "persistent_connection": persistent_connection,
         }
         renogy_config["data"] = {
@@ -126,6 +131,9 @@ class RenogySource(Source, source_name="renogy"):
                 or persistent_connection == "true"
             ).lower(),
             "poll_interval": section.get("poll_interval", "60"),
+            "read_timeout": section.get("read_timeout", "15"),
+            "request_interval": section.get("request_interval", "0.5"),
+            "write_settle_delay": section.get("write_settle_delay", "0.5"),
             "temperature_unit": section.get("temperature_unit", "F"),
             "fields": section.get("fields", ""),
         }

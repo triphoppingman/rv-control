@@ -134,7 +134,13 @@ Choose a different broker, credentials, topic prefix, or wait time when needed:
 	--host localhost --port 1883 --base-topic rv --timeout 5
 ```
 
-The tool subscribes to `<base-topic>/#` and prints retained or live topics received during the check. MQTT does not provide a portable command to list empty topics, so a topic with no retained message and no activity during the timeout cannot be reported by this tool.
+Retrieve all retained or live values received for one exact MQTT topic:
+
+```sh
+.venv/bin/python tools/mqtt_check.py --topic rv/renogy/status --timeout 5
+```
+
+Without `--topic`, the tool subscribes to `<base-topic>/#` and prints retained or live topics received during the check. With `--topic`, it subscribes to that exact topic and prints every value received. Values delivered as retained MQTT messages are marked `[retained]`, distinguishing them from live publications received during the check. MQTT does not provide a portable command to list empty topics, so a topic with no retained message and no activity during the timeout cannot be reported by this tool.
 
 ## Configuration
 
@@ -167,16 +173,23 @@ mac_addr = AA:BB:CC:DD:EE:FF
 alias = BT-TH-EXAMPLE
 device_id = 255
 max_retry = 3
+reconnect_delay =
+max_reconnect_delay =
+discovery_timeout = 5
+reconnect_jitter = 0.1
 persistent_connection =
 enable_polling = true
 poll_interval = 60
+read_timeout = 15
+request_interval = 0.5
+write_settle_delay = 0.5
 temperature_unit = F
 fields =
 topic = renogy
 write_enabled = false
 ```
 
-The Renogy section is self-contained. `device-type` can be `RNG_CTRL`, `RNG_CTRL_HIST`, `RNG_BATT`, `RNG_INVT`, `RNG_INVT_HF`, `RNG_DCC`, or `RNG_SHNT`. Use the Bluetooth adapter's address format exactly as reported by discovery tools. An empty `persistent_connection` inherits `[service] daemon_mode`; it defaults to enabled for daemon operation. When enabled, the initial BLE discovery is reused across reconnects instead of scanning again. Persistent mode also keeps polling active, so use `enable_polling = true` for continuous daemon telemetry.
+The Renogy section is self-contained. `device-type` can be `RNG_CTRL`, `RNG_CTRL_HIST`, `RNG_BATT`, `RNG_INVT`, `RNG_INVT_HF`, `RNG_DCC`, or `RNG_SHNT`. Use the Bluetooth adapter's address format exactly as reported by discovery tools. An empty `persistent_connection` inherits `[service] daemon_mode`; it defaults to enabled for daemon operation. Each connection attempt performs fresh discovery and creates a fresh BLE client. Persistent mode also keeps polling active, so use `enable_polling = true` for continuous daemon telemetry.
 
 ```ini
 [hughes_power_watchdog]
@@ -185,6 +198,10 @@ adapter = hci0
 address = AA:BB:CC:DD:EE:FF
 name = PMD-EXAMPLE
 circuit_amps = 30
+max_retry =
+reconnect_delay =
+max_reconnect_delay =
+notification_timeout = 60
 persistent_connection =
 topic = hughes
 write_enabled = false
@@ -257,7 +274,7 @@ max_retry = 0
 max_reconnect_delay = 300
 ```
 
-`max_retry = 0` means unlimited retries. `max_reconnect_delay` caps the exponential backoff used by the Hughes source; source supervision also restarts a collector thread that exits unexpectedly.
+`max_retry = 0` means unlimited retries. `reconnect_delay`, `max_reconnect_delay`, and `max_retry` may be overridden in an individual Renogy or Hughes section; blank source values inherit `[service]`. `max_reconnect_delay` caps exponential backoff. Renogy supports `discovery_timeout`, `read_timeout`, `request_interval`, `write_settle_delay`, and `reconnect_jitter` per source. `request_interval` spaces register reads, `write_settle_delay` gives the device time to receive a request, and `reconnect_jitter` prevents simultaneous adapter retries. Hughes uses `notification_timeout` to reconnect a session that remains connected but stops delivering telemetry. Source supervision restarts a collector thread that exits unexpectedly.
 
 The MQTT `write_enabled` option is a global safety switch. RV-C, Renogy, and WLED also require their own source-level `write_enabled = true` before accepting commands. Hughes is telemetry-only.
 

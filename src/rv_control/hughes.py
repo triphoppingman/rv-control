@@ -147,13 +147,14 @@ class HughesSource(Source, source_name="hughes"):
         if not persistent:
             persistent = self.config["service"].get("daemon_mode", "true")
         persistent = persistent.lower() == "true"
-        reconnect_delay = self.config["service"].getfloat("reconnect_delay", fallback=10)
-        max_reconnect_delay = self.config["service"].getfloat("max_reconnect_delay", fallback=300)
-        max_retry = self.config["service"].getint("max_retry", fallback=0)
+        reconnect_delay = self._retry_setting("reconnect_delay", 10, float)
+        max_reconnect_delay = self._retry_setting("max_reconnect_delay", 300, float)
+        max_retry = self._retry_setting("max_retry", 0, int)
+        notification_timeout = self._retry_setting("notification_timeout", 60, float)
         retry_count = 0
         while not self.stop_event.is_set():
             try:
-                await self._run_ble_session(client_class, address, section)
+                await self._run_ble_session(client_class, address, section, notification_timeout)
                 if not persistent or self.stop_event.is_set():
                     return
                 retry_count = 0
@@ -168,7 +169,14 @@ class HughesSource(Source, source_name="hughes"):
             delay = min(reconnect_delay * (2 ** max(retry_count - 1, 0)), max_reconnect_delay)
             await asyncio.sleep(delay)
 
-    async def _run_ble_session(self, client_class: Callable[..., Any], address: str, section: Any) -> None:
+    def _retry_setting(self, name: str, default: int | float, value_type: Callable[[str], int | float]) -> int | float:
+        """Return a source retry override or the corresponding service default."""
+        value = self.section.get(name, "").strip()
+        if value:
+            return value_type(value)
+        return value_type(self.config["service"].get(name, str(default)))
+
+    async def _run_ble_session(self, client_class: Callable[..., Any], address: str, section: Any, notification_timeout: float = 60) -> None:
         """Run one Hughes notification session until the shared stop event is set."""
         async with client_class(address) as client:
             services = client.services
@@ -177,10 +185,11 @@ class HughesSource(Source, source_name="hughes"):
             legacy_buffer = bytearray()
             split_phase = not modern and section.getint("circuit_amps", fallback=30) == 50
             leg_measurements: dict[int, dict[str, Any]] = {}
+            last_measurement = asyncio.get_running_loop().time()
 
             def callback(_sender: Any, payload: bytearray) -> None:
                 """Buffer and decode notifications, publishing complete measurements."""
-                nonlocal legacy_buffer
+                nonlocal last_measurement, legacy_buffer
                 data = bytes(payload)
                 decoded = self.decode(data)
                 if decoded is None and not modern:
@@ -189,12 +198,17 @@ class HughesSource(Source, source_name="hughes"):
                         decoded = self.decode(bytes(legacy_buffer[:40]))
                         del legacy_buffer[:40]
                 if decoded:
+                    last_measurement = asyncio.get_running_loop().time()
                     measurement = self.combine_legs(leg_measurements, decoded) if split_phase else decoded
                     if measurement:
                         self.publisher.publish(section.get("topic", "hughes"), measurement)
             await client.start_notify(tx, callback)
-            if modern:
-                await client.write_gatt_char(tx, b"!%!%,protocol,open,")
-            while not self.stop_event.is_set():
-                await asyncio.sleep(1)
-            await client.stop_notify(tx)
+            try:
+                if modern:
+                    await client.write_gatt_char(tx, b"!%!%,protocol,open,")
+                while not self.stop_event.is_set():
+                    await asyncio.sleep(min(notification_timeout, 1))
+                    if asyncio.get_running_loop().time() - last_measurement >= notification_timeout:
+                        raise TimeoutError(f"No Hughes telemetry received for {notification_timeout:g} seconds")
+            finally:
+                await client.stop_notify(tx)

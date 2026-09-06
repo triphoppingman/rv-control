@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import configparser
 import logging
+import random
 import traceback
 from typing import Any, Callable
 from .BLEManager import BLEManager
@@ -73,6 +74,8 @@ class BaseClient:
                 mac_address=self.config['device']['mac_addr'],
                 alias=self.config['device']['alias'],
                 adapter=self.config['device'].get('adapter', 'hci0'),
+                discovery_timeout=self.config['device'].getfloat('discovery_timeout', fallback=5),
+                write_settle_delay=self.config['data'].getfloat('write_settle_delay', fallback=0.5),
                 on_data=self.on_data_received,
                 on_connect_fail=self.__on_connect_fail,
                 on_disconnect=self.__on_disconnect,
@@ -81,10 +84,7 @@ class BaseClient:
                 write_service_uuid=self.write_service_uuid,
             )
 
-        if self.ble_manager.device is None or not self.persistent_connection:
-            await self.ble_manager.discover()
-        else:
-            logging.info('Reusing previously discovered Renogy device: %s', self.ble_manager.device.address)
+        await self.ble_manager.discover()
 
         if not self.ble_manager.device:
             logging.error(f"Device not found: {self.config['device']['alias']} => {self.config['device']['mac_addr']}, please check the details provided.")
@@ -129,7 +129,7 @@ class BaseClient:
                 await self.check_polling()
             else:
                 self.section_index += 1
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(self.config['data'].getfloat('request_interval', fallback=0.5))
                 await self.read_section()
         else:
             logging.warning("on_data_received: unknown operation={}".format(operation))
@@ -164,7 +164,8 @@ class BaseClient:
         if not getattr(self, 'write_char_uuid', None) or len(self.sections) == 0:
             return logging.info("Nothing to write, skipping operation")
 
-        self.read_timeout = self.loop.call_later(READ_TIMEOUT, self.on_read_timeout)
+        read_timeout = self.config['data'].getfloat('read_timeout', fallback=READ_TIMEOUT)
+        self.read_timeout = self.loop.call_later(read_timeout, self.on_read_timeout)
         request = self.create_generic_read_request(self.device_id, 3, self.sections[index]['register'], self.sections[index]['words']) 
         await self.ble_manager.characteristic_write_value(request)
 
@@ -213,7 +214,11 @@ class BaseClient:
         try:
             if self._retry_count < self.max_retry:
                 self._retry_count += 1
-                delay = 2 ** self._retry_count
+                reconnect_delay = self.config['device'].getfloat('reconnect_delay', fallback=2)
+                max_reconnect_delay = self.config['device'].getfloat('max_reconnect_delay', fallback=300)
+                reconnect_jitter = self.config['device'].getfloat('reconnect_jitter', fallback=0.1)
+                delay = min(reconnect_delay * (2 ** (self._retry_count - 1)), max_reconnect_delay)
+                delay = min(delay * random.uniform(1 - reconnect_jitter, 1 + reconnect_jitter), max_reconnect_delay)
                 logging.info(f"Retrying connection in {delay} seconds (Attempt {self._retry_count}/{self.max_retry}). Reason: {reason}")
                 if self.read_timeout and not self.read_timeout.cancelled():
                     self.read_timeout.cancel()
@@ -221,6 +226,7 @@ class BaseClient:
                 if self.ble_manager:
                     try:
                         await self.ble_manager.disconnect()
+                        self.ble_manager = None
                     except Exception as e:
                         logging.debug(f"Error disconnecting manager client during retry setup: {e}")
                         

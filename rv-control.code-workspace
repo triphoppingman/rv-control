@@ -2,6 +2,9 @@
 	"folders": [
 		{
 			"path": "."
+		},
+		{
+			"path": "../rv-control-ui"
 		}
 	],
 	"settings": {}

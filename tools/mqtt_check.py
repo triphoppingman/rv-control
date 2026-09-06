@@ -20,6 +20,7 @@ class MqttTopicProbe:
         self.error: str | None = None
         self.topics: set[str] = set()
         self.values: dict[str, list[str]] = {}
+        self.retained: dict[str, list[bool]] = {}
         self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="rv-control-topic-check")
         self.client.on_connect = self._on_connect
         self.client.on_message = self._on_message
@@ -49,6 +50,7 @@ class MqttTopicProbe:
         payload = bytes(message.payload).decode("utf-8", errors="replace")
         self.topics.add(topic)
         self.values.setdefault(topic, []).append(payload)
+        self.retained.setdefault(topic, []).append(bool(getattr(message, "retain", False)))
 
     def check(
         self,
@@ -109,8 +111,9 @@ def main(
         click.echo(f"Observed {len(observed)} topic(s) under {inspected_filter}:")
         if show_values:
             for topic in sorted(observed):
-                for value in observed[topic]:
-                    click.echo(f"  {topic} = {value}")
+                for index, value in enumerate(observed[topic]):
+                    retained = " [retained]" if probe.retained[topic][index] else ""
+                    click.echo(f"  {topic}{retained} = {value}")
         else:
             for topic in sorted(observed):
                 click.echo(f"  {topic}")

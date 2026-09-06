@@ -52,6 +52,26 @@ def test_renogy_config_propagates_adapter_and_one_shot_mode(config_file: Path) -
     assert client_config["device"]["persistent_connection"] == "false"
 
 
+def test_renogy_config_propagates_ble_retry_settings(config_file: Path) -> None:
+    """Verify Renogy retry and timeout settings reach the BLE client configuration."""
+    config = load_config(str(config_file))
+    config["renogy"].update({
+        "max_retry": "7",
+        "reconnect_delay": "3",
+        "max_reconnect_delay": "45",
+        "discovery_timeout": "9",
+        "read_timeout": "20",
+    })
+    source = RenogySource(config, None, threading.Event())
+    client_config = source._client_config(persistent_connection=True)
+
+    assert client_config["device"].getint("max_retry") == 7
+    assert client_config["device"].getfloat("reconnect_delay") == 3
+    assert client_config["device"].getfloat("max_reconnect_delay") == 45
+    assert client_config["device"].getfloat("discovery_timeout") == 9
+    assert client_config["data"].getfloat("read_timeout") == 20
+
+
 def test_multiple_source_sections_resolve_by_type(config_file: Path) -> None:
     """Verify multiple configured sections instantiate the selected source type."""
     config = load_config(str(config_file))
