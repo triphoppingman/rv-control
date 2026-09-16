@@ -67,7 +67,8 @@ class GpsdSource(Source, source_name="gpsd"):
                             LOGGER.debug("Ignoring non-JSON gpsd response")
                             continue
                         if isinstance(payload, dict) and payload.get("class") not in ("DEVICES", "WATCH"):
-                            self.publisher.publish(topic, payload)
+                            cls = payload["class"]
+                            self.publisher.publish(f"{topic}/{cls}", payload)
                 finally:
                     stream.close()
         except Exception:
