@@ -1,6 +1,6 @@
 # rv-control
 
-`rv-control` collects telemetry from an RV-C CAN bus, Renogy BLE devices, Hughes Power Watchdog devices, and WLED controllers, publishing each reading as JSON to Mosquitto.
+`rv-control` collects telemetry from an RV-C CAN bus, Renogy BLE devices, Hughes Power Watchdog devices, WLED controllers, and gpsd, publishing each reading as JSON to Mosquitto.
 
 The runtime is self-contained and does not import code or configuration from external checkout directories:
 
@@ -8,6 +8,7 @@ The runtime is self-contained and does not import code or configuration from ext
 - `src/rv_control/renogybt` contains the project-owned Renogy client implementation.
 - `src/rv_control/hughes.py` contains the standalone Hughes BLE implementation.
 - `src/rv_control/wled.py` contains the WLED local JSON API source.
+- `src/rv_control/gpsd.py` contains the gpsd JSON TCP source.
 
 ## User guide
 
@@ -221,6 +222,19 @@ write_enabled = false
 ```
 
 Set `circuit_amps = 50` for a split-phase Power Watchdog. The source then waits for both legacy line notifications and publishes them together using `voltage_line_1`, `current_line_1`, `power_line_1`, `energy_line_1`, and their `_line_2` counterparts. Leave this at `30` for a single-leg unit, which publishes each measurement immediately.
+
+gpsd connects to its JSON TCP stream, enables JSON reports with the gpsd `WATCH` request, and publishes each received JSON object unchanged:
+
+```ini
+[gpsd]
+type = gpsd
+host = localhost
+port = 2947
+timeout = 5
+topic = gpsd
+```
+
+Add the gpsd section name to `[source]` `enabled-sources` to start it. gpsd reports are published beneath the configured MQTT base topic, for example `rv/gpsd`.
 
 WLED controllers use a named source section with a local JSON API base URL:
 
