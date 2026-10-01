@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import struct
+from contextlib import AsyncExitStack
 from typing import Any, Callable
 
+from .bluetooth import BluetoothAdapterRegistry
 from .source import Source
 
 
@@ -17,6 +19,7 @@ class HughesSource(Source, source_name="hughes"):
     config_section = "hughes"
     LEGACY_HEADER = b"\x01\x03\x20"
     MODERN_HEADER = b"$yw@"
+    _session_received_telemetry = False
 
     @staticmethod
     def attribute_inventory(device_name: str | None) -> list[dict[str, str]]:
@@ -153,6 +156,7 @@ class HughesSource(Source, source_name="hughes"):
         notification_timeout = self._retry_setting("notification_timeout", 60, float)
         retry_count = 0
         while not self.stop_event.is_set():
+            self._session_received_telemetry = False
             try:
                 await self._run_ble_session(client_class, address, section, notification_timeout)
                 if not persistent or self.stop_event.is_set():
@@ -162,7 +166,8 @@ class HughesSource(Source, source_name="hughes"):
             except Exception:
                 if self.stop_event.is_set() or not persistent:
                     raise
-                retry_count += 1
+                # A session that delivered telemetry before stalling should not escalate backoff.
+                retry_count = 1 if self._session_received_telemetry else retry_count + 1
                 if max_retry and retry_count > max_retry:
                     raise RuntimeError(f"Hughes reconnect limit reached ({max_retry})")
                 LOGGER.exception("Hughes connection dropped; reconnecting to %s", address)
@@ -178,7 +183,15 @@ class HughesSource(Source, source_name="hughes"):
 
     async def _run_ble_session(self, client_class: Callable[..., Any], address: str, section: Any, notification_timeout: float = 60) -> None:
         """Run one Hughes notification session until the shared stop event is set."""
-        async with client_class(address) as client:
+        adapter = section.get("adapter", "hci0").strip() or "hci0"
+        connect_settle_delay = self._retry_setting("connect_settle_delay", 2, float)
+        async with AsyncExitStack() as stack:
+            # Share the adapter connect lock with Renogy so setups never overlap.
+            async with BluetoothAdapterRegistry.for_adapter(adapter).connect_slot():
+                client = await stack.enter_async_context(client_class(address, adapter=adapter))
+            # Give the watchdog time to finish GATT setup before subscribing.
+            if connect_settle_delay > 0:
+                await asyncio.sleep(connect_settle_delay)
             services = client.services
             modern = any(str(service.uuid).lower() == "000000ff-0000-1000-8000-00805f9b34fb" for service in services)
             tx = "0000ff01-0000-1000-8000-00805f9b34fb" if modern else "0000ffe2-0000-1000-8000-00805f9b34fb"
@@ -199,6 +212,7 @@ class HughesSource(Source, source_name="hughes"):
                         del legacy_buffer[:40]
                 if decoded:
                     last_measurement = asyncio.get_running_loop().time()
+                    self._session_received_telemetry = True
                     measurement = self.combine_legs(leg_measurements, decoded) if split_phase else decoded
                     if measurement:
                         self.publisher.publish(section.get("topic", "hughes"), measurement)

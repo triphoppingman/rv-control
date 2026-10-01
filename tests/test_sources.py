@@ -102,7 +102,7 @@ def test_hughes_daemon_buffers_fragmented_legacy_packet(config_file: Path) -> No
     class FakeClient:
         """Provide a notification session that fragments one legacy packet."""
 
-        def __init__(self, _address: str) -> None:
+        def __init__(self, _address: str, **_kwargs: Any) -> None:
             """Accept the BLE address used to create the client."""
 
         async def __aenter__(self) -> "FakeClient":
@@ -154,7 +154,7 @@ def test_hughes_daemon_combines_50a_legacy_legs(config_file: Path) -> None:
     class FakeClient:
         """Provide a notification session that delivers both 50A legs."""
 
-        def __init__(self, _address: str) -> None:
+        def __init__(self, _address: str, **_kwargs: Any) -> None:
             """Accept the BLE address used to create the client."""
 
         async def __aenter__(self) -> "FakeClient":

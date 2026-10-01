@@ -93,7 +93,7 @@ def test_hughes_reconnects_after_session_failure(config_file: Path) -> None:
     calls = []
 
     class FakeClient:
-        def __init__(self, _address: str) -> None:
+        def __init__(self, _address: str, **_kwargs: Any) -> None:
             """Record each attempted BLE client construction."""
             calls.append("construct")
 

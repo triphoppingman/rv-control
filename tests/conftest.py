@@ -39,6 +39,7 @@ fields =
 [hughes]
 type = hughes
 adapter = hci0
+connect_settle_delay = 0
 address =
 name =
 persistent_connection =

@@ -84,19 +84,27 @@ class BaseClient:
                 write_service_uuid=self.write_service_uuid,
             )
 
-        await self.ble_manager.discover()
+        # A concurrent retry may disconnect and replace self.ble_manager while this coroutine awaits.
+        manager = self.ble_manager
+        await manager.discover()
+        if self.ble_manager is not manager:
+            logging.debug("BLE manager replaced during discovery; abandoning stale connect attempt.")
+            return
 
-        if not self.ble_manager.device:
+        if not manager.device:
             logging.error(f"Device not found: {self.config['device']['alias']} => {self.config['device']['mac_addr']}, please check the details provided.")
-            for dev in self.ble_manager.discovered_devices:
+            for dev in manager.discovered_devices:
                 if dev.name != None and dev.name.startswith(tuple(ALIAS_PREFIXES)):
                     logging.info(f"Possible device found! ====> {dev.name} > [{dev.address}]")
             if self.loop and self.loop.is_running():
                 self.loop.create_task(self.__handle_retry_async("Device not found during discovery"))
             return
         else:
-            await self.ble_manager.connect()
-            if self.ble_manager.client and self.ble_manager.client.is_connected:
+            await manager.connect()
+            if self.ble_manager is not manager:
+                logging.debug("BLE manager replaced during connect; abandoning stale connect attempt.")
+                return
+            if manager.client and manager.client.is_connected:
                 self._retry_count = 0
                 await self.read_section()
 
@@ -164,10 +172,14 @@ class BaseClient:
         if not getattr(self, 'write_char_uuid', None) or len(self.sections) == 0:
             return logging.info("Nothing to write, skipping operation")
 
+        manager = self.ble_manager
+        if manager is None:
+            return logging.debug("No active BLE manager; skipping read request.")
+
         read_timeout = self.config['data'].getfloat('read_timeout', fallback=READ_TIMEOUT)
         self.read_timeout = self.loop.call_later(read_timeout, self.on_read_timeout)
         request = self.create_generic_read_request(self.device_id, 3, self.sections[index]['register'], self.sections[index]['words']) 
-        await self.ble_manager.characteristic_write_value(request)
+        await manager.characteristic_write_value(request)
 
     def create_generic_read_request(self, device_id: int, function: int, regAddr: int | None, readWrd: int | None) -> list[int] | None:
         """Build a Modbus-style read request from device, function, and register values."""
