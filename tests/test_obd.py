@@ -215,6 +215,7 @@ def test_daemon_publishes_snapshots_and_reconnects_when_ecu_goes_silent() -> Non
     statuses = [payload["online"] for topic, payload in publisher.messages if topic == "obd/status"]
     assert snapshots[0]["rpm"] == 1726.0 and snapshots[0]["coolant_temp"] == 122.0 and "timestamp" in snapshots[0]
     assert statuses == [True, False]
+    assert all(value is None for key, value in snapshots[-1].items() if key != "timestamp")
     assert all(sock.closed for sock in sockets)
 
 

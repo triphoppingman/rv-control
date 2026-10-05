@@ -14,6 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - Adapter initialization (`ATZ`, `ATE0`, `ATL0`, `ATS0`, `ATH0`, `ATSP<protocol>`, `ATSH<header>`), ECU probe with `0100`, and optional `fallback_protocol` when automatic detection fails.
   - Responses are read until the ELM327 `>` prompt; `SEARCHING...`, multi-frame (`0:`/`1:`) and multi-ECU replies, error strings, and negative responses are handled, and the echoed mode/PID is verified before decoding.
   - Per-cycle flat snapshots on `<base_topic>/<topic>` (failed PIDs are `null`) and availability changes on `<base_topic>/<topic>/status` with adapter version, battery voltage, and protocol.
+  - When the source goes offline (engine off or adapter lost), an all-`null` snapshot is published to `<base_topic>/<topic>` so snapshot-only consumers such as rv-control-ui clear stale engine values.
   - Engine on/off resilience: an unreachable adapter or a silent ECU (`max_failed_cycles`) is treated as offline, the socket is closed, and reconnects use exponential backoff (`reconnect_delay`, `max_reconnect_delay`, `max_retry`, inheriting `[service]` when blank). State transitions are logged once.
   - Fixed-rate polling at `poll_hz` with a one-time warning when a cycle overruns.
   - `adapter` selects the local Bluetooth controller by `hciN` name or controller MAC, and the RFCOMM socket is bound to it.

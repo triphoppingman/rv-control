@@ -466,6 +466,7 @@ class ObdSource(Source, source_name="obd"):
             if not online:
                 LOGGER.debug("OBD %s still offline: %s", self.section_name, message)
             return
+        was_online = self._online is True
         self._online = online
         status = {"online": online, "timestamp": _timestamp(), **(info or {})}
         if message:
@@ -475,6 +476,9 @@ class ObdSource(Source, source_name="obd"):
         else:
             LOGGER.warning("OBD %s offline: %s", self.section_name, message)
         self._publish(f"{self._topic()}/status", status)
+        if was_online:
+            # Clear consumers that only watch the snapshot topic so stale engine values are not displayed.
+            self._publish(self._topic(), {**{pid.name: None for pid in self.pids}, "timestamp": status["timestamp"]})
 
     def _poll(self, elm: Elm327, topic: str, interval: float, max_failed_cycles: int) -> None:
         """Poll every PID once per interval and publish snapshots until stopped or the ECU goes silent."""
