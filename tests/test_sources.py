@@ -145,7 +145,7 @@ def test_hughes_daemon_combines_50a_legacy_legs(config_file: Path) -> None:
         data[:3] = b"\x01\x03\x20"
         data[3:7] = voltage.to_bytes(4, "big", signed=True)
         data[7:11] = current.to_bytes(4, "big", signed=True)
-        data[11:15] = (voltage * current).to_bytes(4, "big", signed=True)
+        data[11:15] = (voltage * current // 10000).to_bytes(4, "big", signed=True)
         data[15:19] = energy.to_bytes(4, "big", signed=True)
         if line == 2:
             data[37:40] = b"\x01\x01\x01"
