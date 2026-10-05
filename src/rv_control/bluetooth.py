@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from contextlib import asynccontextmanager
-from typing import AsyncIterator
+from contextlib import asynccontextmanager, contextmanager
+from typing import AsyncIterator, Iterator
 
 
 class BluetoothAdapterCoordinator:
@@ -34,6 +34,12 @@ class BluetoothAdapterCoordinator:
             yield
         finally:
             self._connect_lock.release()
+
+    @contextmanager
+    def connect_slot_sync(self) -> Iterator[None]:
+        """Reserve the adapter from blocking code, such as RFCOMM socket connects."""
+        with self._connect_lock:
+            yield
 
 
 class BluetoothAdapterRegistry:

@@ -18,12 +18,14 @@ Telemetry is published as JSON to a local MQTT broker such as Mosquitto.
 - `src/rv_control/renogy.py`: Renogy adapter, self-contained configuration mapping, register inventory, interrogation, and optional writes.
 - `src/rv_control/hughes.py`: Hughes BLE protocols, attribute inventory, interrogation, and daemon reconnects.
 - `src/rv_control/wled.py`: WLED local JSON API source, polling, interrogation, and guarded state writes.
+- `src/rv_control/obd.py`: Read-only ELM327 Bluetooth RFCOMM OBD-II PID source, INI-defined PIDs, safe decode expressions, and engine on/off reconnects.
 - `src/rv_control/renogybt/`: Project-owned Renogy client implementation.
 - `src/rv_control/data/rvc-spec.yml`: Project-owned RV-C DGN specification.
 - `src/rv_control/mqtt.py`: MQTT publishing and optional command subscription.
 - `config.ini`: Local runtime configuration; treat it as machine-specific and do not expose credentials.
 - `config-example.ini`: Shareable configuration template.
 - `tests/`: pytest regression tests.
+- `CHANGELOG.md`: Keep a Changelog history; update it with every code commit (see Changelog below).
 
 The old `vendor/` directory has been removed. Do not recreate runtime dependencies on it. Use the project-owned copies under `src/rv_control`.
 
@@ -43,6 +45,14 @@ The old `vendor/` directory has been removed. Do not recreate runtime dependenci
 - Keep MQTT cleanup and source cleanup in `finally` blocks. Initialize cleanup variables before entering `try` blocks.
 - Do not add cloud services or external telemetry destinations without an explicit request.
 - Avoid unrelated refactors and preserve the existing public CLI/configuration contract.
+
+## Changelog
+
+- Every commit that changes code, configuration templates, tools, or user-facing behavior must update `CHANGELOG.md` in the same commit.
+- Add entries under `## [Unreleased]` using Keep a Changelog headings (`Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`, `Security`). Create a heading only when it has entries.
+- Describe the user-visible effect (new source, option, topic, command, or fixed behavior), not the implementation diff. Mention new or changed configuration keys and MQTT topics explicitly.
+- Do not include device addresses, credentials, or contents of `config.ini` in changelog entries.
+- Test-only or documentation-only commits may skip the changelog unless they change documented behavior.
 
 ## Configuration conventions
 

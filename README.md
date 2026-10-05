@@ -1,6 +1,6 @@
 # rv-control
 
-`rv-control` collects telemetry from an RV-C CAN bus, Renogy BLE devices, Hughes Power Watchdog devices, WLED controllers, and gpsd, publishing each reading as JSON to Mosquitto.
+`rv-control` collects telemetry from an RV-C CAN bus, Renogy BLE devices, Hughes Power Watchdog devices, WLED controllers, gpsd, and ELM327 Bluetooth OBD-II adapters, publishing each reading as JSON to Mosquitto.
 
 The runtime is self-contained and does not import code or configuration from external checkout directories:
 
@@ -9,6 +9,7 @@ The runtime is self-contained and does not import code or configuration from ext
 - `src/rv_control/hughes.py` contains the standalone Hughes BLE implementation.
 - `src/rv_control/wled.py` contains the WLED local JSON API source.
 - `src/rv_control/gpsd.py` contains the gpsd JSON TCP source.
+- `src/rv_control/obd.py` contains the read-only ELM327 Bluetooth OBD-II PID source.
 
 ## User guide
 
@@ -118,7 +119,7 @@ Choose a different adapter or scan duration when needed:
 .venv/bin/python tools/bt_discovery.py --adapter hci0 --timeout 15
 ```
 
-The tool prints each matching device's family, Bluetooth address, advertised name, and signal strength. It does not connect to or modify any device.
+The tool prints each matching device's family, Bluetooth address, advertised name, and signal strength. It does not connect to or modify any device. It scans BLE only; ELM327 OBD-II adapters use Bluetooth Classic and are discovered and paired with `bluetoothctl` as described in [ELM327 OBD-II adapter (Bluetooth Classic)](#elm327-obd-ii-adapter-bluetooth-classic).
 
 ## MQTT check
 
@@ -290,6 +291,48 @@ PYTHONPATH=src .venv/bin/python tools/wled_tool.py \
 
 Direct write commands require `write_enabled = true` in the selected WLED section. The tool does not embed controller addresses; `base_url`, timeout, and other connection details remain in `config.ini`.
 
+ELM327 Bluetooth OBD-II adapters use a named source section. The source connects with a raw Bluetooth RFCOMM socket (no `rfcomm bind`, no serial device node), so pair and trust the adapter once with `bluetoothctl` before first use (see [ELM327 OBD-II adapter (Bluetooth Classic)](#elm327-obd-ii-adapter-bluetooth-classic) for discovery, pairing, and controller selection). `adapter` selects the local controller by `hciN` name or controller MAC address, and the RFCOMM socket is bound to it:
+
+```ini
+[obd_engine]
+type = obd
+adapter = hci0
+address = 00:1D:A5:XX:XX:XX
+channel = 1
+header = 7E0
+protocol = 0
+fallback_protocol = 6
+poll_hz = 2
+connect_timeout = 10
+read_timeout = 5
+max_failed_cycles = 3
+reconnect_delay = 2
+max_reconnect_delay = 60
+max_retry =
+topic = obd
+pid.egt11 = 22, F478, ((b0*256+b1)*0.18)-40, °F
+pid.rpm = 01, 0C, (b0*256+b1)/4, RPM
+pid.coolant_temp = 01, 05, (b0-40)*1.8+32, °F
+```
+
+Each `pid.<name> = mode, pid, decode, unit` entry defines one PID. `mode` and `pid` are hexadecimal; only read-only OBD modes (01, 02, 03, 05, 06, 07, 09, 0A, 21, 22) are accepted. `decode` is an arithmetic expression over the response data bytes `b0`, `b1`, … (after the echoed mode and PID); it may use numeric constants, arithmetic, bitwise and comparison operators, conditional expressions, and `abs`, `min`, `max`, `round`, `int`, and `float`. Expressions are validated and compiled once at startup. INI option names are case-insensitive, so use snake_case PID names; they become the payload keys. Write a literal `%` (modulo) as `%%`.
+
+On connect the source sends `ATZ`, `ATE0`, `ATL0`, `ATS0`, `ATH0`, `ATSP<protocol>`, and `ATSH<header>` (when `header` is set), reads the adapter voltage, and probes the ECU with `0100`. If the probe fails and `fallback_protocol` is set, it retries with that protocol (for example `6` for 11-bit 500 kbps CAN). PIDs are then queried sequentially once per cycle at `poll_hz`; a PID returning `NO DATA`, an error, or a short response is published as `null` and polling continues.
+
+Each cycle publishes one flat snapshot such as `{"egt11": 140.0, "rpm": 850.0, "coolant_temp": null, "timestamp": "..."}` to `<base_topic>/<topic>`. Availability changes publish `{"online": ..., "adapter": ..., "voltage": ..., "protocol": ..., "message": ...}` to `<base_topic>/<topic>/status`. The source treats both an unreachable adapter and a reachable adapter with a silent ECU (ignition off, or `max_failed_cycles` consecutive cycles with no PID answering) as offline: it closes the socket and reconnects with exponential backoff from `reconnect_delay` to `max_reconnect_delay`. Offline/online transitions are logged once rather than on every retry. `max_retry` blank inherits `[service]`; `0` retries forever. `comms-check` passes when the adapter answers, reports whether the ECU responded, and lists configured PIDs with units.
+
+Use the standalone OBD tool to work with the adapter directly. It reads the same INI section and is read-only:
+
+```sh
+PYTHONPATH=src .venv/bin/python tools/obd_tool.py --config config.ini --section obd_engine info
+PYTHONPATH=src .venv/bin/python tools/obd_tool.py --section obd_engine supported
+PYTHONPATH=src .venv/bin/python tools/obd_tool.py --section obd_engine read
+PYTHONPATH=src .venv/bin/python tools/obd_tool.py --section obd_engine monitor --hz 1 --count 10
+PYTHONPATH=src .venv/bin/python tools/obd_tool.py --section obd_engine query 22F478
+```
+
+Stop the `rvcontrol run` service before using the tool; an ELM327 accepts only one RFCOMM connection at a time.
+
 Hughes uses the same `persistent_connection` setting as Renogy. Runtime connects directly to the configured address without repeatedly scanning; when persistence is enabled, a dropped session reconnects to that address after `service.reconnect_delay` seconds. `comms-check` remains a one-shot scan and ignores daemon mode.
 
 Daemon retry behavior is configured in the service section:
@@ -302,9 +345,9 @@ max_retry = 0
 max_reconnect_delay = 300
 ```
 
-`max_retry = 0` means unlimited retries. `reconnect_delay`, `max_reconnect_delay`, and `max_retry` may be overridden in an individual Renogy or Hughes section; blank source values inherit `[service]`. `max_reconnect_delay` caps exponential backoff. Renogy supports `discovery_timeout`, `read_timeout`, `request_interval`, `write_settle_delay`, and `reconnect_jitter` per source. `request_interval` spaces register reads, `write_settle_delay` gives the device time to receive a request, and `reconnect_jitter` prevents simultaneous adapter retries. Hughes uses `notification_timeout` to reconnect a session that remains connected but stops delivering telemetry, and `connect_settle_delay` (default 2 seconds) to pause after connecting before subscribing. Hughes connection setup shares the per-adapter lock with Renogy, and a session that delivered telemetry before stalling restarts backoff from `reconnect_delay`. Source supervision restarts a collector thread that exits unexpectedly.
+`max_retry = 0` means unlimited retries. `reconnect_delay`, `max_reconnect_delay`, and `max_retry` may be overridden in an individual Renogy, Hughes, or OBD section; blank source values inherit `[service]`. `max_reconnect_delay` caps exponential backoff. Renogy supports `discovery_timeout`, `read_timeout`, `request_interval`, `write_settle_delay`, and `reconnect_jitter` per source. `request_interval` spaces register reads, `write_settle_delay` gives the device time to receive a request, and `reconnect_jitter` prevents simultaneous adapter retries. Hughes uses `notification_timeout` to reconnect a session that remains connected but stops delivering telemetry, and `connect_settle_delay` (default 2 seconds) to pause after connecting before subscribing. Hughes connection setup shares the per-adapter lock with Renogy, and a session that delivered telemetry before stalling restarts backoff from `reconnect_delay`. Source supervision restarts a collector thread that exits unexpectedly.
 
-The MQTT `write_enabled` option is a global safety switch. RV-C, Renogy, and WLED also require their own source-level `write_enabled = true` before accepting commands. Hughes is telemetry-only.
+The MQTT `write_enabled` option is a global safety switch. RV-C, Renogy, and WLED also require their own source-level `write_enabled = true` before accepting commands. Hughes and OBD are telemetry-only.
 
 Bluetooth access usually requires membership in the `bluetooth` group or appropriate Linux capabilities. RV-C requires a configured SocketCAN `can0` interface and the MCP2515 kernel overlay.
 
@@ -599,7 +642,7 @@ If `can0` is missing, check the overlay name, oscillator value, interrupt GPIO w
 
 ### Bluetooth and permissions
 
-The Renogy and Hughes sources use BlueZ through the `hci0` adapter by default. Confirm the adapter is powered and visible:
+The Renogy, Hughes, and OBD sources use BlueZ through the `hci0` adapter by default. Confirm the adapter is powered and visible:
 
 ```sh
 bluetoothctl list
@@ -617,6 +660,78 @@ adapter = hci0
 ```
 
 Run `comms-check` interactively first. It performs fresh discovery and is useful for confirming that the Pi sees the configured BLE addresses before enabling daemon mode.
+
+### ELM327 OBD-II adapter (Bluetooth Classic)
+
+The OBD source talks to the adapter over Bluetooth Classic RFCOMM (Serial Port Profile). The Pi's onboard controller is dual-mode, so it can serve this alongside the BLE Renogy and Hughes sources.
+
+**Choose a compatible adapter.** The adapter must expose Classic SPP. BLE-only OBD dongles (commonly sold as "iOS compatible" or "Bluetooth 4.0/LE") will pair poorly or not at all and cannot be opened with RFCOMM. Dual-mode or Bluetooth 2.x/3.0 "Android" ELM327 adapters work. Unpair the adapter from any phone or disable phone OBD apps: an ELM327 accepts only one connection at a time.
+
+**Power it up.** Most OBD ports are always powered, but many adapters sleep until the ignition is on or the bus is active. Turn the ignition on before discovery and pairing.
+
+**Pick the Pi adapter.** List local controllers and note the one you will use:
+
+```sh
+bluetoothctl list
+hciconfig -a        # shows hciN names alongside controller addresses
+```
+
+BlueZ stores pairings per controller (`/var/lib/bluetooth/<controller-address>/`), so pair on the same controller that `[obd_engine] adapter` names. `adapter` accepts either an `hciN` name or the controller's MAC address. Prefer the MAC when a USB Bluetooth dongle is attached, because `hciN` numbering can change between boots. A second USB adapter dedicated to the ELM327 is optional; the source already serializes connection setup with the BLE sources that share an adapter.
+
+**Discover the ELM327.** `tools/bt_discovery.py` scans BLE only and will not list Classic devices; use `bluetoothctl`:
+
+```sh
+bluetoothctl
+[bluetooth]# select <controller-address>     # only needed with more than one adapter
+[bluetooth]# power on
+[bluetooth]# agent on
+[bluetooth]# default-agent
+[bluetooth]# scan on
+```
+
+Wait for a `[NEW] Device` line with a name such as `OBDII`, `OBD2`, `V-LINK`, or `OBDLink`, then `scan off`. `devices` lists everything seen so far.
+
+**Pair and trust it:**
+
+```sh
+[bluetoothctl]# pair 00:1D:A5:XX:XX:XX       # PIN is usually 1234 or 0000 (sometimes 6789)
+[bluetoothctl]# trust 00:1D:A5:XX:XX:XX
+[bluetoothctl]# info 00:1D:A5:XX:XX:XX       # expect Paired: yes, Trusted: yes
+[bluetoothctl]# quit
+```
+
+Do not `connect` from `bluetoothctl`. BlueZ has no SPP profile handler, so `connect` normally fails with `br-connection-profile-unavailable`; that is expected. The service opens the RFCOMM channel itself, and there is no `rfcomm bind` or `/dev/rfcomm*` device.
+
+**Confirm the RFCOMM channel.** Nearly all ELM327 adapters use channel 1. If connections are refused, list the adapter's service records and look for `Serial Port` with its `Channel:` value:
+
+```sh
+sdptool browse 00:1D:A5:XX:XX:XX
+```
+
+`sdptool` needs BlueZ's compatibility mode on newer releases; if it reports `Failed to connect to SDP server`, try `channel = 1` first and other channels only if needed.
+
+**Configure and verify.** Put the adapter address, controller, and channel in `[obd_engine]`, add `obd_engine` to `[source] enabled-sources`, stop the service if it is running, and check the link:
+
+```sh
+PYTHONPATH=src .venv/bin/python tools/obd_tool.py --config config.ini --section obd_engine info
+.venv/bin/rvcontrol --config config.ini comms-check
+```
+
+`info` shows the ELM firmware string, battery voltage, and detected protocol. With the engine off it still succeeds and reports `ECU not responding`.
+
+**Permissions.** Opening an outgoing RFCOMM socket does not require root. Pairing with `bluetoothctl` requires access to BlueZ over D-Bus, typically membership in the `bluetooth` group or `sudo`. Pairing is persistent across reboots once the device is trusted.
+
+**Troubleshooting:**
+
+| Symptom | Likely cause |
+| --- | --- |
+| `[Errno 112] Host is down` | Adapter unpowered, asleep, or out of range. Normal with the ignition off; the daemon backs off and retries. |
+| `[Errno 111] Connection refused` | Wrong `channel`, adapter not paired on this controller, or a BLE-only adapter. |
+| `[Errno 16] Device or resource busy` / timeout on connect | Another client (phone, `obd_tool.py`, or a running service) already holds the connection. |
+| `[Errno 19] No such device` for the controller | The `adapter` value does not match a local controller; check `bluetoothctl list`. |
+| `ECU not responding (UNABLE TO CONNECT)` | Ignition off, or automatic protocol detection failed; set `fallback_protocol` (for example `6` for 11-bit 500 kbps CAN). |
+| Mode 22 PIDs return `NO DATA` while mode 01 works | Wrong `header` for the module that owns those PIDs, or the PID is not supported by this vehicle. |
+| Repeated pairing prompts or `AuthenticationFailed` | Remove and re-pair: `bluetoothctl remove <address>`, then repeat discovery and pairing. |
 
 ### Installation location and service startup
 

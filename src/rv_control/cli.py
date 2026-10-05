@@ -11,6 +11,7 @@ from .coach import Coach
 from .config import load_config
 from .mqtt import MqttPublisher
 from .hughes import HughesSource
+from .obd import ObdSource
 from .renogy import RenogySource
 from .rvc import RvcSource
 from .source import Source
