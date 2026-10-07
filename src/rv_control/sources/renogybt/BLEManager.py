@@ -6,7 +6,7 @@ import sys
 from typing import Any, Awaitable, Callable
 from bleak import BleakClient, BleakScanner, BLEDevice
 
-from ..bluetooth import BluetoothAdapterRegistry
+from ...bluetooth import BluetoothAdapterRegistry
 
 DISCOVERY_TIMEOUT = 5 # max wait time to complete the bluetooth scanning (seconds)
 
