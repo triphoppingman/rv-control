@@ -121,6 +121,10 @@ Choose a different adapter or scan duration when needed:
 
 The tool prints each matching device's family, Bluetooth address, advertised name, and signal strength. It does not connect to or modify any device. It scans BLE only; ELM327 OBD-II adapters use Bluetooth Classic and are discovered and paired with `bluetoothctl` as described in [ELM327 OBD-II adapter (Bluetooth Classic)](#elm327-obd-ii-adapter-bluetooth-classic).
 
+## Targets
+
+Telemetry goes to the sections listed in `[target] enabled-targets`; each section has a `type` (`mqtt` or `store`), like sources. `store` writes the latest payload per topic to a local JSON file (`directory`/`filename`, default `data/state.json`), keyed by the same full topic MQTT uses, e.g. `rv/renogy`; its `base_topic` defaults to the MQTT target's. Without a `[target]` section, the legacy `[service] targets` list (default `mqtt`) applies. New targets subclass `rv_control.target.Target`.
+
 ## MQTT check
 
 Use the MQTT check tool to verify the broker connection and observe project topics:

@@ -9,12 +9,13 @@ import click
 
 from .coach import Coach
 from .config import load_config
-from .mqtt import MqttPublisher
+from . import mqtt as _mqtt, store as _store  # noqa: F401  (register targets)
 from .hughes import HughesSource
 from .obd import ObdSource
 from .renogy import RenogySource
 from .rvc import RvcSource
 from .source import Source
+from .target import Target
 from .wled import WledSource
 
 
@@ -122,7 +123,7 @@ def run(config: Any) -> None:
     stop_event = threading.Event()
     sources = []
     source_map = {}
-    publisher = MqttPublisher(config, lambda topic, payload: _handle_command(config, source_map, topic, payload))
+    publisher = Target.build(config, lambda topic, payload: _handle_command(config, source_map, topic, payload))
     try:
         publisher.connect()
         sources, source_map = Source.start_enabled(config, publisher, stop_event)
@@ -130,7 +131,7 @@ def run(config: Any) -> None:
             raise click.ClickException("No sources are enabled")
         Source.run_until_stopped(config, publisher, stop_event, sources, source_map)
     except OSError as error:
-        raise click.ClickException(f"Unable to connect to MQTT: {error}") from error
+        raise click.ClickException(f"Unable to connect to target: {error}") from error
     except KeyboardInterrupt:
         click.echo("Stopping")
     finally:
@@ -142,9 +143,10 @@ def run(config: Any) -> None:
 
 def _handle_command(config: Any, source_map: dict[str, Any], topic: str, payload: dict[str, Any]) -> None:
     """Route an MQTT set-topic payload to its configured source."""
-    prefix = config["mqtt"].get("base_topic", "rv").strip("/") + "/"
+    section = config[Target.section_for_type(config, "mqtt") or "mqtt"]
+    prefix = section.get("base_topic", "rv").strip("/") + "/"
     relative = topic.removeprefix(prefix)
     source_name = relative.removesuffix("/set")
     source = source_map.get(source_name)
-    if source and config["mqtt"].getboolean("write_enabled", fallback=False):
+    if source and section.getboolean("write_enabled", fallback=False):
         source.handle_command(payload)

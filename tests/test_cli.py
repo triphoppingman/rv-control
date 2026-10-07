@@ -28,7 +28,7 @@ def test_run_closes_mqtt_when_source_startup_fails(monkeypatch: Any, config_file
             self.closed = True
 
     publisher = FakePublisher()
-    monkeypatch.setattr(cli_module, "MqttPublisher", lambda *_args, **_kwargs: publisher)
+    monkeypatch.setattr(cli_module.Target, "build", lambda *_args, **_kwargs: publisher)
     monkeypatch.setattr(cli_module.Source, "start_enabled", lambda *_args: (_ for _ in ()).throw(OSError("startup")))
     result = CliRunner().invoke(cli, ["--config", str(config_file), "run"])
     assert result.exit_code != 0

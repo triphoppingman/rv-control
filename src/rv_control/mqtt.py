@@ -4,15 +4,22 @@ import json
 import logging
 from typing import Any, Callable
 
+from .target import Target
+
 LOGGER = logging.getLogger(__name__)
 
 
-class MqttPublisher:
-    def __init__(self, config: Any, command_handler: Callable[[str, dict[str, Any]], None] | None = None) -> None:
-        """Create an MQTT publisher from configuration and an optional command callback."""
+class MqttTarget(Target, target_name="mqtt"):
+    """Publish telemetry to an MQTT broker and optionally receive set commands."""
+
+    config_section = "mqtt"
+
+    def __init__(self, config: Any, command_handler: Callable[[str, dict[str, Any]], None] | None = None, section_name: str | None = None) -> None:
+        """Create an MQTT publisher from its config section and an optional command callback."""
+        super().__init__(config, command_handler, section_name)
         import paho.mqtt.client as mqtt
 
-        section = config["mqtt"]
+        section = config[self.section_name]
         self.base_topic = section.get("base_topic", "rv").strip("/")
         self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="rv-control")
         self._mqtt = mqtt
@@ -54,3 +61,6 @@ class MqttPublisher:
         """Stop the MQTT loop and disconnect the broker client."""
         self.client.loop_stop()
         self.client.disconnect()
+
+
+MqttPublisher = MqttTarget

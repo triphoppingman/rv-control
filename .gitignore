@@ -27,3 +27,4 @@ config.json
 .idea/
 .DS_Store
 *.swp
+data/
