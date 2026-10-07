@@ -85,7 +85,7 @@ def compile_decode(expression: str) -> CodeType:
             raise ValueError(f"decode expression {expression!r} uses unsupported syntax: {type(node).__name__}")
         if isinstance(node, ast.Constant) and (isinstance(node.value, bool) or not isinstance(node.value, (int, float))):
             raise ValueError(f"decode expression {expression!r} may only contain numeric constants")
-        if isinstance(node, ast.Name) and not (_BYTE_NAME.match(node.id) or node.id in DECODE_FUNCTIONS):
+        if isinstance(node, ast.Name) and not (_BYTE_NAME.match(node.id) or node.id in DECODE_FUNCTIONS or node.id == "BARO"):
             raise ValueError(f"decode expression {expression!r} references unknown name {node.id!r}")
         if isinstance(node, ast.Call) and (not isinstance(node.func, ast.Name) or node.func.id not in DECODE_FUNCTIONS or node.keywords):
             raise ValueError(f"decode expression {expression!r} may only call {', '.join(sorted(DECODE_FUNCTIONS))}")
@@ -130,26 +130,31 @@ class ObdPid:
     expression: str
     unit: str
     code: CodeType
+    header: str | None = None
 
     @classmethod
     def parse(cls, name: str, value: str) -> ObdPid:
-        """Parse an INI value of the form mode, pid, decode expression, unit."""
+        """Parse a PID entry with an optional per-PID CAN header."""
         fields = value.split(",")
         if len(fields) < 4:
             raise ValueError(f"pid.{name} must be 'mode, pid, decode, unit'")
-        expression = ",".join(fields[2:-1]).strip()
+        optional_header = fields[-1].strip().upper()
+        has_header = len(optional_header) in (3, 6, 8) and bool(_HEX.match(optional_header))
+        expression = ",".join(fields[2:-2] if has_header else fields[2:-1]).strip()
         if not expression:
             raise ValueError(f"pid.{name} requires a decode expression")
-        return cls(name, parse_mode(fields[0]), parse_pid_hex(fields[1]), expression, fields[-1].strip(), compile_decode(expression))
+        unit = fields[-2].strip() if has_header else fields[-1].strip()
+        return cls(name, parse_mode(fields[0]), parse_pid_hex(fields[1]), expression, unit, compile_decode(expression), optional_header if has_header else None)
 
     @property
     def request(self) -> str:
         """Return the ELM327 request string for this PID."""
         return f"{self.mode:02X}{self.pid}"
 
-    def decode(self, data: bytes) -> int | float:
-        """Evaluate the decode expression with response data bytes bound to b0, b1, and so on."""
+    def decode(self, data: bytes, context: dict[str, int | float] | None = None) -> int | float:
+        """Evaluate the decode expression with response bytes and optional named values."""
         variables = {f"b{index}": value for index, value in enumerate(data)}
+        variables.update(context or {})
         try:
             value = eval(self.code, {"__builtins__": {}, **DECODE_FUNCTIONS}, variables)  # noqa: S307 - AST validated
         except NameError as error:
@@ -390,17 +395,26 @@ class ObdSource(Source, source_name="obd"):
             elm.close()
 
     @staticmethod
-    def query(elm: Elm327, pid: ObdPid) -> int | float:
+    def query(elm: Elm327, pid: ObdPid, context: dict[str, int | float] | None = None) -> int | float:
         """Request and decode one PID, raising ObdNoData when no usable value is returned."""
-        return pid.decode(extract_data(elm.command(pid.request), pid.mode, pid.pid))
+        return pid.decode(extract_data(elm.command(pid.request), pid.mode, pid.pid), context)
 
     def read_cycle(self, elm: Elm327) -> tuple[dict[str, int | float | None], dict[str, str]]:
         """Query every configured PID sequentially, recording N/A results without stopping."""
         values: dict[str, int | float | None] = {}
         errors: dict[str, str] = {}
+        current_header = self._header()
         for pid in self.pids:
             try:
-                values[pid.name] = self.query(elm, pid)
+                target_header = pid.header or self._header()
+                if target_header and target_header != current_header:
+                    if "OK" not in elm.command(f"ATSH{target_header}"):
+                        raise ObdNoData(f"ELM327 rejected ATSH{target_header}")
+                    current_header = target_header
+                context: dict[str, int | float] = {}
+                if pid.name == "boost" and isinstance(values.get("baro"), (int, float)):
+                    context["BARO"] = values["baro"]
+                values[pid.name] = self.query(elm, pid, context)
             except (ObdNoData, TimeoutError) as error:
                 values[pid.name] = None
                 errors[pid.name] = str(error)

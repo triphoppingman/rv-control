@@ -104,6 +104,9 @@ def test_pid_parsing_keeps_commas_in_decode_and_validates_mode() -> None:
     """Verify PID entries split around decode expressions and reject write services."""
     pid = ObdPid.parse("clamped", "0x01, 0c, max(b0-40,0), °C")
     assert (pid.mode, pid.pid, pid.expression, pid.unit, pid.request) == (1, "0C", "max(b0-40,0)", "°C", "010C")
+    transmission_temp = ObdPid.parse("tft", "22, 1E1C, ((b0-256 if b0>=128 else b0)*256+b1)*(9/80)+32, °F, 7E1")
+    assert transmission_temp.header == "7E1"
+    assert transmission_temp.decode(bytes([0xFF, 0x00])) == 3.2
     with pytest.raises(ValueError, match="not a read-only mode"):
         ObdPid.parse("clear", "04, , b0, ")
     with pytest.raises(ValueError, match="not a read-only mode"):
@@ -124,6 +127,37 @@ def test_decode_reports_short_responses_and_rounds_float_noise() -> None:
     assert pid.decode(bytes([0x03, 0xE8])) == 140.0
     with pytest.raises(ObdNoData, match="short response"):
         pid.decode(bytes([0x03]))
+
+
+def test_read_cycle_uses_baro_dependency_and_per_pid_can_header() -> None:
+    """Verify Boost decodes against Baro and transmission requests switch the CAN header."""
+    responses = {
+        **INIT,
+        "22F478": "62F47803E8",
+        "010C": "410C1AF8",
+        "0105": "41055A",
+        "0133": "413364",
+        "221440": "62144003E8",
+        "ATSH7E1": "OK",
+        "221E1C": "621E1CFF00",
+    }
+    source, _sockets = make_source(
+        responses,
+        **{
+            "pid.baro": "01, 33, b0/100, bar",
+            "pid.boost": "22, 1440, (b0*256+b1)*0.03625-BARO*14.5038, PSI",
+            "pid.tft": "22, 1E1C, ((b0-256 if b0>=128 else b0)*256+b1)*(9/80)+32, °F, 7E1",
+        },
+    )
+    elm = Elm327(FakeElmSocket(responses))
+
+    values, errors = source.read_cycle(elm)
+
+    assert values["baro"] == 1.0
+    assert values["boost"] == 21.7462
+    assert values["tft"] == 3.2
+    assert not errors
+    assert elm.connection.sent.index("ATSH7E1") < elm.connection.sent.index("221E1C")
 
 
 def test_extract_data_handles_echo_errors_negative_and_multiframe() -> None:

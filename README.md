@@ -317,9 +317,26 @@ topic = obd
 pid.egt11 = 22, F478, ((b0*256+b1)*0.18)-40, °F
 pid.rpm = 01, 0C, (b0*256+b1)/4, RPM
 pid.coolant_temp = 01, 05, (b0-40)*1.8+32, °F
+pid.tft = 22, 1E1C, ((b0-256 if b0>=128 else b0)*256+b1)*(9/80)+32, °F, 7E1
+pid.eot = 22, 1310, (((b0*256+b1)/100)+40)*(9/5)+32, °F
+pid.baro = 01, 33, b0/100, bar
+pid.boost = 22, 1440, (b0*256+b1)*0.03625-BARO*14.5038, PSI
+pid.load = 01, 04, b0/2.55-50, %%
+pid.iat = 01, 0F, b0-40, °F
+pid.vgt = 22, 096D, b0/2.55, %%
+pid.speed = 01, 0D, b0/1.609344, MPH
+pid.fuel = 22, F42F, b0*0.39216, %%
+pid.volt = 01, 42, (b0*256+b1)/1000, V
+pid.gear = 22, 1E12, b0, , 7E1
+pid.fipw = 22, 1410, (b0*256+b1)*0.008, ms
+pid.icp = 22, 1430, (b0*256+b1)/2, PSI
+pid.app = 01, 41, b0/2.55, %%
+pid.ambient = 22, F446, b0-40, °F
+pid.iat2 = 22, F45B, b0-40, °F
+pid.tcc = 22, 1E23, b0, , 7E1
 ```
 
-Each `pid.<name> = mode, pid, decode, unit` entry defines one PID. `mode` and `pid` are hexadecimal; only read-only OBD modes (01, 02, 03, 05, 06, 07, 09, 0A, 21, 22) are accepted. `decode` is an arithmetic expression over the response data bytes `b0`, `b1`, … (after the echoed mode and PID); it may use numeric constants, arithmetic, bitwise and comparison operators, conditional expressions, and `abs`, `min`, `max`, `round`, `int`, and `float`. Expressions are validated and compiled once at startup. INI option names are case-insensitive, so use snake_case PID names; they become the payload keys. Write a literal `%` (modulo) as `%%`.
+Each `pid.<name> = mode, pid, decode, unit` entry defines one PID; append `, header` to override the source CAN header for an individual PID. `mode`, `pid`, and `header` are hexadecimal; only read-only OBD modes (01, 02, 03, 05, 06, 07, 09, 0A, 21, 22) are accepted. `decode` is an arithmetic expression over the response data bytes `b0`, `b1`, … (after the echoed mode and PID); it may use numeric constants, arithmetic, bitwise and comparison operators, conditional expressions, and `abs`, `min`, `max`, `round`, `int`, and `float`. The Ford example includes a signed `7E1` transmission-temperature PID and uses the `baro` reading (in bar) as `BARO` converted to PSI for the `boost` calculation; keep `pid.baro` before `pid.boost`. Expressions are validated and compiled once at startup. INI option names are case-insensitive, so use snake_case PID names; they become the payload keys. Write a literal `%` in a unit or as modulo as `%%`.
 
 On connect the source sends `ATZ`, `ATE0`, `ATL0`, `ATS0`, `ATH0`, `ATSP<protocol>`, and `ATSH<header>` (when `header` is set), reads the adapter voltage, and probes the ECU with `0100`. If the probe fails and `fallback_protocol` is set, it retries with that protocol (for example `6` for 11-bit 500 kbps CAN). PIDs are then queried sequentially once per cycle at `poll_hz`; a PID returning `NO DATA`, an error, or a short response is published as `null` and polling continues.
 

@@ -25,6 +25,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - `comms-check` passes when the adapter answers (even with the engine off) and lists configured PIDs and units; `interrogate` returns one reading of every PID.
 - `tools/obd_tool.py` with `info`, `supported`, `read`, `monitor`, and `query` commands for direct, read-only adapter access using the same INI section.
 - `[obd_engine]` example section in `config-example.ini`.
+- Expanded the example OBD-II PID set with the requested Power Stroke towing signals while retaining the existing EGT11, RPM, and coolant-temperature entries; transmission PIDs can specify their `7E1` CAN header, and Boost uses the configured Baro reading.
 - Synchronous `connect_slot_sync()` on the Bluetooth adapter coordinator so RFCOMM connects serialize with BLE connection setup on a shared adapter.
 - README documentation for the OBD source and a Raspberry Pi guide for ELM327 adapter selection, controller selection, discovery, pairing, RFCOMM channel lookup, permissions, and troubleshooting.
 - `tests/test_obd.py` covering PID parsing, decode safety, response parsing, adapter I/O, interrogation, fallback protocol, comms-check, daemon reconnects, retry limits, and adapter resolution.
