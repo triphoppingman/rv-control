@@ -690,16 +690,17 @@ The OBD source talks to the adapter over Bluetooth Classic RFCOMM (Serial Port P
 
 **Power it up.** Most OBD ports are always powered, but many adapters sleep until the ignition is on or the bus is active. Turn the ignition on before discovery and pairing.
 
-**Pick the Pi adapter.** List local controllers and note the one you will use:
+**Pick the Pi adapter.** List local controllers and note both the controller address and its `hciN` name:
 
 ```sh
 bluetoothctl list
-hciconfig -a        # shows hciN names alongside controller addresses
+bluetoothctl show
+hciconfig -a        # optional: maps hciN names to controller addresses
 ```
 
-BlueZ stores pairings per controller (`/var/lib/bluetooth/<controller-address>/`), so pair on the same controller that `[obd_engine] adapter` names. `adapter` accepts either an `hciN` name or the controller's MAC address. Prefer the MAC when a USB Bluetooth dongle is attached, because `hciN` numbering can change between boots. A second USB adapter dedicated to the ELM327 is optional; the source already serializes connection setup with the BLE sources that share an adapter.
+BlueZ stores pairings per controller (`/var/lib/bluetooth/<controller-address>/`), so pair on the same controller that `[obd_engine] adapter` names. `adapter` accepts either an `hciN` name or the controller's MAC address. Using the controller MAC shown by `bluetoothctl list` avoids needing to map it to an `hciN`, and is more stable when a USB Bluetooth dongle is attached because `hciN` numbering can change between boots. A second USB adapter dedicated to the ELM327 is optional; the source already serializes connection setup with the BLE sources that share an adapter.
 
-**Discover the ELM327.** `tools/bt_discovery.py` scans BLE only and will not list Classic devices; use `bluetoothctl`:
+**Discover the ELM327.** `tools/bt_discovery.py` scans BLE only and will not list Classic devices; use `bluetoothctl`. If there is more than one controller, select the controller you intend to configure before scanning. Replace `<controller-address>` and `<elm327-address>` below with the addresses shown by BlueZ:
 
 ```sh
 bluetoothctl
@@ -708,37 +709,52 @@ bluetoothctl
 [bluetooth]# agent on
 [bluetooth]# default-agent
 [bluetooth]# scan on
+[bluetooth]# devices
+[bluetooth]# scan off
 ```
 
-Wait for a `[NEW] Device` line with a name such as `OBDII`, `OBD2`, `V-LINK`, or `OBDLink`, then `scan off`. `devices` lists everything seen so far.
+Wait for a `[NEW] Device` line with a name such as `OBDII`, `OBD2`, `V-LINK`, or `OBDLink`. Record its address, run `devices` to confirm it is listed, then stop the scan with `scan off`. If no likely adapter appears, check that the dongle is powered and awake, the ignition is on, and the Pi's Bluetooth controller is not blocked (`rfkill list bluetooth`).
 
-**Pair and trust it:**
+**Pair and trust it.** Still at the `bluetoothctl` prompt, substitute the discovered adapter address:
 
 ```sh
-[bluetoothctl]# pair 00:1D:A5:XX:XX:XX       # PIN is usually 1234 or 0000 (sometimes 6789)
-[bluetoothctl]# trust 00:1D:A5:XX:XX:XX
-[bluetoothctl]# info 00:1D:A5:XX:XX:XX       # expect Paired: yes, Trusted: yes
-[bluetoothctl]# quit
+[bluetooth]# pair <elm327-address>       # PIN is usually 1234 or 0000 (sometimes 6789)
+[bluetooth]# trust <elm327-address>
+[bluetooth]# info <elm327-address>       # expect Paired: yes, Trusted: yes
+[bluetooth]# quit
 ```
 
 Do not `connect` from `bluetoothctl`. BlueZ has no SPP profile handler, so `connect` normally fails with `br-connection-profile-unavailable`; that is expected. The service opens the RFCOMM channel itself, and there is no `rfcomm bind` or `/dev/rfcomm*` device.
 
-**Confirm the RFCOMM channel.** Nearly all ELM327 adapters use channel 1. If connections are refused, list the adapter's service records and look for `Serial Port` with its `Channel:` value:
+**Confirm the RFCOMM channel.** Start with channel 1; nearly all ELM327 adapters use it. If connections are refused, list the adapter's service records and look for `Serial Port` with its `Channel:` value:
 
 ```sh
-sdptool browse 00:1D:A5:XX:XX:XX
+sdptool browse <elm327-address>
 ```
 
 `sdptool` needs BlueZ's compatibility mode on newer releases; if it reports `Failed to connect to SDP server`, try `channel = 1` first and other channels only if needed.
 
-**Configure and verify.** Put the adapter address, controller, and channel in `[obd_engine]`, add `obd_engine` to `[source] enabled-sources`, stop the service if it is running, and check the link:
+**Configure and verify.** In `config.ini`, set the discovered ELM327 address, the selected local controller (`hciN` or its MAC address), and the RFCOMM channel in `[obd_engine]`. Replace both address placeholders in the example with the actual addresses and omit the angle brackets. Add `obd_engine` to the comma-separated `[source] enabled-sources` list. For example:
+
+```ini
+[source]
+enabled-sources = rv_c_bus, renogy_controller, hughes_power_watchdog, obd_engine
+
+[obd_engine]
+type = obd
+adapter = <controller-address>
+address = <elm327-address>
+channel = 1
+```
+
+Keep the source's other OBD settings and PID entries from the existing configuration. Stop `rvcontrol run` first if it is already using the adapter; the ELM327 accepts only one RFCOMM connection at a time. Then check the connection:
 
 ```sh
 PYTHONPATH=src .venv/bin/python tools/obd_tool.py --config config.ini --section obd_engine info
 .venv/bin/rvcontrol --config config.ini comms-check
 ```
 
-`info` shows the ELM firmware string, battery voltage, and detected protocol. With the engine off it still succeeds and reports `ECU not responding`.
+`info` should show the ELM firmware string, battery voltage, and detected protocol. If it reports `ECU not responding`, the Bluetooth/RFCOMM connection may still be working; turn the ignition on and retry before diagnosing the adapter. `comms-check` verifies the configured source. Once checks pass, start the service and confirm its OBD status/telemetry.
 
 **Permissions.** Opening an outgoing RFCOMM socket does not require root. Pairing with `bluetoothctl` requires access to BlueZ over D-Bus, typically membership in the `bluetooth` group or `sudo`. Pairing is persistent across reboots once the device is trusted.
 
