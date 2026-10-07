@@ -6,7 +6,7 @@ from __future__ import annotations
 import can
 import click
 
-from rv_control.rvc import RVC_SPECFILE, decode_message, format_message, load_spec
+from rv_control.sources.rvc import RVC_SPECFILE, decode_message, format_message, load_spec
 
 
 @click.command()

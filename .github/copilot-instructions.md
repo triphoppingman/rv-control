@@ -12,16 +12,20 @@ Telemetry is published as JSON to a local MQTT broker such as Mosquitto.
 
 ## Repository structure
 
+- `src/rv_control/sources/` and `src/rv_control/targets/`: One module per source or target type; each registers itself through its ABC in `base.py`.
 - `src/rv_control/cli.py`: Click command-line interface.
-- `src/rv_control/source.py`: `Source` ABC, source registry, lifecycle, supervision, communication checks, and aggregate interrogation.
-- `src/rv_control/rvc.py`: RV-C decoding, CAN reads, interrogation, and optional writes.
-- `src/rv_control/renogy.py`: Renogy adapter, self-contained configuration mapping, register inventory, interrogation, and optional writes.
-- `src/rv_control/hughes.py`: Hughes BLE protocols, attribute inventory, interrogation, and daemon reconnects.
-- `src/rv_control/wled.py`: WLED local JSON API source, polling, interrogation, and guarded state writes.
-- `src/rv_control/obd.py`: Read-only ELM327 Bluetooth RFCOMM OBD-II PID source, INI-defined PIDs, safe decode expressions, and engine on/off reconnects.
-- `src/rv_control/renogybt/`: Project-owned Renogy client implementation.
+- `src/rv_control/sources/base.py`: `Source` ABC, source registry, lifecycle, supervision, communication checks, and aggregate interrogation.
+- `src/rv_control/sources/rvc.py`: RV-C decoding, CAN reads, interrogation, and optional writes.
+- `src/rv_control/sources/renogy.py`: Renogy adapter, self-contained configuration mapping, register inventory, interrogation, and optional writes.
+- `src/rv_control/sources/hughes.py`: Hughes BLE protocols, attribute inventory, interrogation, and daemon reconnects.
+- `src/rv_control/sources/wled.py`: WLED local JSON API source, polling, interrogation, and guarded state writes.
+- `src/rv_control/sources/obd.py`: Read-only ELM327 Bluetooth RFCOMM OBD-II PID source, INI-defined PIDs, safe decode expressions, and engine on/off reconnects.
+- `src/rv_control/sources/renogybt/`: Project-owned Renogy client implementation.
 - `src/rv_control/data/rvc-spec.yml`: Project-owned RV-C DGN specification.
-- `src/rv_control/mqtt.py`: MQTT publishing and optional command subscription.
+- `src/rv_control/targets/base.py`: `Target` ABC, target registry, and `MultiTarget` fan-out.
+- `src/rv_control/targets/mqtt.py`: MQTT publishing and optional command subscription.
+- `src/rv_control/targets/store.py`: Latest-value-per-topic local JSON file target.
+- `src/rv_control/targets/log.py`: Debug target that logs topics and payloads.
 - `config.ini`: Local runtime configuration; treat it as machine-specific and do not expose credentials.
 - `config-example.ini`: Shareable configuration template.
 - `tests/`: pytest regression tests.
@@ -35,7 +39,7 @@ The old `vendor/` directory has been removed. Do not recreate runtime dependenci
 - Add an expressive docstring to every function and method, including private methods and nested callbacks.
 - Preserve the `Source` ABC and register new sources through its registry mechanism. A source must provide `source_name`, `config_section`, `run`, and `comms_check`.
 - Keep protocol-specific behavior inside its source module. Do not put device logic in the CLI.
-- Keep shared RV-C utility functionality in `src/rv_control/rvc_util.py`; tools under `tools/` should call its canonical specification, CAN-frame, DGN, and protocol helper functions rather than duplicating them. Keep `src/rv_control/rvc.py` focused on `RvcSource` integration and compatibility re-exports.
+- Keep shared RV-C utility functionality in `src/rv_control/rvc_util.py`; tools under `tools/` should call its canonical specification, CAN-frame, DGN, and protocol helper functions rather than duplicating them. Keep `src/rv_control/sources/rvc.py` focused on `RvcSource` integration and compatibility re-exports.
 - Coach semantic mappings under `src/rv_control/coaches/` select transports (e.g. `rvc`, `wled`); the `[coach]` section in `config.ini` maps transport names to installation-specific INI sections (e.g. `rvc = rv_c_bus`). All source access from `Coach` must use the `Source` abstraction.
 - Keep `comms-check` and `interrogate` one-shot operations. They must not inherit daemon persistence or run indefinitely.
 - `run` is the long-lived daemon path. Avoid rereading static specifications or rebuilding static client configuration inside poll loops.

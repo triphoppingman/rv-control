@@ -40,7 +40,7 @@ class Source(threading.Thread, ABC):
         if name not in cls._registry:
             try:
                 import importlib
-                importlib.import_module(f".{name}", package="rv_control")
+                importlib.import_module(f".{name}", package="rv_control.sources")
             except ImportError:
                 pass
         try:

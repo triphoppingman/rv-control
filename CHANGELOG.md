@@ -10,7 +10,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - Pluggable telemetry targets: `Target` ABC ([src/rv_control/target.py](src/rv_control/target.py)) with a self-registering registry, mirroring `Source`. Targets are enabled via `[target] enabled-targets` (section names, each with a `type`); several targets fan out through `MultiTarget`, where one target's failure does not affect the others.
 - `store` target ([src/rv_control/store.py](src/rv_control/store.py)) that keeps the latest payload per full topic (e.g. `rv/renogy`) in a local JSON file (`directory`, `filename`, `flush_interval`; default `data/state.json`), written atomically from a background thread.
-- `[target]` and `[store]` sections in `config-example.ini`, README "Targets" documentation, and `tests/test_target.py`.
+- `log` target ([src/rv_control/log.py](src/rv_control/log.py)) that logs each full topic and JSON payload at a configurable `level` without storing or forwarding anything, for debugging sources.
+- `[target]`, `[store]`, and `[log]` sections in `config-example.ini`, README "Targets" documentation, and `tests/test_target.py`.
 - ELM327 Bluetooth OBD-II source (`type = obd`, [src/rv_control/obd.py](src/rv_control/obd.py)) that polls configured PIDs read-only over a raw Bluetooth RFCOMM socket (no `rfcomm bind`, no `pyserial`) and publishes them to MQTT.
   - PIDs are configured in the source's INI section as `pid.<name> = mode, pid, decode, unit`; decode expressions over `b0`, `b1`, … are validated against a safe arithmetic subset and compiled once at startup.
   - Only read-only OBD modes (01, 02, 03, 05, 06, 07, 09, 0A, 21, 22) are accepted; the source does not accept MQTT commands.
@@ -31,6 +32,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Source tree reorganized: sources (including `renogybt/`) now live in `src/rv_control/sources/` with the `Source` ABC in `sources/base.py`, and targets live in `src/rv_control/targets/` with the `Target` ABC in `targets/base.py`. Shared `bluetooth.py` and `rvc_util.py` stay at the package top level. Python import paths changed (e.g. `rv_control.sources.rvc`, `rv_control.targets.mqtt`); the CLI and configuration contract is unchanged.
 - MQTT publishing is now `MqttTarget` ([src/rv_control/mqtt.py](src/rv_control/mqtt.py)), with unchanged topics, payloads, and write gating; `MqttPublisher` remains as an alias. `run` builds publishers with `Target.build`, and command routing locates the MQTT section by `type`.
 - `[mqtt]` is no longer required when a `[target]` section is present. Without `[target]`, the legacy `[service] targets` list (default `mqtt`) applies, so existing configs behave as before.
 - Configuration files are read as UTF-8 so unit strings such as `°F` load consistently.

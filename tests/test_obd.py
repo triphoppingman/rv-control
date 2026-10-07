@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from rv_control.obd import (
+from rv_control.sources.obd import (
     Elm327,
     ObdNoData,
     ObdPid,
@@ -246,7 +246,7 @@ def test_invalid_configuration_fails_before_connecting() -> None:
 
 def test_resolve_adapter_address_accepts_mac_and_rejects_bad_names() -> None:
     """Verify adapters may be given as a literal MAC and invalid names are rejected before any socket I/O."""
-    from rv_control.obd import resolve_adapter_address
+    from rv_control.sources.obd import resolve_adapter_address
 
     assert resolve_adapter_address("ac:7b:a1:00:00:01") == "AC:7B:A1:00:00:01"
     with pytest.raises(ValueError):

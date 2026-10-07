@@ -10,7 +10,7 @@ from typing import Any, Callable
 import click
 
 from rv_control.config import load_config
-from rv_control.obd import ObdError, ObdSource, extract_data, validate_request
+from rv_control.sources.obd import ObdError, ObdSource, extract_data, validate_request
 
 
 @click.group()

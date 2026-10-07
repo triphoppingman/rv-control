@@ -9,14 +9,14 @@ import click
 
 from .coach import Coach
 from .config import load_config
-from . import mqtt as _mqtt, store as _store  # noqa: F401  (register targets)
-from .hughes import HughesSource
-from .obd import ObdSource
-from .renogy import RenogySource
-from .rvc import RvcSource
-from .source import Source
-from .target import Target
-from .wled import WledSource
+from .sources.base import Source
+from .sources.hughes import HughesSource
+from .sources.obd import ObdSource
+from .sources.renogy import RenogySource
+from .sources.rvc import RvcSource
+from .sources.wled import WledSource
+from .targets import log as _log, mqtt as _mqtt, store as _store  # noqa: F401  (register targets)
+from .targets.base import Target
 
 
 @click.group()

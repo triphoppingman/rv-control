@@ -18,7 +18,7 @@ from .rvc_util import (
     dc_dimmer_payload,
     normalize_can_payload,
 )
-from .source import Source
+from .sources.base import Source
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_COACH_SPEC = str(Path(__file__).resolve().parent / "coaches/thor-magnitude-bh35-2020.yml")

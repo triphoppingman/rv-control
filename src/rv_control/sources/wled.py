@@ -6,7 +6,7 @@ from typing import Any
 
 import requests
 
-from .source import Source
+from .base import Source
 
 
 LOGGER = logging.getLogger(__name__)

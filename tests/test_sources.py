@@ -6,14 +6,14 @@ from pathlib import Path
 from typing import Any
 
 from rv_control.config import load_config
-from rv_control.hughes import HughesSource
-from rv_control.renogy import RenogySource
-from rv_control.rvc import RvcSource
-from rv_control.rvc import (RvcName, address_claim_message,
+from rv_control.sources.hughes import HughesSource
+from rv_control.sources.renogy import RenogySource
+from rv_control.sources.rvc import RvcSource
+from rv_control.sources.rvc import (RvcName, address_claim_message,
                             build_address_claim_message,
                             build_dc_dimmer_message, decode_rvc_name,
                             encode_rvc_name)
-from rv_control.source import Source
+from rv_control.sources.base import Source
 
 
 def test_source_registry_contains_concrete_sources() -> None:

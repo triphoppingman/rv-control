@@ -5,7 +5,7 @@ import logging
 import socket
 from typing import Any
 
-from .source import Source
+from .base import Source
 
 
 LOGGER = logging.getLogger(__name__)

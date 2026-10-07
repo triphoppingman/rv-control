@@ -8,7 +8,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from .target import Target
+from .base import Target
 
 LOGGER = logging.getLogger(__name__)
 

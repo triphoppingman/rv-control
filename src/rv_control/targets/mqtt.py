@@ -4,7 +4,7 @@ import json
 import logging
 from typing import Any, Callable
 
-from .target import Target
+from .base import Target
 
 LOGGER = logging.getLogger(__name__)
 

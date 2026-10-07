@@ -10,7 +10,7 @@ import click
 import requests
 
 from rv_control.config import load_config
-from rv_control.wled import WledSource
+from rv_control.sources.wled import WledSource
 
 
 @click.group()

@@ -5,9 +5,9 @@ from configparser import ConfigParser
 from pathlib import Path
 from typing import Any
 
-from rv_control.mqtt import MqttTarget
-from rv_control.store import StoreTarget
-from rv_control.target import MultiTarget, Target
+from rv_control.targets.mqtt import MqttTarget
+from rv_control.targets.store import StoreTarget
+from rv_control.targets.base import MultiTarget, Target
 
 
 def _config(tmp_path: Path, targets: str = "store") -> ConfigParser:
@@ -74,3 +74,15 @@ def test_legacy_service_targets_and_missing_type(tmp_path: Path) -> None:
         assert "requires type" in str(error)
     else:
         raise AssertionError("expected ValueError")
+
+
+def test_log_target_logs_topic_and_payload(caplog: Any) -> None:
+    """Verify the log target emits the full topic and JSON payload."""
+    import logging
+
+    config = ConfigParser()
+    config.read_dict({"target": {"enabled-targets": "dbg"}, "dbg": {"type": "log", "base_topic": "rv", "level": "DEBUG"}})
+    target = Target.build(config)
+    with caplog.at_level(logging.DEBUG, logger="rv_control.targets.log"):
+        target.publish("renogy", {"v": 1})
+    assert 'rv/renogy {"v": 1}' in caplog.text

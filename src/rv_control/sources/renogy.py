@@ -4,7 +4,7 @@ import asyncio
 import logging
 from typing import Any
 
-from .source import Source
+from .base import Source
 
 
 LOGGER = logging.getLogger(__name__)
@@ -14,13 +14,13 @@ class RenogySource(Source, source_name="renogy"):
     source_name = "renogy"
     config_section = "renogy"
     CLIENTS = {
-        "RNG_CTRL": ("rv_control.renogybt.RoverClient", "RoverClient"),
-        "RNG_CTRL_HIST": ("rv_control.renogybt.RoverHistoryClient", "RoverHistoryClient"),
-        "RNG_BATT": ("rv_control.renogybt.BatteryClient", "BatteryClient"),
-        "RNG_INVT": ("rv_control.renogybt.InverterClient", "InverterClient"),
-        "RNG_INVT_HF": ("rv_control.renogybt.HFInverterClient", "HFInverterClient"),
-        "RNG_DCC": ("rv_control.renogybt.DCChargerClient", "DCChargerClient"),
-        "RNG_SHNT": ("rv_control.renogybt.ShuntClient", "ShuntClient"),
+        "RNG_CTRL": ("rv_control.sources.renogybt.RoverClient", "RoverClient"),
+        "RNG_CTRL_HIST": ("rv_control.sources.renogybt.RoverHistoryClient", "RoverHistoryClient"),
+        "RNG_BATT": ("rv_control.sources.renogybt.BatteryClient", "BatteryClient"),
+        "RNG_INVT": ("rv_control.sources.renogybt.InverterClient", "InverterClient"),
+        "RNG_INVT_HF": ("rv_control.sources.renogybt.HFInverterClient", "HFInverterClient"),
+        "RNG_DCC": ("rv_control.sources.renogybt.DCChargerClient", "DCChargerClient"),
+        "RNG_SHNT": ("rv_control.sources.renogybt.ShuntClient", "ShuntClient"),
     }
 
     def __init__(self, config: Any, publisher: Any, stop_event: Any, section_name: str | None = None) -> None:

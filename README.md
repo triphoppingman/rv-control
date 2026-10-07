@@ -5,11 +5,11 @@
 The runtime is self-contained and does not import code or configuration from external checkout directories:
 
 - `src/rv_control/data/rvc-spec.yml` is the project-owned RV-C DGN specification.
-- `src/rv_control/renogybt` contains the project-owned Renogy client implementation.
-- `src/rv_control/hughes.py` contains the standalone Hughes BLE implementation.
-- `src/rv_control/wled.py` contains the WLED local JSON API source.
-- `src/rv_control/gpsd.py` contains the gpsd JSON TCP source.
-- `src/rv_control/obd.py` contains the read-only ELM327 Bluetooth OBD-II PID source.
+- `src/rv_control/sources/renogybt` contains the project-owned Renogy client implementation.
+- `src/rv_control/sources/hughes.py` contains the standalone Hughes BLE implementation.
+- `src/rv_control/sources/wled.py` contains the WLED local JSON API source.
+- `src/rv_control/sources/gpsd.py` contains the gpsd JSON TCP source.
+- `src/rv_control/sources/obd.py` contains the read-only ELM327 Bluetooth OBD-II PID source.
 
 ## User guide
 
@@ -123,7 +123,7 @@ The tool prints each matching device's family, Bluetooth address, advertised nam
 
 ## Targets
 
-Telemetry goes to the sections listed in `[target] enabled-targets`; each section has a `type` (`mqtt` or `store`), like sources. `store` writes the latest payload per topic to a local JSON file (`directory`/`filename`, default `data/state.json`), keyed by the same full topic MQTT uses, e.g. `rv/renogy`; its `base_topic` defaults to the MQTT target's. Without a `[target]` section, the legacy `[service] targets` list (default `mqtt`) applies. New targets subclass `rv_control.target.Target`.
+Telemetry goes to the sections listed in `[target] enabled-targets`; each section has a `type` (`mqtt`, `store`, or `log`), like sources. `store` writes the latest payload per topic to a local JSON file (`directory`/`filename`, default `data/state.json`), keyed by the same full topic MQTT uses, e.g. `rv/renogy`; its `base_topic` defaults to the MQTT target's. `log` writes each full topic and JSON payload to the service log at `level` (default `INFO`) and stores nothing, which helps debug sources; add its section name to `enabled-targets` to use it. Without a `[target]` section, the legacy `[service] targets` list (default `mqtt`) applies. New targets subclass `rv_control.targets.base.Target`.
 
 ## MQTT check
 
@@ -493,7 +493,7 @@ Install dependencies with `pip install -r requirements.txt`.
 
 ### RV-C utilities
 
-All reusable RV-C CAN functionality belongs in [src/rv_control/rvc_util.py](src/rv_control/rvc_util.py). Tools under `tools/` should import these helpers instead of implementing their own CAN identifier packing, payload validation, specification loading, frame decoding, or display formatting. [src/rv_control/rvc.py](src/rv_control/rvc.py) owns the `RvcSource` lifecycle and re-exports utility names for compatibility.
+All reusable RV-C CAN functionality belongs in [src/rv_control/rvc_util.py](src/rv_control/rvc_util.py). Tools under `tools/` should import these helpers instead of implementing their own CAN identifier packing, payload validation, specification loading, frame decoding, or display formatting. [src/rv_control/sources/rvc.py](src/rv_control/sources/rvc.py) owns the `RvcSource` lifecycle and re-exports utility names for compatibility.
 
 The transmit helpers are:
 
@@ -587,8 +587,8 @@ sudo systemctl restart rv-control
 This project explicitly acknowledges and incorporates work from the following open-source projects. The listed upstream repositories are the authoritative sources for the original code, documentation, specifications, and license terms:
 
 - [linuxkidd/rvc-monitor-py](https://github.com/linuxkidd/rvc-monitor-py): RV-C protocol implementation and DGN specification. The project-owned specification copy is `src/rv_control/data/rvc-spec.yml`. The upstream project is licensed under the [Apache License 2.0](https://github.com/linuxkidd/rvc-monitor-py/blob/master/LICENSE).
-- [cyrils/renogy-bt](https://github.com/cyrils/renogy-bt): Renogy BLE clients, register definitions, and parsers. The project-owned client copy is `src/rv_control/renogybt/`, with its license notice at `src/rv_control/renogybt/LICENSE`. The upstream project is licensed under the [GNU General Public License v3.0](https://github.com/cyrils/renogy-bt/blob/main/LICENSE).
-- [IAmTheMitchell/Hughes-Power-Watchdog](https://github.com/IAmTheMitchell/Hughes-Power-Watchdog): Hughes Power Watchdog BLE protocol reference and device-generation behavior. The standalone implementation in `src/rv_control/hughes.py` follows that protocol documentation. The upstream project is licensed under the [MIT License](https://github.com/IAmTheMitchell/Hughes-Power-Watchdog/blob/main/LICENSE).
+- [cyrils/renogy-bt](https://github.com/cyrils/renogy-bt): Renogy BLE clients, register definitions, and parsers. The project-owned client copy is `src/rv_control/sources/renogybt/`, with its license notice at `src/rv_control/sources/renogybt/LICENSE`. The upstream project is licensed under the [GNU General Public License v3.0](https://github.com/cyrils/renogy-bt/blob/main/LICENSE).
+- [IAmTheMitchell/Hughes-Power-Watchdog](https://github.com/IAmTheMitchell/Hughes-Power-Watchdog): Hughes Power Watchdog BLE protocol reference and device-generation behavior. The standalone implementation in `src/rv_control/sources/hughes.py` follows that protocol documentation. The upstream project is licensed under the [MIT License](https://github.com/IAmTheMitchell/Hughes-Power-Watchdog/blob/main/LICENSE).
 
 The copied and derived components under `src/rv_control` retain the applicable upstream license notices. When redistributing this project, preserve those notices and continue to provide the upstream license terms for the corresponding components.
 

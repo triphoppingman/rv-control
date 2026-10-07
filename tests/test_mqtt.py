@@ -4,7 +4,7 @@ import json
 from configparser import ConfigParser
 from typing import Any
 
-from rv_control.mqtt import MqttPublisher
+from rv_control.targets.mqtt import MqttPublisher
 from rv_control.cli import _handle_command
 
 

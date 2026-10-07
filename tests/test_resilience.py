@@ -6,9 +6,9 @@ from pathlib import Path
 from typing import Any
 
 from rv_control.config import load_config
-from rv_control.hughes import HughesSource
-from rv_control.renogy import RenogySource
-from rv_control.source import Source
+from rv_control.sources.hughes import HughesSource
+from rv_control.sources.renogy import RenogySource
+from rv_control.sources.base import Source
 
 
 def test_source_supervisor_restarts_dead_source() -> None:

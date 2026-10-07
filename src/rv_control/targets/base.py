@@ -44,7 +44,7 @@ class Target(ABC):
         """Return the registered target class for a name, importing its module if needed."""
         if name not in cls._registry:
             try:
-                importlib.import_module(f".{name}", package="rv_control")
+                importlib.import_module(f".{name}", package="rv_control.targets")
             except ImportError:
                 pass
         try:

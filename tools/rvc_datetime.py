@@ -9,7 +9,7 @@ import time
 import can
 import click
 
-from rv_control.rvc import (RVC_SPECFILE, RV_C_PRIORITY, SET_DATE_TIME_DGN,
+from rv_control.sources.rvc import (RVC_SPECFILE, RV_C_PRIORITY, SET_DATE_TIME_DGN,
                             SOURCE_ADDRESS, datetime_payload, decode_datetime,
                             format_datetime, load_spec, send_can_message)
 

@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from rv_control.config import load_config
-from rv_control.wled import WledSource
+from rv_control.sources.wled import WledSource
 
 
 class FakeResponse:

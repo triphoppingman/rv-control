@@ -64,7 +64,7 @@ def test_coach_execution_wled_command(config_file: Path, monkeypatch: Any) -> No
 
     wled_calls = []
 
-    from rv_control.source import Source
+    from rv_control.sources.base import Source
 
     class FakeWledSource(Source, source_name="wled"):
         def __init__(self, _cfg: Any, publisher: Any = None, stop_event: Any = None, section_name: str = "") -> None:
@@ -94,7 +94,7 @@ def test_coach_execute_group(config_file: Path, monkeypatch: Any) -> None:
     config["rv_c_bus"] = {"type": "rvc", "interface": "can0", "write_enabled": "true"}
     config["wled_patio"] = {"type": "wled", "base_url": "http://wled.local", "write_enabled": "true"}
 
-    from rv_control.source import Source
+    from rv_control.sources.base import Source
 
     class FakeWledSource(Source, source_name="wled"):
         def __init__(self, _cfg: Any, publisher: Any = None, stop_event: Any = None, section_name: str = "") -> None:
