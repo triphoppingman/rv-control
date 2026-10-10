@@ -342,17 +342,63 @@ On connect the source sends `ATZ`, `ATE0`, `ATL0`, `ATS0`, `ATH0`, `ATSP<protoco
 
 Each cycle publishes one flat snapshot such as `{"egt11": 140.0, "rpm": 850.0, "coolant_temp": null, "timestamp": "..."}` to `<base_topic>/<topic>`. Availability changes publish `{"online": ..., "adapter": ..., "voltage": ..., "protocol": ..., "message": ...}` to `<base_topic>/<topic>/status`. When the source goes from online to offline it also publishes one snapshot with every PID set to `null`, so displays that only subscribe to `<base_topic>/<topic>` (such as rv-control-ui, which shows `null` as `--`) do not keep showing the last engine values. The source treats both an unreachable adapter and a reachable adapter with a silent ECU (ignition off, or `max_failed_cycles` consecutive cycles with no PID answering) as offline: it closes the socket and reconnects with exponential backoff from `reconnect_delay` to `max_reconnect_delay`. Offline/online transitions are logged once rather than on every retry. `max_retry` blank inherits `[service]`; `0` retries forever. `comms-check` passes when the adapter answers, reports whether the ECU responded, and lists configured PIDs with units.
 
-Use the standalone OBD tool to work with the adapter directly. It reads the same INI section and is read-only:
+Use the standalone OBD tool to work with the adapter directly. It reads the same INI section and is read-only unless the debug server's `--allow-unsafe` option is explicitly enabled:
 
 ```sh
 PYTHONPATH=src .venv/bin/python tools/obd_tool.py --config config.ini --section obd_engine info
 PYTHONPATH=src .venv/bin/python tools/obd_tool.py --section obd_engine supported
+PYTHONPATH=src .venv/bin/python tools/obd_tool.py --section obd_engine check-pids
+PYTHONPATH=src .venv/bin/python tools/obd_tool.py --section obd_engine check-pids --output obd-pids.json
 PYTHONPATH=src .venv/bin/python tools/obd_tool.py --section obd_engine read
 PYTHONPATH=src .venv/bin/python tools/obd_tool.py --section obd_engine monitor --hz 1 --count 10
 PYTHONPATH=src .venv/bin/python tools/obd_tool.py --section obd_engine query 22F478
 ```
 
 Stop the `rvcontrol run` service before using the tool; an ELM327 accepts only one RFCOMM connection at a time.
+
+#### Temporary OBD TCP debug server
+
+For another Kiro instance investigating PID failures, use the
+[remote OBD debug runbook](docs/OBD-REMOTE-DEBUG.md). It includes operator setup,
+handoff instructions, TCP framing, bounded investigations of any configured PID
+or PID set (with EGT11 as a worked example), response
+interpretation, and evidence/cleanup requirements.
+
+For an AI-assisted debug session on a trusted LAN, stop the normal collector and run:
+
+```sh
+PYTHONPATH=src .venv/bin/python tools/obd_tool.py --config config.ini --section obd_engine \
+  server --host 0.0.0.0 --port 35000 --allow-unsafe
+```
+
+The server prints its listening address and a newly generated authentication token locally. `--host` defaults to `127.0.0.1`; `0.0.0.0` exposes it on all IPv4 interfaces, or specify the Pi's LAN IPv4 address to restrict the listener. `--port` defaults to `35000`. To reuse a token, supply `--auth-token` or set `OBD_SERVER_AUTH_TOKEN`; avoid sharing it in logs or command history. Tokens must be 1 to 200 printable ASCII characters without whitespace.
+
+Connect using `nc <pi-address> 35000`, then type the following, replacing the token placeholder:
+
+```text
+AUTH <token-printed-on-pi>
+ATI
+ATRV
+010C
+22F478
+QUIT
+```
+
+Authentication must complete within 10 seconds and happens before Bluetooth is opened. After authentication the server initializes the adapter from the selected INI section, then sends `>`. Each subsequent command receives the adapter's unmodified response bytes through the next `>` prompt, retaining echo, spaces, and error replies. Wait for that prompt before sending the next command. Either CR or LF terminates a command; blank lines are ignored rather than repeating the previous command. Commands are limited to 256 bytes. `QUIT` or disconnect releases Bluetooth, and `Ctrl+C` closes the server. One client is serviced at a time; later connections may wait in the listen backlog. `--idle-timeout` defaults to 300 seconds per complete command and also bounds socket writes; adapter replies use the source's `read_timeout`. There is no automatic Bluetooth reconnection within a client session.
+
+Without `--allow-unsafe`, the only AT commands accepted are `ATI`, `AT@1`, `AT@2`, `ATRV`, `ATDP`, and `ATDPN`, plus the existing read-only OBD modes. Changing headers (`ATSH`), protocols (`ATSP`), formatting, or resetting the adapter requires `--allow-unsafe`. That flag permits arbitrary printable AT commands and complete hexadecimal requests, **including ECU writes**; it is strictly an explicit temporary debugging escape hatch, independent of MQTT write flags. The bridge does not enable MQTT publishing or command subscriptions.
+
+This is plain TCP, not a Telnet protocol server: use `nc` or a simple TCP client without Telnet negotiation. The token and commands are not encrypted. Keep it on the trusted LAN, do not port-forward it to the internet, and stop it after debugging. Initialization still probes the ECU, but an ECU-offline result does not prevent an authenticated client from using AT diagnostics.
+
+Use `check-pids --output FILE` to save the complete JSON report while still printing it to the terminal. The UTF-8 file is replaced atomically after the check completes, including any individual PID errors. An existing file is overwritten; its parent directory must already exist. An offline ECU, lost connection, or interruption during the check leaves the destination unchanged. File-writing errors cause a nonzero exit rather than a successful report.
+
+For troubleshooting a rejected PID such as EGT11, the report also includes adapter firmware, voltage, detected protocol, a standard RPM (`010C`) control request on the initial configured header, and per-PID `diagnostics`. These retain the response lines (normalized by the ELM parser, not a byte-for-byte wire capture), extracted data bytes, actual request header, header-change replies, request-attempt flag, elapsed time, and failure stage (`header`, `transport`, `response`, or `decode`). Negative ECU response codes include their conventional meanings. No extra headers, manufacturer identifiers, diagnostic sessions, or security unlocks are tried.
+
+For example, `7F2231` means the responding ECU rejected `22F478` with "request out of range"; it does not identify a replacement PID or prove that another module cannot support it. `NO DATA` or a timeout is not an explicit ECU rejection. `?` is an adapter rejection. A positive `62F478...` response followed by a `decode` failure points instead to the configured expression or data length. Compare the failed PID with the control request and other working mode 22 requests on the same header before changing identifiers. A failed control request is retained in the report rather than stopping the configured-PID checks.
+
+`supported` reads the ECU's standard mode 01 supported-PID bitmaps; it does not discover manufacturer-specific mode 22 identifiers. `check-pids` checks only the configured `pid.*` entries, including mode 22 and per-PID ECU headers, in one read-only cycle. Its JSON output includes `checked`, `usable`, `failed`, `elapsed_seconds` (including connection/setup), and a `pids` list containing each name, request, header, unit, decoded value, and error. A usable result means the configured request returned data that its expression could decode; a failed result does not prove the PID is unsupported. Ignition state, ECU header, timeout, and decode expression can all affect the result.
+
+Run the check with the ignition on, preserving PID order for dependencies such as Baro before Boost. There is no polling loop or reconnect retry. Budget approximately `number of PIDs × read_timeout` for PID requests, plus connection, adapter initialization, and header changes; this is not a hard overall deadline. With the 20-PID example and `read_timeout = 5`, that is roughly 100 seconds for PID requests if they each consume their timeout. Prompt replies will usually finish much sooner, but actual Pi/vehicle timing must be measured. Use `elapsed_seconds` to record it; `Ctrl+C` interrupts the operation and closes the session.
 
 Hughes uses the same `persistent_connection` setting as Renogy. Runtime connects directly to the configured address without repeatedly scanning; when persistence is enabled, a dropped session reconnects to that address after `service.reconnect_delay` seconds. `comms-check` remains a one-shot scan and ignores daemon mode.
 
@@ -429,6 +475,24 @@ PYTHONPATH=src .venv/bin/python tools/rvc_monitor.py --interface can1
 ```
 
 The monitor prints every CAN frame in a candump-style format. Extended RV-C frames include the DGN name, source address, and decoded values; non-RV-C frames are shown as raw frames.
+
+For remote, receive-only debugging via `nc`, run:
+
+```sh
+PYTHONPATH=src .venv/bin/python tools/rvc_monitor.py --interface can0 \
+  server --host 0.0.0.0 --port 35001
+```
+
+Connect with `nc <pi-address> 35001` and enter `AUTH <token-printed-on-pi>`.
+The server streams newline-delimited JSON containing raw CAN IDs, payload bytes,
+timestamps, DLC, frame flags, and decoded RV-C fields. Unknown messages retain
+their raw data. `QUIT` or disconnect releases the subscription; `Ctrl+C` stops
+the listener. There is no CAN send capability. Host defaults to `127.0.0.1`,
+port to `35001`; `--auth-token` / `RVC_SERVER_AUTH_TOKEN` override the generated
+token, and `--write-timeout` bounds slow-client writes. Use only on the trusted
+LAN: traffic and authentication are unencrypted. Interface/spec options go
+before `server`. See the [Kiro RV-C debug runbook](docs/RVC-REMOTE-DEBUG.md)
+for protocol details, raw record fields, bounded capture, and handoff instructions.
 
 Send a raw payload for any DGN defined in the RV-C specification by number or name:
 

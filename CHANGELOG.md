@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `tools/rvc_monitor.py server` streams raw CAN fields and decoded RV-C messages over receive-only authenticated TCP, with configurable `--host`, `--port` (default `35001`), `--auth-token` / `RVC_SERVER_AUTH_TOKEN`, and `--write-timeout`. Includes a remote Kiro debug runbook; existing local monitoring remains the default.
+- `tools/obd_tool.py server` offers a temporary, single-client plain TCP ELM327 debug bridge with generated-token authentication, configurable `--host`, `--port`, `--auth-token` / `OBD_SERVER_AUTH_TOKEN`, and `--idle-timeout`. It is read-only by default; `--allow-unsafe` explicitly enables unrestricted AT/hex passthrough, including possible ECU writes.
+- `tools/obd_tool.py check-pids --output FILE` saves the completed PID report as JSON while retaining terminal output; existing reports are replaced atomically and file errors are reported.
+- `tools/obd_tool.py check-pids` checks all configured OBD PIDs once, including manufacturer-specific requests and per-PID ECU headers, and reports usable values, individual errors, summary counts, and elapsed time without MQTT publishing.
 - Pluggable telemetry targets: `Target` ABC ([src/rv_control/target.py](src/rv_control/target.py)) with a self-registering registry, mirroring `Source`. Targets are enabled via `[target] enabled-targets` (section names, each with a `type`); several targets fan out through `MultiTarget`, where one target's failure does not affect the others.
 - `store` target ([src/rv_control/store.py](src/rv_control/store.py)) that keeps the latest payload per full topic (e.g. `rv/renogy`) in a local JSON file (`directory`, `filename`, `flush_interval`; default `data/state.json`), written atomically from a background thread.
 - `log` target ([src/rv_control/log.py](src/rv_control/log.py)) that logs each full topic and JSON payload at a configurable `level` without storing or forwarding anything, for debugging sources.
@@ -33,6 +37,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- `tools/obd_tool.py check-pids` now saves adapter/protocol details, a standard RPM control check, and per-PID response, header, timing, failure-stage, and negative-response-code evidence to distinguish ECU rejection from transport or decoding failures in one report.
 - Source tree reorganized: sources (including `renogybt/`) now live in `src/rv_control/sources/` with the `Source` ABC in `sources/base.py`, and targets live in `src/rv_control/targets/` with the `Target` ABC in `targets/base.py`. Shared `bluetooth.py` and `rvc_util.py` stay at the package top level. Python import paths changed (e.g. `rv_control.sources.rvc`, `rv_control.targets.mqtt`); the CLI and configuration contract is unchanged.
 - MQTT publishing is now `MqttTarget` ([src/rv_control/mqtt.py](src/rv_control/mqtt.py)), with unchanged topics, payloads, and write gating; `MqttPublisher` remains as an alias. `run` builds publishers with `Target.build`, and command routing locates the MQTT section by `type`.
 - `[mqtt]` is no longer required when a `[target]` section is present. Without `[target]`, the legacy `[service] targets` list (default `mqtt`) applies, so existing configs behave as before.

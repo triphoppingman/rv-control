@@ -26,6 +26,17 @@ ERROR_RESPONSES = (
     "STOPPED", "ERROR", "DATA ERROR", "BUFFER FULL", "FB ERROR", "LV RESET", "ACT ALERT", "<RX ERROR",
 )
 IGNORED_PREFIXES = ("SEARCHING", "BUS INIT")
+NEGATIVE_RESPONSE_CODES = {
+    0x11: "service not supported",
+    0x12: "subfunction not supported",
+    0x13: "incorrect message length or invalid format",
+    0x21: "busy, repeat request",
+    0x22: "conditions not correct",
+    0x31: "request out of range",
+    0x33: "security access denied",
+    0x78: "response pending",
+    0x7F: "service not supported in active session",
+}
 DECODE_FUNCTIONS: dict[str, Callable[..., Any]] = {"abs": abs, "min": min, "max": max, "round": round, "int": int, "float": float}
 _BYTE_NAME = re.compile(r"^b\d{1,3}$")
 _HEX = re.compile(r"^[0-9A-F]*$")
@@ -217,8 +228,8 @@ class Elm327:
                 break
         self._stale = False
 
-    def command(self, command: str, timeout: float | None = None) -> list[str]:
-        """Send one command and return the response lines received before the > prompt."""
+    def command_raw(self, command: str, timeout: float | None = None) -> bytes:
+        """Send a command and return unmodified response bytes through the ELM prompt."""
         self._discard_stale()
         self.connection.sendall(f"{command}\r".encode("ascii"))
         buffer = bytearray()
@@ -236,7 +247,12 @@ class Elm327:
             if not data:
                 raise ConnectionError("ELM327 closed the connection")
             buffer.extend(data)
-        text = bytes(buffer[:buffer.index(b">")]).replace(b"\0", b"").decode("ascii", errors="ignore")
+        return bytes(buffer[:buffer.index(b">") + 1])
+
+    def command(self, command: str, timeout: float | None = None) -> list[str]:
+        """Send one command and return normalized response lines before the ELM prompt."""
+        response = self.command_raw(command, timeout)
+        text = response[:-1].replace(b"\0", b"").decode("ascii", errors="ignore")
         lines = []
         for line in re.split(r"[\r\n]+", text):
             line = line.strip().upper()
@@ -395,29 +411,72 @@ class ObdSource(Source, source_name="obd"):
             elm.close()
 
     @staticmethod
-    def query(elm: Elm327, pid: ObdPid, context: dict[str, int | float] | None = None) -> int | float:
-        """Request and decode one PID, raising ObdNoData when no usable value is returned."""
-        return pid.decode(extract_data(elm.command(pid.request), pid.mode, pid.pid), context)
+    def query(
+        elm: Elm327, pid: ObdPid, context: dict[str, int | float] | None = None,
+        diagnostics: dict[str, Any] | None = None,
+    ) -> int | float:
+        """Request and decode one PID, optionally retaining response and failure-stage evidence."""
+        if diagnostics is not None:
+            diagnostics["failure_stage"] = "transport"
+        lines = elm.command(pid.request)
+        if diagnostics is not None:
+            diagnostics["response"] = lines
+            diagnostics["failure_stage"] = "response"
+        try:
+            data = extract_data(lines, pid.mode, pid.pid)
+        except ObdNoData as error:
+            if diagnostics is not None:
+                match = re.fullmatch(r"negative response code 0x([0-9A-F]{2})", str(error))
+                if match:
+                    code = int(match.group(1), 16)
+                    diagnostics["negative_response_code"] = f"{code:02X}"
+                    diagnostics["negative_response_meaning"] = NEGATIVE_RESPONSE_CODES.get(code, "unknown code")
+            raise
+        if diagnostics is not None:
+            diagnostics["data"] = data.hex(" ").upper()
+            diagnostics["failure_stage"] = "decode"
+        value = pid.decode(data, context)
+        if diagnostics is not None:
+            diagnostics["failure_stage"] = None
+        return value
 
-    def read_cycle(self, elm: Elm327) -> tuple[dict[str, int | float | None], dict[str, str]]:
-        """Query every configured PID sequentially, recording N/A results without stopping."""
+    def read_cycle(
+        self, elm: Elm327, diagnostics: list[dict[str, Any]] | None = None,
+    ) -> tuple[dict[str, int | float | None], dict[str, str]]:
+        """Query configured PIDs sequentially, optionally collecting per-request diagnostics."""
         values: dict[str, int | float | None] = {}
         errors: dict[str, str] = {}
         current_header = self._header()
         for pid in self.pids:
+            evidence: dict[str, Any] = {
+                "response": None, "data": None, "failure_stage": "header",
+                "actual_header": current_header or None, "request_attempted": False,
+            }
+            started = time.monotonic()
             try:
                 target_header = pid.header or self._header()
                 if target_header and target_header != current_header:
-                    if "OK" not in elm.command(f"ATSH{target_header}"):
+                    header_reply = elm.command(f"ATSH{target_header}")
+                    evidence["header_response"] = header_reply
+                    if "OK" not in header_reply:
                         raise ObdNoData(f"ELM327 rejected ATSH{target_header}")
                     current_header = target_header
+                evidence["actual_header"] = current_header or None
+                evidence["request_attempted"] = True
+                evidence["failure_stage"] = "transport"
                 context: dict[str, int | float] = {}
                 if pid.name == "boost" and isinstance(values.get("baro"), (int, float)):
                     context["BARO"] = values["baro"]
-                values[pid.name] = self.query(elm, pid, context)
+                if diagnostics is None:
+                    values[pid.name] = self.query(elm, pid, context)
+                else:
+                    values[pid.name] = self.query(elm, pid, context, evidence)
             except (ObdNoData, TimeoutError) as error:
                 values[pid.name] = None
                 errors[pid.name] = str(error)
+            if diagnostics is not None:
+                evidence["elapsed_seconds"] = round(time.monotonic() - started, 3)
+                diagnostics.append(evidence)
         self._log_pid_transitions(errors)
         return values, errors
 
