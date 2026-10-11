@@ -37,6 +37,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Hughes daemon reconnects now log expected Bluetooth unavailability (device not found, BLE errors, timeouts) as a one-line warning with the retry delay instead of a full traceback; unexpected errors still log a traceback.
 - `tools/obd_tool.py check-pids` now saves adapter/protocol details, a standard RPM control check, and per-PID response, header, timing, failure-stage, and negative-response-code evidence to distinguish ECU rejection from transport or decoding failures in one report.
 - Source tree reorganized: sources (including `renogybt/`) now live in `src/rv_control/sources/` with the `Source` ABC in `sources/base.py`, and targets live in `src/rv_control/targets/` with the `Target` ABC in `targets/base.py`. Shared `bluetooth.py` and `rvc_util.py` stay at the package top level. Python import paths changed (e.g. `rv_control.sources.rvc`, `rv_control.targets.mqtt`); the CLI and configuration contract is unchanged.
 - MQTT publishing is now `MqttTarget` ([src/rv_control/mqtt.py](src/rv_control/mqtt.py)), with unchanged topics, payloads, and write gating; `MqttPublisher` remains as an alias. `run` builds publishers with `Target.build`, and command routing locates the MQTT section by `type`.

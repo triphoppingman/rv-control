@@ -154,6 +154,12 @@ class HughesSource(Source, source_name="hughes"):
         max_reconnect_delay = self._retry_setting("max_reconnect_delay", 300, float)
         max_retry = self._retry_setting("max_retry", 0, int)
         notification_timeout = self._retry_setting("notification_timeout", 60, float)
+        expected_errors: tuple[type[BaseException], ...] = (TimeoutError, asyncio.TimeoutError)
+        try:
+            from bleak.exc import BleakError
+            expected_errors += (BleakError,)
+        except ImportError:
+            pass
         retry_count = 0
         while not self.stop_event.is_set():
             self._session_received_telemetry = False
@@ -163,14 +169,20 @@ class HughesSource(Source, source_name="hughes"):
                     return
                 retry_count = 0
                 LOGGER.warning("Hughes session ended; reconnecting to %s", address)
-            except Exception:
+            except Exception as error:
                 if self.stop_event.is_set() or not persistent:
                     raise
                 # A session that delivered telemetry before stalling should not escalate backoff.
                 retry_count = 1 if self._session_received_telemetry else retry_count + 1
                 if max_retry and retry_count > max_retry:
-                    raise RuntimeError(f"Hughes reconnect limit reached ({max_retry})")
-                LOGGER.exception("Hughes connection dropped; reconnecting to %s", address)
+                    raise RuntimeError(f"Hughes reconnect limit reached ({max_retry})") from error
+                delay = min(reconnect_delay * (2 ** max(retry_count - 1, 0)), max_reconnect_delay)
+                if isinstance(error, expected_errors):
+                    LOGGER.warning("Hughes %s unavailable (%s: %s); retrying in %gs", address, type(error).__name__, error, delay)
+                else:
+                    LOGGER.exception("Hughes connection dropped; reconnecting to %s", address)
+                await asyncio.sleep(delay)
+                continue
             delay = min(reconnect_delay * (2 ** max(retry_count - 1, 0)), max_reconnect_delay)
             await asyncio.sleep(delay)
 
