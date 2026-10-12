@@ -37,9 +37,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- The OBD example now explicitly sets `max_retry = 0` to keep retrying while the engine or Bluetooth adapter is unavailable, independently of the `[service]` retry limit.
 - Hughes daemon reconnects now log expected Bluetooth unavailability (device not found, BLE errors, timeouts) as a one-line warning with the retry delay instead of a full traceback; unexpected errors still log a traceback.
 - `tools/obd_tool.py check-pids` now saves adapter/protocol details, a standard RPM control check, and per-PID response, header, timing, failure-stage, and negative-response-code evidence to distinguish ECU rejection from transport or decoding failures in one report.
 - Source tree reorganized: sources (including `renogybt/`) now live in `src/rv_control/sources/` with the `Source` ABC in `sources/base.py`, and targets live in `src/rv_control/targets/` with the `Target` ABC in `targets/base.py`. Shared `bluetooth.py` and `rvc_util.py` stay at the package top level. Python import paths changed (e.g. `rv_control.sources.rvc`, `rv_control.targets.mqtt`); the CLI and configuration contract is unchanged.
 - MQTT publishing is now `MqttTarget` ([src/rv_control/mqtt.py](src/rv_control/mqtt.py)), with unchanged topics, payloads, and write gating; `MqttPublisher` remains as an alias. `run` builds publishers with `Target.build`, and command routing locates the MQTT section by `type`.
 - `[mqtt]` is no longer required when a `[target]` section is present. Without `[target]`, the legacy `[service] targets` list (default `mqtt`) applies, so existing configs behave as before.
 - Configuration files are read as UTF-8 so unit strings such as `°F` load consistently.
+
+### Fixed
+
+- OBD unlimited reconnects no longer stop with a backoff overflow during prolonged `Host is down` or engine-off outages. Retry waits stay capped at `max_reconnect_delay`, reset after ECU recovery, and remain interruptible on shutdown. Invalid non-positive or non-finite retry delays and negative `max_retry` values are rejected before connecting.
