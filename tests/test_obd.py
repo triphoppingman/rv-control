@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import threading
 from configparser import ConfigParser
 from typing import Any
@@ -8,6 +9,7 @@ import pytest
 
 from rv_control.sources.obd import (
     Elm327,
+    EcuUnavailable,
     ObdNoData,
     ObdPid,
     ObdSource,
@@ -267,6 +269,112 @@ def test_daemon_stops_after_configured_retry_limit(caplog: pytest.LogCaptureFixt
     source.run()
     assert len(attempts) == 3
     assert "reconnect limit reached" in caplog.text
+
+
+@pytest.mark.parametrize("failure", ["host_down", "ecu_offline"])
+def test_daemon_recovers_after_prolonged_outage(
+    failure: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Keep capped retries alive through a long outage and resume publishing on recovery."""
+    responses = {**INIT, "22F478": "62F47803E8", "010C": "410C1AF8", "0105": "41055A"}
+    source, sockets = make_source(responses, reconnect_delay="2", max_reconnect_delay="60")
+    factory = source.connection_factory
+    publish = source.publisher.publish
+    attempts = 0
+    delays: list[float] = []
+
+    def connect() -> FakeElmSocket:
+        """Simulate 1,100 unavailable connections before the adapter and ECU recover."""
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 1100:
+            if failure == "host_down":
+                raise OSError(errno.EHOSTDOWN, "Host is down")
+            sock = FakeElmSocket({**INIT, "0100": "NO DATA"})
+            sockets.append(sock)
+            return sock
+        return factory()
+
+    def wait(timeout: float) -> bool:
+        """Record retry delays without waiting during the simulated long outage."""
+        if not source.stop_event.is_set():
+            delays.append(timeout)
+        return source.stop_event.is_set()
+
+    def record(topic: str, payload: dict[str, Any]) -> None:
+        """Stop after recovery produces a fresh telemetry snapshot."""
+        publish(topic, payload)
+        if topic == "obd":
+            source.stop_event.set()
+
+    source.connection_factory = connect
+    source.publisher.publish = record
+    monkeypatch.setattr(source.stop_event, "wait", wait)
+    source.run()
+
+    assert attempts == 1101
+    assert delays == [2, 4, 8, 16, 32] + [60] * 1095
+    assert [payload["online"] for topic, payload in source.publisher.messages if topic == "obd/status"] == [False, True]
+    assert next(payload for topic, payload in source.publisher.messages if topic == "obd")["rpm"] == 1726.0
+    assert all(sock.closed for sock in sockets)
+    assert "stopped" not in caplog.text
+
+
+def test_daemon_resets_backoff_after_recovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Restart retry delays after a working ECU session and honor shutdown during backoff."""
+    source, sockets = make_source(INIT, reconnect_delay="2", max_reconnect_delay="60")
+    factory = source.connection_factory
+    attempts = 0
+    delays: list[float] = []
+
+    def connect() -> FakeElmSocket:
+        """Allow the third attempt to connect before the adapter is lost again."""
+        nonlocal attempts
+        attempts += 1
+        if attempts != 3:
+            raise OSError(errno.EHOSTDOWN, "Host is down")
+        return factory()
+
+    def poll(_elm: Elm327, _topic: str, _interval: float, _max_failed_cycles: int) -> None:
+        """Simulate the engine turning off after a successful ECU initialization."""
+        raise EcuUnavailable("engine off")
+
+    def wait(timeout: float) -> bool:
+        """Stop during the fourth retry wait without making another connection."""
+        delays.append(timeout)
+        if len(delays) == 4:
+            source.stop_event.set()
+        return source.stop_event.is_set()
+
+    source.connection_factory = connect
+    monkeypatch.setattr(source, "_poll", poll)
+    monkeypatch.setattr(source.stop_event, "wait", wait)
+    source.run()
+
+    assert attempts == 4
+    assert delays == [2, 4, 2, 4]
+    assert all(sock.closed for sock in sockets)
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("reconnect_delay", "0"), ("reconnect_delay", "-1"),
+        ("reconnect_delay", "nan"), ("reconnect_delay", "inf"),
+        ("max_reconnect_delay", "0"), ("max_reconnect_delay", "-1"),
+        ("max_reconnect_delay", "nan"), ("max_reconnect_delay", "inf"),
+        ("max_retry", "-1"),
+    ],
+)
+def test_daemon_rejects_invalid_retry_settings(
+    name: str, value: str, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Reject tight-loop or non-finite retry settings before touching Bluetooth."""
+    source, sockets = make_source(INIT, **{name: value})
+    source.run()
+    assert sockets == []
+    assert name in caplog.text
+    assert "must be" in caplog.text
 
 
 def test_invalid_configuration_fails_before_connecting() -> None:

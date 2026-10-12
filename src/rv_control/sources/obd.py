@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import logging
+import math
 import re
 import socket
 import threading
@@ -592,8 +593,14 @@ class ObdSource(Source, source_name="obd"):
         reconnect_delay = self._retry_setting("reconnect_delay", 2, float)
         max_reconnect_delay = self._retry_setting("max_reconnect_delay", 60, float)
         max_retry = self._retry_setting("max_retry", 0, int)
+        for name, value in (("reconnect_delay", reconnect_delay), ("max_reconnect_delay", max_reconnect_delay)):
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"[{self.section_name}] {name} must be finite and greater than zero")
+        if max_retry < 0:
+            raise ValueError(f"[{self.section_name}] max_retry must be zero (unlimited) or positive")
         max_failed_cycles = max(self.section.getint("max_failed_cycles", fallback=3), 1)
         failures = 0
+        delay = min(reconnect_delay, max_reconnect_delay)
         while not self.stop_event.is_set():
             elm = None
             try:
@@ -602,6 +609,7 @@ class ObdSource(Source, source_name="obd"):
                 if not info["ecu_online"]:
                     raise EcuUnavailable(f"{info['adapter']} reachable ({info['voltage']}) but {info['message']}")
                 failures = 0
+                delay = min(reconnect_delay, max_reconnect_delay)
                 self._set_online(True, info)
                 self._poll(elm, topic, interval, max_failed_cycles)
             except (OSError, ObdError) as error:
@@ -614,8 +622,9 @@ class ObdSource(Source, source_name="obd"):
             finally:
                 if elm is not None:
                     elm.close()
-            delay = min(reconnect_delay * (2 ** max(failures - 1, 0)), max_reconnect_delay)
+            LOGGER.debug("OBD %s reconnecting in %.3fs (failure %d)", self.section_name, delay, failures)
             self.stop_event.wait(delay)
+            delay = min(delay * 2, max_reconnect_delay)
 
 
 def _timestamp() -> str:
