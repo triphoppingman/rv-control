@@ -663,6 +663,18 @@ sudo systemctl stop rv-control
 sudo systemctl restart rv-control
 ```
 
+If the journal reports `OSError: [Errno 24] Too many open files` from the Renogy
+client, update to a version containing the Renogy event-loop cleanup fix and
+restart the service. Restarting releases descriptors held by the old process;
+raising `LimitNOFILE` alone only delays a resource leak. Renogy now closes its
+event loop and BLE session whenever a worker exits or interrogation completes.
+To check whether the descriptor count stays stable during reconnects:
+
+```sh
+pid=$(systemctl show rv-control --property MainPID --value)
+sudo ls "/proc/$pid/fd" | wc -l
+```
+
 ## Third-party acknowledgements
 
 This project explicitly acknowledges and incorporates work from the following open-source projects. The listed upstream repositories are the authoritative sources for the original code, documentation, specifications, and license terms:

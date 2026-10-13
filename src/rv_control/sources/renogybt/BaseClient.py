@@ -33,7 +33,9 @@ class BaseClient:
         self.device_id = self.config['device'].getint('device_id')
         self.sections = []
         self.section_index = 0
-        self.loop = None
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self.future: asyncio.Future[str] | None = None
+        self._stopping = False
         self.write_service_uuid = getattr(self, 'write_service_uuid', WRITE_SERVICE_UUID)
         self.write_char_uuid = getattr(self, 'write_char_uuid', WRITE_CHAR_UUID)
         self.notify_char_uuid = getattr(self, 'notify_char_uuid', NOTIFY_CHAR_UUID)
@@ -45,27 +47,45 @@ class BaseClient:
         )
         logging.info(f"Init {self.__class__.__name__}: {self.config['device']['alias']} => {self.config['device']['mac_addr']}")
 
-    def _get_or_create_loop(self) -> asyncio.AbstractEventLoop:
-        """Return the client event loop, creating one for the current thread if needed."""
-        try:
-            return asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            return loop
-
     def start(self) -> None:
-        """Start the client lifecycle on its worker event loop."""
+        """Run one client session and close its owned event loop on every exit."""
+        session = self._run_session()
         try:
-            self.loop = self._get_or_create_loop()
-            self.loop.create_task(self.connect())
-            self.future = self.loop.create_future()
-            self.loop.run_until_complete(self.future)
+            asyncio.run(session)
         except Exception as e:
             self.__on_error(e)
         except KeyboardInterrupt:
-            self.loop = None
             self.__on_error("KeyboardInterrupt")
+        finally:
+            session.close()
+
+    async def _run_session(self) -> None:
+        """Collect until stopped, then release BLE resources before loop shutdown."""
+        self.loop = asyncio.get_running_loop()
+        self.future = self.loop.create_future()
+        self._stopping = False
+        try:
+            await self.connect()
+            await self.future
+        finally:
+            self._stopping = True
+            if self.read_timeout:
+                self.read_timeout.cancel()
+            if self.poll_timer:
+                self.poll_timer.cancel()
+            try:
+                pending = asyncio.all_tasks() - {asyncio.current_task()}
+                for task in pending:
+                    task.cancel()
+                results = await asyncio.gather(*pending, return_exceptions=True)
+                for result in results:
+                    if isinstance(result, Exception):
+                        logging.error("Renogy task failed during shutdown: %s", result)
+                await self.disconnect()
+            finally:
+                self.ble_manager = None
+                self.future = None
+                self.loop = None
 
     async def connect(self) -> None:
         """Discover and connect the BLE manager, retrying according to client policy."""
@@ -112,7 +132,6 @@ class BaseClient:
         """Disconnect the BLE manager and release active client resources."""
         if self.ble_manager:
             await self.ble_manager.disconnect()
-        self.future.set_result('DONE')
 
     async def on_data_received(self, response: bytes | bytearray) -> None:
         """Dispatch an incoming response to the matching parser and callback."""
@@ -152,7 +171,7 @@ class BaseClient:
     def on_read_timeout(self) -> None:
         """Record a read timeout and let the retry lifecycle handle it."""
         logging.error("on_read_timeout => Timed out! Please check your device_id!")
-        if self.loop and self.loop.is_running():
+        if not self._stopping and self.loop and self.loop.is_running():
             self.loop.create_task(self.__handle_retry_async("Read timeout"))
 
     async def check_polling(self) -> None:
@@ -208,18 +227,18 @@ class BaseClient:
     def __on_connect_fail(self, error: Any) -> None:
         """Handle failed BLE connection attempts and schedule retry processing."""
         logging.error(f"Connection failed: {error}")
-        if self.loop and self.loop.is_running():
+        if not self._stopping and self.loop and self.loop.is_running():
             self.loop.create_task(self.__handle_retry_async(f"Connection failed: {error}"))
 
     def __on_disconnect(self) -> None:
         """Handle an unexpected BLE disconnect during persistent operation."""
         logging.warning("Unexpected disconnect callback received.")
-        if self.loop and self.loop.is_running():
+        if not self._stopping and self.loop and self.loop.is_running():
             self.loop.create_task(self.__handle_retry_async("Unexpected disconnect"))
 
     async def __handle_retry_async(self, reason: str) -> None:
         """Apply retry limits and reconnect after a failed client operation."""
-        if self._reconnecting:
+        if self._stopping or self._reconnecting:
             logging.debug("Retry or reconnect already in progress, ignoring duplicate trigger.")
             return
         self._reconnecting = True
@@ -252,15 +271,19 @@ class BaseClient:
             self._reconnecting = False
 
     def stop(self) -> None:
-        """Request client shutdown and stop its worker event loop."""
+        """Request shutdown on the existing loop without allocating new resources."""
         if self.read_timeout and not self.read_timeout.cancelled(): self.read_timeout.cancel()
-        if self.loop is None:
-            self.loop = self._get_or_create_loop()
-            self.loop.create_task(self.disconnect())
-            self.future = self.loop.create_future()
-            self.loop.run_until_complete(self.future)
-        else:
-            self.loop.create_task(self.disconnect())
+        loop = self.loop
+        future = self.future
+        if loop is None or not loop.is_running() or future is None or self._stopping:
+            return
+
+        def finish() -> None:
+            """Complete the session once even when several callbacks request stop."""
+            if not future.done():
+                future.set_result('DONE')
+
+        loop.call_soon_threadsafe(finish)
 
     def __safe_callback(self, calback: Callable[[BaseClient, Any], None] | None, param: Any) -> None:
         """Invoke an optional client callback while containing callback exceptions."""

@@ -47,4 +47,5 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Renogy worker restarts and one-shot interrogation now close their event loops, cancel pending work, and disconnect BLE clients, preventing file-descriptor accumulation and eventual `Too many open files` failures. Shutdown after a failed startup no longer attempts to create another event loop.
 - OBD unlimited reconnects no longer stop with a backoff overflow during prolonged `Host is down` or engine-off outages. Retry waits stay capped at `max_reconnect_delay`, reset after ECU recovery, and remain interruptible on shutdown. Invalid non-positive or non-finite retry delays and negative `max_retry` values are rejected before connecting.
