@@ -3,10 +3,12 @@ from __future__ import annotations
 import errno
 import threading
 from configparser import ConfigParser
+from pathlib import Path
 from typing import Any
 
 import pytest
 
+from rv_control.config import load_config
 from rv_control.sources.obd import (
     Elm327,
     EcuUnavailable,
@@ -100,6 +102,16 @@ def make_source(responses: dict[str, str], **overrides: str) -> tuple[ObdSource,
 
     source.connection_factory = factory
     return source, sockets
+
+
+@pytest.mark.parametrize("raw, expected", [(0x00, 0.0), (0x1C, 10.980392), (0xFF, 100.0)])
+def test_example_load_pid_decodes_full_percentage_range(raw: int, expected: float) -> None:
+    """Verify the enabled example load PID decodes endpoints and the captured idle reading."""
+    config = load_config(Path(__file__).resolve().parents[1] / "config-example.ini")
+    pid = ObdPid.parse("load", config["obd_engine"]["pid.load"])
+    assert pid.request == "0104"
+    assert pid.unit == "%"
+    assert pid.decode(extract_data([f"4104{raw:02X}"], pid.mode, pid.pid)) == expected
 
 
 def test_pid_parsing_keeps_commas_in_decode_and_validates_mode() -> None:
