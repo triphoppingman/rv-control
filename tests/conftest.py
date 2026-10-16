@@ -4,6 +4,26 @@ import pytest
 from pathlib import Path
 
 
+@pytest.fixture(autouse=True)
+def stub_bluez_link_release(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
+    """Keep source tests off the system D-Bus while recording stale-link releases."""
+    calls: list[tuple[str, str]] = []
+
+    async def release(adapter: str, address: str, timeout: float = 10) -> bool:
+        """Record a BlueZ link release request without touching hardware."""
+        calls.append((adapter, address))
+        return False
+
+    import importlib
+
+    from rv_control.sources import hughes
+
+    ble_manager_module = importlib.import_module("rv_control.sources.renogybt.BLEManager")
+    monkeypatch.setattr(hughes, "release_stale_connection", release)
+    monkeypatch.setattr(ble_manager_module, "release_stale_connection", release)
+    return calls
+
+
 @pytest.fixture
 def config_file(tmp_path: Path) -> Path:
     """Create and return a temporary configuration with every required section."""

@@ -6,7 +6,7 @@ import struct
 from contextlib import AsyncExitStack
 from typing import Any, Callable
 
-from ..bluetooth import BluetoothAdapterRegistry
+from ..bluetooth import BluetoothAdapterRegistry, release_stale_connection
 from .base import Source
 
 
@@ -83,6 +83,7 @@ class HughesSource(Source, source_name="hughes"):
         section = self.section
         packet = asyncio.get_running_loop().create_future()
         legacy_buffer = bytearray()
+        await release_stale_connection(section.get("adapter", "hci0"), address)
         async with BleakClient(address) as client:
             services = client.services
             modern = any(str(service.uuid).lower() == "000000ff-0000-1000-8000-00805f9b34fb" for service in services)
@@ -197,6 +198,15 @@ class HughesSource(Source, source_name="hughes"):
         """Run one Hughes notification session until the shared stop event is set."""
         adapter = section.get("adapter", "hci0").strip() or "hci0"
         connect_settle_delay = self._retry_setting("connect_settle_delay", 2, float)
+        # An orphaned BlueZ link keeps the watchdog invisible to this service and the phone app.
+        await release_stale_connection(adapter, address)
+        try:
+            await self._run_connected_session(client_class, address, section, adapter, connect_settle_delay, notification_timeout)
+        finally:
+            await release_stale_connection(adapter, address)
+
+    async def _run_connected_session(self, client_class: Callable[..., Any], address: str, section: Any, adapter: str, connect_settle_delay: float, notification_timeout: float) -> None:
+        """Connect, subscribe, and publish Hughes telemetry until stopped or stalled."""
         async with AsyncExitStack() as stack:
             # Share the adapter connect lock with Renogy so setups never overlap.
             async with BluetoothAdapterRegistry.for_adapter(adapter).connect_slot():
@@ -237,4 +247,7 @@ class HughesSource(Source, source_name="hughes"):
                     if asyncio.get_running_loop().time() - last_measurement >= notification_timeout:
                         raise TimeoutError(f"No Hughes telemetry received for {notification_timeout:g} seconds")
             finally:
-                await client.stop_notify(tx)
+                try:
+                    await client.stop_notify(tx)
+                except Exception as error:
+                    LOGGER.debug("Hughes stop_notify failed during teardown: %r", error)

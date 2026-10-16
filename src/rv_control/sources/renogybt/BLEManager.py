@@ -5,7 +5,7 @@ import logging
 from typing import Any, Awaitable, Callable
 from bleak import BleakClient, BleakScanner, BLEDevice
 
-from ...bluetooth import BluetoothAdapterRegistry
+from ...bluetooth import BluetoothAdapterRegistry, release_stale_connection
 
 DISCOVERY_TIMEOUT = 5 # max wait time to complete the bluetooth scanning (seconds)
 
@@ -35,6 +35,8 @@ class BLEManager:
     async def discover(self) -> None:
         """Discover the configured BLE device and retain the matching device record."""
         mac_address = self.mac_address.upper()
+        # A link BlueZ still holds keeps the device from advertising, so release it first.
+        await release_stale_connection(self.adapter, self.mac_address)
         logging.info("Starting discovery...")
         self.device = None
         async with self.coordinator.scan_slot():
@@ -75,6 +77,7 @@ class BLEManager:
                 raise ConnectionError("Device disconnected during BLE setup")
         except Exception as error:
             self._disconnect_reported = True
+            await self._release_client()
             self.connect_fail_callback(error)
         finally:
             self._connecting = False
@@ -111,10 +114,25 @@ class BLEManager:
         except Exception as e:
             logging.info(f'characteristic_write_value failed {e}')
 
+    async def _release_client(self) -> None:
+        """Disconnect a client after failed setup so BlueZ does not keep the link open."""
+        client = self.client
+        if client is None:
+            return
+        self._intentional_disconnect = True
+        try:
+            await client.disconnect()
+        except Exception as error:
+            logging.warning(f"Error releasing BLE client after failed setup: {error!r}")
+        await release_stale_connection(self.adapter, self.mac_address)
+
     async def disconnect(self) -> None:
-        """Mark shutdown intentional and disconnect the active BLE client."""
+        """Mark shutdown intentional and release the BLE link even if it looks closed."""
         if self.client:
             self._intentional_disconnect = True
-            if self.client.is_connected:
+            if self.client.is_connected and self.device is not None:
                 logging.info(f"Exit: Disconnecting device: {self.device.name} {self.device.address}")
+            try:
                 await self.client.disconnect()
+            finally:
+                await release_stale_connection(self.adapter, self.mac_address)

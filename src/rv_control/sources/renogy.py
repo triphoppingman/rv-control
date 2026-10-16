@@ -171,6 +171,8 @@ class RenogySource(Source, source_name="renogy"):
         try:
             section = self.section
             renogy_config = self._client_config()
+            # The daemon always polls; persistent_connection only decides whether the link stays open.
+            renogy_config["data"]["enable_polling"] = "true"
             client_info = self.CLIENTS.get(renogy_config["device"].get("device_type", ""))
             if not client_info:
                 raise ValueError(f"Unknown Renogy device type: {renogy_config['device'].get('device_type')}")

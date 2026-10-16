@@ -210,7 +210,7 @@ topic = renogy
 write_enabled = false
 ```
 
-The Renogy section is self-contained. `device-type` can be `RNG_CTRL`, `RNG_CTRL_HIST`, `RNG_BATT`, `RNG_INVT`, `RNG_INVT_HF`, `RNG_DCC`, or `RNG_SHNT`. Use the Bluetooth adapter's address format exactly as reported by discovery tools. An empty `persistent_connection` inherits `[service] daemon_mode`; it defaults to enabled for daemon operation. Each connection attempt performs fresh discovery and creates a fresh BLE client. Persistent mode also keeps polling active, so use `enable_polling = true` for continuous daemon telemetry.
+The Renogy section is self-contained. `device-type` can be `RNG_CTRL`, `RNG_CTRL_HIST`, `RNG_BATT`, `RNG_INVT`, `RNG_INVT_HF`, `RNG_DCC`, or `RNG_SHNT`. Use the Bluetooth adapter's address format exactly as reported by discovery tools. An empty `persistent_connection` inherits `[service] daemon_mode`; it defaults to enabled for daemon operation. Each connection attempt performs fresh discovery and creates a fresh BLE client. The daemon polls every `poll_interval` seconds: with a persistent connection the link stays open between polls; with `persistent_connection = false` it connects, reads, and disconnects each cycle, leaving the device free for the Renogy phone app in between (Renogy Bluetooth modules accept only one connection at a time). `enable_polling` applies to one-shot client use. Before each connection attempt and after each teardown, rv-control asks BlueZ to drop any link it still holds to the device, because an orphaned link stops the device from advertising until it is power cycled.
 
 ```ini
 [hughes_power_watchdog]
@@ -404,7 +404,7 @@ For example, `7F2231` means the responding ECU rejected `22F478` with "request o
 
 Run the check with the ignition on, preserving PID order for dependencies such as Baro before Boost. There is no polling loop or reconnect retry. Budget approximately `number of PIDs × read_timeout` for PID requests, plus connection, adapter initialization, and header changes; this is not a hard overall deadline. With the 20-PID example and `read_timeout = 5`, that is roughly 100 seconds for PID requests if they each consume their timeout. Prompt replies will usually finish much sooner, but actual Pi/vehicle timing must be measured. Use `elapsed_seconds` to record it; `Ctrl+C` interrupts the operation and closes the session.
 
-Hughes uses the same `persistent_connection` setting as Renogy. Runtime connects directly to the configured address without repeatedly scanning; when persistence is enabled, a dropped session reconnects to that address after `service.reconnect_delay` seconds. `comms-check` remains a one-shot scan and ignores daemon mode.
+Hughes uses the same `persistent_connection` setting as Renogy. Runtime connects directly to the configured address without repeatedly scanning; when persistence is enabled, a dropped session reconnects to that address after `service.reconnect_delay` seconds. Like Renogy, each session first releases any link BlueZ still holds to the watchdog. While connected, the watchdog is unavailable to its phone app. `comms-check` remains a one-shot scan and ignores daemon mode.
 
 Daemon retry behavior is configured in the service section:
 

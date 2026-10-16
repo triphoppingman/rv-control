@@ -39,6 +39,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Renogy daemon operation always polls every `poll_interval` seconds. With `persistent_connection = false` it connects, reads all registers, and disconnects each cycle so the device stays available to the Renogy phone app between polls; `persistent_connection = true` (or blank with `daemon_mode = true`) keeps the link open as before. Previously, non-persistent daemon operation without `enable_polling` reconnected about once per second.
+
 - CLI logs now include the source filename, line number, and function, including messages emitted through the root logger. Renogy BLE connection failures also identify the device alias, address, and Bluetooth adapter.
 - The OBD example comments out `pid.egt11`, `pid.eot`, `pid.boost`, `pid.vgt`, `pid.fipw`, `pid.icp`, and `pid.iat2` after repeated request-out-of-range responses on the tested 2019 F-550. It also disables the mislabeled `pid.app` monitor-status request; definitions remain available for reference.
 - The OBD example now explicitly sets `max_retry = 0` to keep retrying while the engine or Bluetooth adapter is unavailable, independently of the `[service]` retry limit.
@@ -51,6 +53,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Renogy and Hughes BLE devices no longer become unreachable (to rv-control and the phone app) until power cycled after a dropped or failed connection. Before each connection attempt and after each session, rv-control now asks BlueZ to release any link it still holds to the configured device, and failed Renogy setup always disconnects its client.
+- Renogy reconnects no longer leave the previous polling loop running, which stacked overlapping register reads and read timeouts after each drop.
+- A Hughes `stop_notify` failure on an already-dropped link no longer masks the original session error.
 - OBD ECU probe failures are logged as warnings, and `fallback_protocol` is only tried when the configured protocol is automatic (`0`), preventing a fixed protocol from being retried as its own fallback.
 - Renogy BLE connection setup no longer treats transient disconnect callbacks as separate failures or logs each disconnect twice. Retries are serialized and continue through repeated setup failures until recovery or the configured `max_retry` limit, and connection errors now identify the exception instead of printing a traceback-object tuple.
 - Corrected and re-enabled `pid.load` in the OBD example: mode 01 PID 04 now decodes calculated engine load as `b0*100/255` (0-100%) without the incorrect negative offset.

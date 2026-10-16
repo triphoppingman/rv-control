@@ -45,6 +45,8 @@ class BaseClient:
         self._reconnecting = False
         self._connecting = False
         self._retry_reason: str | None = None
+        # Incremented on each connection attempt so read chains from older sessions stop.
+        self._generation = 0
         self.max_retry = self.config['device'].getint('max_retry', fallback=3)
         self.persistent_connection = self.config['device'].getboolean(
             'persistent_connection', fallback=False
@@ -105,6 +107,9 @@ class BaseClient:
 
     async def _connect_once(self) -> None:
         """Complete one discovery and setup attempt before retry processing starts."""
+        self._generation += 1
+        self.section_index = 0
+        self.data = {}
         if self.ble_manager is None:
             self.ble_manager = BLEManager(
                 mac_address=self.config['device']['mac_addr'],
@@ -150,6 +155,7 @@ class BaseClient:
     async def on_data_received(self, response: bytes | bytearray) -> None:
         """Dispatch an incoming response to the matching parser and callback."""
         if self.read_timeout and not self.read_timeout.cancelled(): self.read_timeout.cancel()
+        generation = self._generation
         operation = bytes_to_int(response, 1, 1)
 
         if operation == READ_SUCCESS or operation == READ_ERROR:
@@ -171,6 +177,8 @@ class BaseClient:
             else:
                 self.section_index += 1
                 await asyncio.sleep(self.config['data'].getfloat('request_interval', fallback=0.5))
+                if generation != self._generation or self._stopping:
+                    return logging.debug("Discarding read chain from a replaced Renogy session.")
                 await self.read_section()
         else:
             logging.warning("on_data_received: unknown operation={}".format(operation))
@@ -188,10 +196,33 @@ class BaseClient:
         self.__schedule_retry("Read timeout")
 
     async def check_polling(self) -> None:
-        """Run the next polling cycle when persistent mode is enabled."""
-        if self.config['data'].getboolean('enable_polling'): 
-            await asyncio.sleep(self.config['data'].getint('poll_interval'))
+        """Schedule exactly one next polling cycle, releasing the link when not persistent."""
+        if self._stopping or not self.config['data'].getboolean('enable_polling'):
+            return
+        if self.poll_timer and not self.poll_timer.done():
+            self.poll_timer.cancel()
+        if not self.persistent_connection:
+            # Free the single-connection BLE peripheral for other centrals between polls.
+            manager = self.ble_manager
+            self.ble_manager = None
+            if manager is not None:
+                try:
+                    await manager.disconnect()
+                except Exception as error:
+                    logging.warning(f"Error disconnecting Renogy device between polls: {error!r}")
+        self.poll_timer = self.loop.create_task(self._poll_after_interval(self._generation))
+
+    async def _poll_after_interval(self, generation: int) -> None:
+        """Wait one poll interval, then read again or reconnect for a new session."""
+        await asyncio.sleep(self.config['data'].getfloat('poll_interval', fallback=60))
+        if self._stopping or generation != self._generation or self._reconnecting:
+            return
+        # Past the wait, so a nested check_polling must not cancel this running cycle.
+        self.poll_timer = None
+        if self.persistent_connection and self.ble_manager is not None:
             await self.read_section()
+        else:
+            await self.connect()
 
     async def read_section(self) -> None:
         """Send the next configured register read request to the device."""
@@ -281,6 +312,7 @@ class BaseClient:
                 delay = min(reconnect_delay * (2 ** (self._retry_count - 1)), max_reconnect_delay)
                 delay = min(delay * random.uniform(1 - reconnect_jitter, 1 + reconnect_jitter), max_reconnect_delay)
                 logging.info(f"Retrying connection in {delay} seconds (Attempt {self._retry_count}/{self.max_retry}). Reason: {reason}")
+                self._generation += 1
                 if self.read_timeout and not self.read_timeout.cancelled():
                     self.read_timeout.cancel()
                 if self.poll_timer:

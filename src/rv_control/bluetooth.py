@@ -3,9 +3,76 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 from contextlib import asynccontextmanager, contextmanager
 from typing import AsyncIterator, Iterator
+
+LOGGER = logging.getLogger(__name__)
+
+BLUEZ_SERVICE = "org.bluez"
+BLUEZ_DEVICE_INTERFACE = "org.bluez.Device1"
+DBUS_PROPERTIES_INTERFACE = "org.freedesktop.DBus.Properties"
+
+
+def bluez_device_path(adapter: str, address: str) -> str:
+    """Return the BlueZ D-Bus object path for a device address on an adapter."""
+    normalized_adapter = adapter.strip() or "hci0"
+    return f"/org/bluez/{normalized_adapter}/dev_{address.strip().upper().replace(':', '_')}"
+
+
+async def release_stale_connection(adapter: str, address: str, timeout: float = 10) -> bool:
+    """Ask BlueZ to drop a link to a device that this process no longer owns.
+
+    A BLE peripheral that BlueZ still considers connected stops advertising, so it
+    disappears from discovery and refuses other centrals such as a phone app until
+    it is power cycled. Calling this before each connection attempt and after each
+    teardown releases such orphaned links. Returns True when a disconnect was issued.
+    Failures are logged and never raised so callers can always proceed.
+    """
+    if not address or not address.strip():
+        return False
+    try:
+        from dbus_fast import BusType, Message, MessageType, Variant
+        from dbus_fast.aio import MessageBus
+    except ImportError:
+        return False
+    path = bluez_device_path(adapter, address)
+    bus = None
+    try:
+        bus = await asyncio.wait_for(MessageBus(bus_type=BusType.SYSTEM).connect(), timeout)
+        reply = await asyncio.wait_for(bus.call(Message(
+            destination=BLUEZ_SERVICE,
+            path=path,
+            interface=DBUS_PROPERTIES_INTERFACE,
+            member="Get",
+            signature="ss",
+            body=[BLUEZ_DEVICE_INTERFACE, "Connected"],
+        )), timeout)
+        if reply is None or reply.message_type != MessageType.METHOD_RETURN:
+            return False
+        connected = reply.body[0]
+        if isinstance(connected, Variant):
+            connected = connected.value
+        if not connected:
+            return False
+        LOGGER.warning("BlueZ still holds a connection to %s on %s; disconnecting it", address, adapter)
+        reply = await asyncio.wait_for(bus.call(Message(
+            destination=BLUEZ_SERVICE,
+            path=path,
+            interface=BLUEZ_DEVICE_INTERFACE,
+            member="Disconnect",
+        )), timeout)
+        if reply is not None and reply.message_type == MessageType.ERROR:
+            LOGGER.warning("BlueZ refused to disconnect %s: %s %s", address, reply.error_name, reply.body)
+            return False
+        return True
+    except Exception as error:
+        LOGGER.warning("Unable to verify BlueZ link state for %s on %s: %r", address, adapter, error)
+        return False
+    finally:
+        if bus is not None:
+            bus.disconnect()
 
 
 class BluetoothAdapterCoordinator:
