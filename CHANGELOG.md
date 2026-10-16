@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `[service] log_level` in `config.ini` controls the default logging threshold (DEBUG, INFO, WARNING, ERROR, or CRITICAL); `--verbose` continues to override it with DEBUG.
 - `tools/obd_tool.py server -v` / `--verbose` echoes forwarded requests, raw responses, and command errors to local stderr without echoing authentication exchanges or changing the TCP client stream.
 - `tools/rvc_monitor.py server` streams raw CAN fields and decoded RV-C messages over receive-only authenticated TCP, with configurable `--host`, `--port` (default `35001`), `--auth-token` / `RVC_SERVER_AUTH_TOKEN`, and `--write-timeout`. Includes a remote Kiro debug runbook; existing local monitoring remains the default.
 - `tools/obd_tool.py server` offers a temporary, single-client plain TCP ELM327 debug bridge with generated-token authentication, configurable `--host`, `--port`, `--auth-token` / `OBD_SERVER_AUTH_TOKEN`, and `--idle-timeout`. It is read-only by default; `--allow-unsafe` explicitly enables unrestricted AT/hex passthrough, including possible ECU writes.
@@ -49,6 +50,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- OBD ECU probe failures are logged as warnings, and `fallback_protocol` is only tried when the configured protocol is automatic (`0`), preventing a fixed protocol from being retried as its own fallback.
 - Renogy BLE connection setup no longer treats transient disconnect callbacks as separate failures or logs each disconnect twice. Retries are serialized and continue through repeated setup failures until recovery or the configured `max_retry` limit, and connection errors now identify the exception instead of printing a traceback-object tuple.
 - Corrected and re-enabled `pid.load` in the OBD example: mode 01 PID 04 now decodes calculated engine load as `b0*100/255` (0-100%) without the incorrect negative offset.
 - Renogy worker restarts and one-shot interrogation now close their event loops, cancel pending work, and disconnect BLE clients, preventing file-descriptor accumulation and eventual `Too many open files` failures. Shutdown after a failed startup no longer attempts to create another event loop.

@@ -25,8 +25,19 @@ from .targets.base import Target
 @click.pass_context
 def cli(context: click.Context, config_path: str, verbose: bool) -> None:
     """Collect RV telemetry and publish it to MQTT."""
-    logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    context.obj = load_config(config_path)
+    config = load_config(config_path)
+    configured_level = config["service"].get("log_level", "INFO").upper()
+    log_level = logging.getLevelName(configured_level)
+    if not isinstance(log_level, int):
+        raise click.BadParameter(
+            f"Invalid [service] log_level {configured_level!r}; use DEBUG, INFO, WARNING, ERROR, or CRITICAL.",
+            param_hint="--config",
+        )
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else log_level,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    context.obj = config
 
 
 @cli.command()

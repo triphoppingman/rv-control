@@ -367,7 +367,8 @@ class ObdSource(Source, source_name="obd"):
         """Reset and configure the adapter, then probe the ECU and return adapter details."""
         reset = elm.command("ATZ")
         adapter = next((line for line in reset if "ELM" in line), reset[-1] if reset else "unknown")
-        commands = ["ATE0", "ATL0", "ATS0", "ATH0", f"ATSP{self._protocol('protocol', '0') or '0'}"]
+        protocol = self._protocol("protocol", "0") or "0"
+        commands = ["ATE0", "ATL0", "ATS0", "ATH0", f"ATSP{protocol}"]
         header = self._header()
         if header:
             commands.append(f"ATSH{header}")
@@ -381,10 +382,20 @@ class ObdSource(Source, source_name="obd"):
             self._probe_ecu(elm)
         except ObdNoData as error:
             fallback = self._protocol("fallback_protocol", "")
-            if not fallback:
+            if protocol != "0":
+                LOGGER.warning(
+                    "OBD %s: configured protocol %s failed ECU probe (%s); not trying fallback protocol",
+                    self.section_name,
+                    protocol,
+                    error,
+                )
                 info["message"] = f"ECU not responding ({error})"
                 return info
-            LOGGER.info("OBD %s: automatic protocol failed (%s); trying protocol %s", self.section_name, error, fallback)
+            if not fallback:
+                LOGGER.warning("OBD %s: automatic protocol failed ECU probe (%s); no fallback protocol configured", self.section_name, error)
+                info["message"] = f"ECU not responding ({error})"
+                return info
+            LOGGER.warning("OBD %s: automatic protocol failed (%s); trying protocol %s", self.section_name, error, fallback)
             if "OK" not in elm.command(f"ATSP{fallback}"):
                 raise ConnectionError(f"ELM327 rejected ATSP{fallback}")
             try:

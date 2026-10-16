@@ -202,7 +202,7 @@ def test_interrogate_reads_every_pid_and_reports_na() -> None:
     assert sockets[0].closed
 
 
-def test_initialize_uses_fallback_protocol_when_auto_fails() -> None:
+def test_initialize_uses_fallback_protocol_when_auto_fails(caplog: pytest.LogCaptureFixture) -> None:
     """Verify the configured fallback protocol is tried when automatic detection fails."""
     responses = {**INIT, "0100": "UNABLE TO CONNECT", "ATSP6": "OK"}
     source, sockets = make_source(responses, fallback_protocol="6")
@@ -210,6 +210,22 @@ def test_initialize_uses_fallback_protocol_when_auto_fails() -> None:
     with source.session() as (_elm, info):
         assert info["ecu_online"] is False
     assert "ATSP6" in sockets[sockets_before].sent
+    assert "automatic protocol failed (UNABLE TO CONNECT); trying protocol 6" in caplog.text
+    assert "WARNING" in caplog.text
+
+
+def test_initialize_does_not_fallback_from_configured_protocol(caplog: pytest.LogCaptureFixture) -> None:
+    """Do not retry a configured fixed protocol as its own fallback."""
+    responses = {**INIT, "0100": "CAN ERROR", "ATSP6": "OK"}
+    source, sockets = make_source(responses, protocol="6", fallback_protocol="6")
+    with source.session() as (_elm, info):
+        assert info["ecu_online"] is False
+        assert info["message"] == "ECU not responding (CAN ERROR)"
+
+    commands = sockets[0].sent
+    assert commands.count("ATSP6") == 1
+    assert "not trying fallback protocol" in caplog.text
+    assert "WARNING" in caplog.text
 
 
 def test_comms_check_succeeds_with_engine_off() -> None:
