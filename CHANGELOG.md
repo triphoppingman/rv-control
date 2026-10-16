@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `tools/obd_tool.py server -v` / `--verbose` echoes forwarded requests, raw responses, and command errors to local stderr without echoing authentication exchanges or changing the TCP client stream.
 - `tools/rvc_monitor.py server` streams raw CAN fields and decoded RV-C messages over receive-only authenticated TCP, with configurable `--host`, `--port` (default `35001`), `--auth-token` / `RVC_SERVER_AUTH_TOKEN`, and `--write-timeout`. Includes a remote Kiro debug runbook; existing local monitoring remains the default.
 - `tools/obd_tool.py server` offers a temporary, single-client plain TCP ELM327 debug bridge with generated-token authentication, configurable `--host`, `--port`, `--auth-token` / `OBD_SERVER_AUTH_TOKEN`, and `--idle-timeout`. It is read-only by default; `--allow-unsafe` explicitly enables unrestricted AT/hex passthrough, including possible ECU writes.
 - `tools/obd_tool.py check-pids --output FILE` saves the completed PID report as JSON while retaining terminal output; existing reports are replaced atomically and file errors are reported.

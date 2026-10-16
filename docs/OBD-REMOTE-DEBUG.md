@@ -19,6 +19,10 @@ scan identifiers or change ECU state.
      server --host 0.0.0.0 --port 35000 --allow-unsafe
    ```
 
+   Add `-v` after `server` to echo forwarded requests (`TX`), raw responses
+   (`RX`, with escaped CR/LF bytes), and command errors locally on stderr.
+   Authentication exchanges and adapter initialization are not echoed.
+
    Use the Pi's LAN IPv4 address instead of `0.0.0.0` to bind only that interface.
    The server prints its listening address and a freshly generated token locally.
    It runs in the foreground until `Ctrl+C`.

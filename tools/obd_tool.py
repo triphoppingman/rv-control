@@ -204,7 +204,7 @@ def bridge_command(line: str, allow_unsafe: bool) -> str:
 
 def serve_client(
     client: socket.socket, source: ObdSource, token: str,
-    allow_unsafe: bool, idle_timeout: float,
+    allow_unsafe: bool, idle_timeout: float, verbose: bool = False,
 ) -> None:
     """Authenticate a client before opening Bluetooth, then relay bounded commands serially."""
     if not authenticate(client, token):
@@ -219,20 +219,28 @@ def serve_client(
             try:
                 command = bridge_command(line, allow_unsafe)
             except ValueError as error:
+                if verbose:
+                    click.echo(f"RX ERROR {error}", err=True)
                 client.sendall(f"ERROR {error}\r\n>".encode("ascii"))
                 continue
+            if verbose:
+                click.echo(f"TX {command}", err=True)
             try:
                 response = elm.command_raw(command)
             except TimeoutError as error:
+                if verbose:
+                    click.echo(f"RX ERROR {error}", err=True)
                 client.sendall(f"ERROR {error}\r\n>".encode("ascii"))
                 continue
+            if verbose:
+                click.echo(f"RX {response!r}", err=True)
             client.settimeout(idle_timeout)
             client.sendall(response)
 
 
 def run_server(
     source: ObdSource, host: str, port: int, token: str,
-    allow_unsafe: bool, idle_timeout: float,
+    allow_unsafe: bool, idle_timeout: float, verbose: bool = False,
 ) -> None:
     """Listen until interrupted, handling one authenticated client and adapter session at a time."""
     with socket.create_server((host, port), backlog=1) as listener:
@@ -248,7 +256,7 @@ def run_server(
                 continue
             with client:
                 try:
-                    serve_client(client, source, token, allow_unsafe, idle_timeout)
+                    serve_client(client, source, token, allow_unsafe, idle_timeout, verbose)
                 except (OSError, ValueError, ObdError) as error:
                     click.echo(f"Client session failed: {error}", err=True)
                     try:
@@ -264,10 +272,11 @@ def run_server(
 @click.option("--auth-token", default=None, envvar="OBD_SERVER_AUTH_TOKEN", help="Token override; defaults to a new random token. May also use OBD_SERVER_AUTH_TOKEN.")
 @click.option("--idle-timeout", type=click.FloatRange(min=0, min_open=True), default=300.0, show_default=True, help="Seconds to receive each complete client command.")
 @click.option("--allow-unsafe", is_flag=True, help="Permit unrestricted AT/hex commands, including possible ECU writes.")
+@click.option("-v", "--verbose", is_flag=True, help="Echo forwarded requests, raw responses, and command errors to stderr (excluding authentication).")
 @click.pass_context
 def server(
     context: click.Context, host: str, port: int, auth_token: str | None,
-    idle_timeout: float, allow_unsafe: bool,
+    idle_timeout: float, allow_unsafe: bool, verbose: bool,
 ) -> None:
     """Temporarily expose the adapter over authenticated plain TCP for nc-style debugging."""
     try:
@@ -275,7 +284,7 @@ def server(
     except ValueError as error:
         raise click.BadParameter(str(error), param_hint="--auth-token") from error
     try:
-        run_server(source_from(context), host, port, token, allow_unsafe, idle_timeout)
+        run_server(source_from(context), host, port, token, allow_unsafe, idle_timeout, verbose)
     except KeyboardInterrupt:
         click.echo("Stopping server", err=True)
     except (OSError, ValueError, ObdError) as error:

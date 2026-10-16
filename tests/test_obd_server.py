@@ -34,7 +34,10 @@ def test_raw_command_preserves_echo_spacing_and_prompt() -> None:
 
 
 @pytest.mark.parametrize("unsafe", [False, True])
-def test_bridge_auth_commands_and_cleanup(unsafe: bool) -> None:
+@pytest.mark.parametrize("verbose", [False, True])
+def test_bridge_auth_commands_and_cleanup(
+    unsafe: bool, verbose: bool, capsys: pytest.CaptureFixture[str],
+) -> None:
     """Authenticate over a real socket and verify filtering, raw replies, and session cleanup."""
     tool = load_tool()
     source, sockets = make_source({**INIT, "ATI": "ELM327 v1.5", "010C": "41 0C 1A F8"})
@@ -46,7 +49,7 @@ def test_bridge_auth_commands_and_cleanup(unsafe: bool) -> None:
         """Run one client session and retain unexpected thread failures for the assertion."""
         try:
             with peer:
-                tool.serve_client(peer, source, "test-token", unsafe, 2)
+                tool.serve_client(peer, source, "test-token", unsafe, 2, verbose)
         except BaseException as error:
             failures.append(error)
 
@@ -80,6 +83,19 @@ def test_bridge_auth_commands_and_cleanup(unsafe: bool) -> None:
     assert not thread.is_alive()
     assert not failures
     assert sockets[0].closed
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    if verbose:
+        assert "TX ATI\n" in captured.err
+        assert "TX 010C\n" in captured.err
+        assert "RX b'010C\\r41 0C 1A F8\\r\\r>'\n" in captured.err
+        assert "AUTH" not in captured.err
+        assert "test-token" not in captured.err
+        if not unsafe:
+            assert "RX ERROR AT command not allowed" in captured.err
+            assert "TX ATSH7E1" not in captured.err
+    else:
+        assert captured.err == ""
 
 
 def test_wrong_token_never_opens_bluetooth() -> None:
@@ -92,6 +108,40 @@ def test_wrong_token_never_opens_bluetooth() -> None:
         tool.serve_client(peer, source, "test-token", False, 1)
         assert b"ERROR authentication failed" in client.recv(1024)
     assert not sockets
+
+
+@pytest.mark.parametrize("verbose", [False, True])
+def test_command_timeout_echo_and_recovery(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], verbose: bool,
+) -> None:
+    """Echo timeouts only when requested and preserve subsequent raw client responses."""
+    tool = load_tool()
+    source, sockets = make_source({**INIT, "ATI": "ELM327 v1.5"})
+    command_raw = Elm327.command_raw
+
+    def timeout_rpm(elm: Elm327, command: str, timeout: float | None = None) -> bytes:
+        """Fail the RPM request without affecting adapter initialization or later commands."""
+        if command == "010C":
+            raise TimeoutError("adapter response timed out")
+        return command_raw(elm, command, timeout)
+
+    monkeypatch.setattr(Elm327, "command_raw", timeout_rpm)
+    client, peer = socket.socketpair()
+    client.settimeout(3)
+    with client, peer:
+        client.sendall(b"AUTH test-token\n010C\nATI\nQUIT\n")
+        tool.serve_client(peer, source, "test-token", False, 1, verbose)
+        reply = receive_until(client, b"ATI\rELM327 v1.5\r\r>")
+    assert b"ERROR adapter response timed out\r\n>" in reply
+    assert sockets[0].closed
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    if verbose:
+        assert "TX 010C\nRX ERROR adapter response timed out\n" in captured.err
+        assert "RX b'ATI\\rELM327 v1.5\\r\\r>'\n" in captured.err
+        assert "test-token" not in captured.err
+    else:
+        assert captured.err == ""
 
 
 @pytest.mark.parametrize("disconnect", [True, False])
@@ -155,7 +205,10 @@ def test_line_limits_and_auth_deadline() -> None:
             tool.client_line(peer, 1)
 
 
-def test_listener_recovers_after_bad_auth_and_stops(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("verbose", [False, True])
+def test_listener_recovers_after_bad_auth_and_stops(
+    monkeypatch: pytest.MonkeyPatch, verbose: bool,
+) -> None:
     """Exercise a real localhost listener with sequential rejected and authenticated clients."""
     tool = load_tool()
     source, sockets = make_source(INIT)
@@ -175,7 +228,7 @@ def test_listener_recovers_after_bad_auth_and_stops(monkeypatch: pytest.MonkeyPa
     def serve() -> None:
         """Run the real listener until the source stop event is set."""
         try:
-            tool.run_server(source, "127.0.0.1", address[1], "test-token", False, 1)
+            tool.run_server(source, "127.0.0.1", address[1], "test-token", False, 1, verbose)
         except BaseException as error:
             failures.append(error)
 
@@ -192,6 +245,8 @@ def test_listener_recovers_after_bad_auth_and_stops(monkeypatch: pytest.MonkeyPa
                     assert receive_until(client, b"\r\n") == b"ERROR authentication failed\r\n"
                 else:
                     receive_until(client, b">")
+                    client.sendall(b"ATI\n")
+                    receive_until(client, b">")
                     client.sendall(b"QUIT\n")
     finally:
         source.stop_event.set()
@@ -202,11 +257,15 @@ def test_listener_recovers_after_bad_auth_and_stops(monkeypatch: pytest.MonkeyPa
     assert sockets[0].closed
     assert listener.fileno() == -1
     assert any(message.startswith("Listening on 127.0.0.1:") for message in messages)
+    assert ("TX ATI" in messages) is verbose
+    assert any(message.startswith("RX b'ATI") for message in messages) is verbose
 
 
 @pytest.mark.parametrize("override", [None, "configured-test-token"])
+@pytest.mark.parametrize("verbose_flag", [None, "-v", "--verbose"])
 def test_server_cli_options(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, override: str | None,
+    verbose_flag: str | None,
 ) -> None:
     """Verify generated or configured tokens and explicit unsafe and network options."""
     tool = load_tool()
@@ -223,12 +282,15 @@ def test_server_cli_options(
     ]
     if override is not None:
         monkeypatch.setenv("OBD_SERVER_AUTH_TOKEN", override)
+    if verbose_flag is not None:
+        arguments.append(verbose_flag)
 
     result = CliRunner().invoke(tool.cli, arguments)
 
     assert result.exit_code == 0, result.output
-    _source, host, port, token, unsafe, timeout = calls[0]
+    _source, host, port, token, unsafe, timeout, verbose = calls[0]
     assert (host, port, unsafe, timeout) == ("0.0.0.0", 36000, True, 30)
+    assert verbose is (verbose_flag is not None)
     if override is None:
         assert len(token) == 43
     else:
