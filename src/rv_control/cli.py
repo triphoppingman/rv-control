@@ -35,7 +35,7 @@ def cli(context: click.Context, config_path: str, verbose: bool) -> None:
         )
     logging.basicConfig(
         level=logging.DEBUG if verbose else log_level,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        format="%(asctime)s %(levelname)s %(name)s [%(filename)s:%(lineno)d %(funcName)s]: %(message)s",
     )
     context.obj = config
 

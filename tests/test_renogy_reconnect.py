@@ -13,6 +13,35 @@ from rv_control.sources.renogybt.BaseClient import BaseClient
 from rv_control.sources.renogybt.BLEManager import BLEManager
 
 
+@pytest.mark.parametrize("adapter", [None, "hci1"])
+def test_connection_failure_identifies_device_and_callback(
+    caplog: pytest.LogCaptureFixture, adapter: str | None,
+) -> None:
+    """Make empty timeout errors traceable to a Renogy device and call site."""
+    config = ConfigParser()
+    config["device"] = {
+        "device_id": "255",
+        "alias": "test-battery",
+        "mac_addr": "00:00:00:00:00:00",
+    }
+    if adapter is not None:
+        config["device"]["adapter"] = adapter
+    client = BaseClient(config)
+
+    with caplog.at_level(logging.ERROR):
+        client._BaseClient__on_connect_fail(TimeoutError())
+
+    record, = caplog.records
+    assert record.name == "rv_control.sources.renogybt.BaseClient"
+    assert record.filename == "BaseClient.py"
+    assert record.funcName == "__on_connect_fail"
+    assert record.lineno > 0
+    assert record.getMessage() == (
+        f"Renogy test-battery (00:00:00:00:00:00) on adapter {adapter or 'hci0'}: "
+        "Connection failed: TimeoutError()"
+    )
+
+
 @pytest.mark.parametrize("stage", ["connect", "subscribe", "disconnected"])
 def test_setup_disconnects_report_only_connection_failure(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, stage: str

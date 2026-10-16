@@ -1,11 +1,39 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
+import pytest
 from click.testing import CliRunner
 
 from rv_control.cli import cli
+
+
+@pytest.mark.parametrize("name", ["root", "rv_control.sources.hughes"])
+@pytest.mark.parametrize("level", [
+    logging.DEBUG, logging.INFO, logging.WARNING, logging.ERROR, logging.CRITICAL,
+])
+def test_log_format_identifies_every_logger_call_site(
+    monkeypatch: Any, config_file: Path, name: str, level: int,
+) -> None:
+    """Include file, line, and function for every logger and standard severity."""
+    import rv_control.cli as cli_module
+
+    settings: dict[str, Any] = {}
+    monkeypatch.setattr(cli_module.logging, "basicConfig", lambda **kwargs: settings.update(kwargs))
+
+    result = CliRunner().invoke(cli, ["--config", str(config_file), "check"])
+    assert result.exit_code == 0
+    record = logging.LogRecord(
+        name, level, "/example/BaseClient.py", 123,
+        "Connection failed: TimeoutError()", (), None, func="__on_connect_fail",
+    )
+    output = logging.Formatter(settings["format"]).format(record)
+    assert (
+        f"{logging.getLevelName(level)} {name} "
+        "[BaseClient.py:123 __on_connect_fail]: Connection failed: TimeoutError()"
+    ) in output
 
 
 def test_configured_log_level(monkeypatch: Any, config_file: Path) -> None:

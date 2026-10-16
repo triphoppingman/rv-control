@@ -9,6 +9,8 @@ from typing import Any, Callable
 from .BLEManager import BLEManager
 from .Utils import bytes_to_int, crc16_modbus, int_to_bytes
 
+logger = logging.getLogger(__name__)
+
 # Base class that works with all Renogy family devices
 # Should be extended by each client with its own parsers and section definitions
 # Section example: {'register': 5000, 'words': 8, 'parser': self.parser_func}
@@ -238,7 +240,13 @@ class BaseClient:
     def __on_connect_fail(self, error: Any) -> None:
         """Handle failed BLE connection attempts and schedule retry processing."""
         reason = f"Connection failed: {error!r}"
-        logging.error("%s", reason)
+        logger.error(
+            "Renogy %s (%s) on adapter %s: %s",
+            self.config['device']['alias'],
+            self.config['device']['mac_addr'],
+            self.config['device'].get('adapter', 'hci0'),
+            reason,
+        )
         self.__schedule_retry(reason)
 
     def __on_disconnect(self) -> None:

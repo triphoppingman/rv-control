@@ -39,6 +39,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- CLI logs now include the source filename, line number, and function, including messages emitted through the root logger. Renogy BLE connection failures also identify the device alias, address, and Bluetooth adapter.
 - The OBD example comments out `pid.egt11`, `pid.eot`, `pid.boost`, `pid.vgt`, `pid.fipw`, `pid.icp`, and `pid.iat2` after repeated request-out-of-range responses on the tested 2019 F-550. It also disables the mislabeled `pid.app` monitor-status request; definitions remain available for reference.
 - The OBD example now explicitly sets `max_retry = 0` to keep retrying while the engine or Bluetooth adapter is unavailable, independently of the `[service]` retry limit.
 - Hughes daemon reconnects now log expected Bluetooth unavailability (device not found, BLE errors, timeouts) as a one-line warning with the retry delay instead of a full traceback; unexpected errors still log a traceback.
