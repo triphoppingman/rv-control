@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import sys
 from typing import Any, Awaitable, Callable
 from bleak import BleakClient, BleakScanner, BLEDevice
 
@@ -30,6 +29,8 @@ class BLEManager:
         self.client: BleakClient = None
         self.discovered_devices = []
         self._intentional_disconnect = False
+        self._connecting = False
+        self._disconnect_reported = False
 
     async def discover(self) -> None:
         """Discover the configured BLE device and retain the matching device record."""
@@ -50,7 +51,9 @@ class BLEManager:
         if not self.device: return logging.error("No device connected!")
 
         try:
+            self._connecting = True
             self._intentional_disconnect = False
+            self._disconnect_reported = False
             self.write_char_handle = None
             async with self.coordinator.connect_slot():
                 self.client = BleakClient(self.device, disconnected_callback=self._on_disconnected)
@@ -68,15 +71,27 @@ class BLEManager:
                         self.write_char_handle = characteristic.handle
                         logging.info(f"found write characteristic {characteristic.uuid}, service {service.uuid}")
 
-        except Exception:
-            logging.error(f"Error connecting to device")
-            self.connect_fail_callback(sys.exc_info())
+            if not self.client.is_connected:
+                raise ConnectionError("Device disconnected during BLE setup")
+        except Exception as error:
+            self._disconnect_reported = True
+            self.connect_fail_callback(error)
+        finally:
+            self._connecting = False
 
     def _on_disconnected(self, client: Any) -> None:
         """Notify the owner when the BLE client disconnects unexpectedly."""
+        if client is not self.client:
+            logging.debug("Ignoring disconnect from a replaced BLE client.")
+            return
         if self._intentional_disconnect:
             logging.info("Disconnected intentionally.")
+        elif self._connecting:
+            logging.debug("Device disconnected during BLE setup; awaiting connection result.")
+        elif self._disconnect_reported:
+            logging.debug("Ignoring duplicate BLE disconnect callback.")
         else:
+            self._disconnect_reported = True
             logging.warning(f"Unexpected disconnect from device: {client.address}")
             if self.disconnect_callback:
                 self.disconnect_callback()

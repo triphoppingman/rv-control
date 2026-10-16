@@ -41,6 +41,8 @@ class BaseClient:
         self.notify_char_uuid = getattr(self, 'notify_char_uuid', NOTIFY_CHAR_UUID)
         self._retry_count = 0
         self._reconnecting = False
+        self._connecting = False
+        self._retry_reason: str | None = None
         self.max_retry = self.config['device'].getint('max_retry', fallback=3)
         self.persistent_connection = self.config['device'].getboolean(
             'persistent_connection', fallback=False
@@ -64,6 +66,8 @@ class BaseClient:
         self.loop = asyncio.get_running_loop()
         self.future = self.loop.create_future()
         self._stopping = False
+        self._retry_count = 0
+        self._retry_reason = None
         try:
             await self.connect()
             await self.future
@@ -89,6 +93,16 @@ class BaseClient:
 
     async def connect(self) -> None:
         """Discover and connect the BLE manager, retrying according to client policy."""
+        self._connecting = True
+        try:
+            await self._connect_once()
+        finally:
+            self._connecting = False
+            if self._retry_reason is not None:
+                self.__schedule_retry(self._retry_reason)
+
+    async def _connect_once(self) -> None:
+        """Complete one discovery and setup attempt before retry processing starts."""
         if self.ble_manager is None:
             self.ble_manager = BLEManager(
                 mac_address=self.config['device']['mac_addr'],
@@ -104,7 +118,6 @@ class BaseClient:
                 write_service_uuid=self.write_service_uuid,
             )
 
-        # A concurrent retry may disconnect and replace self.ble_manager while this coroutine awaits.
         manager = self.ble_manager
         await manager.discover()
         if self.ble_manager is not manager:
@@ -116,15 +129,14 @@ class BaseClient:
             for dev in manager.discovered_devices:
                 if dev.name != None and dev.name.startswith(tuple(ALIAS_PREFIXES)):
                     logging.info(f"Possible device found! ====> {dev.name} > [{dev.address}]")
-            if self.loop and self.loop.is_running():
-                self.loop.create_task(self.__handle_retry_async("Device not found during discovery"))
+            self.__schedule_retry("Device not found during discovery")
             return
         else:
             await manager.connect()
             if self.ble_manager is not manager:
                 logging.debug("BLE manager replaced during connect; abandoning stale connect attempt.")
                 return
-            if manager.client and manager.client.is_connected:
+            if self._retry_reason is None and manager.client and manager.client.is_connected:
                 self._retry_count = 0
                 await self.read_section()
 
@@ -171,8 +183,7 @@ class BaseClient:
     def on_read_timeout(self) -> None:
         """Record a read timeout and let the retry lifecycle handle it."""
         logging.error("on_read_timeout => Timed out! Please check your device_id!")
-        if not self._stopping and self.loop and self.loop.is_running():
-            self.loop.create_task(self.__handle_retry_async("Read timeout"))
+        self.__schedule_retry("Read timeout")
 
     async def check_polling(self) -> None:
         """Run the next polling cycle when persistent mode is enabled."""
@@ -226,24 +237,35 @@ class BaseClient:
 
     def __on_connect_fail(self, error: Any) -> None:
         """Handle failed BLE connection attempts and schedule retry processing."""
-        logging.error(f"Connection failed: {error}")
-        if not self._stopping and self.loop and self.loop.is_running():
-            self.loop.create_task(self.__handle_retry_async(f"Connection failed: {error}"))
+        reason = f"Connection failed: {error!r}"
+        logging.error("%s", reason)
+        self.__schedule_retry(reason)
 
     def __on_disconnect(self) -> None:
         """Handle an unexpected BLE disconnect during persistent operation."""
-        logging.warning("Unexpected disconnect callback received.")
-        if not self._stopping and self.loop and self.loop.is_running():
-            self.loop.create_task(self.__handle_retry_async("Unexpected disconnect"))
+        self.__schedule_retry("Unexpected disconnect")
 
-    async def __handle_retry_async(self, reason: str) -> None:
-        """Apply retry limits and reconnect after a failed client operation."""
-        if self._stopping or self._reconnecting:
-            logging.debug("Retry or reconnect already in progress, ignoring duplicate trigger.")
+    def __schedule_retry(self, reason: str) -> None:
+        """Retain retry triggers and let one worker handle them after setup completes."""
+        if self._stopping or self.loop is None or not self.loop.is_running():
+            return
+        self._retry_reason = reason
+        if self._connecting or self._reconnecting:
             return
         self._reconnecting = True
+        self.loop.create_task(self.__handle_retry_async())
+
+    async def __handle_retry_async(self) -> None:
+        """Drain retry triggers without overlapping attempts or losing new failures."""
         try:
-            if self._retry_count < self.max_retry:
+            while not self._stopping and self._retry_reason is not None:
+                reason = self._retry_reason
+                self._retry_reason = None
+                if self._retry_count >= self.max_retry:
+                    logging.error(f"Max retries ({self.max_retry}) reached. Reason: {reason}. Stopping client.")
+                    self.__safe_callback(self.on_error_callback, f"Max retries reached: {reason}")
+                    self.stop()
+                    return
                 self._retry_count += 1
                 reconnect_delay = self.config['device'].getfloat('reconnect_delay', fallback=2)
                 max_reconnect_delay = self.config['device'].getfloat('max_reconnect_delay', fallback=300)
@@ -253,20 +275,21 @@ class BaseClient:
                 logging.info(f"Retrying connection in {delay} seconds (Attempt {self._retry_count}/{self.max_retry}). Reason: {reason}")
                 if self.read_timeout and not self.read_timeout.cancelled():
                     self.read_timeout.cancel()
+                if self.poll_timer:
+                    self.poll_timer.cancel()
                     
                 if self.ble_manager:
                     try:
                         await self.ble_manager.disconnect()
                         self.ble_manager = None
                     except Exception as e:
-                        logging.debug(f"Error disconnecting manager client during retry setup: {e}")
+                        logging.warning(f"Error disconnecting manager client during retry setup: {e}")
                         
                 await asyncio.sleep(delay)
+                self._retry_reason = None
                 await self.connect()
-            else:
-                logging.error(f"Max retries ({self.max_retry}) reached. Reason: {reason}. Stopping client.")
-                self.__safe_callback(self.on_error_callback, f"Max retries reached: {reason}")
-                self.stop()
+        except Exception as error:
+            self.__on_error(error)
         finally:
             self._reconnecting = False
 
