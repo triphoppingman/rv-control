@@ -115,6 +115,44 @@ def test_authenticated_stream_preserves_raw_frames(
     assert bus.closed == (token != "wrong")
 
 
+@pytest.mark.parametrize("verbose", [False, True])
+def test_verbose_echoes_raw_socket_traffic_with_token_redacted(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], verbose: bool,
+) -> None:
+    """Echo raw TX/RX bytes, including CR/LF and streamed frames, only when verbose."""
+    tool = load_monitor()
+    bus = FakeBus([can.Message(arbitration_id=0x19FFFF01, data=b"\x00", is_extended_id=True)])
+    monkeypatch.setattr(tool.can, "Bus", lambda **_kwargs: bus)
+    client, peer = socket.socketpair()
+    client.settimeout(3)
+    thread = threading.Thread(
+        target=lambda: tool.stream_client(peer, "test-token", "can-test", {}, True, 1, verbose),
+    )
+    thread.start()
+    try:
+        with client.makefile("rb") as reader:
+            assert reader.readline() == b"AUTH required\r\n"
+            client.sendall(b"AUTH test-token\r")
+            assert reader.readline().startswith(b"OK authenticated")
+            assert json.loads(reader.readline())["can_id"] == "19FFFF01"
+            client.sendall(b"QUIT\n")
+    finally:
+        thread.join(3)
+        client.close()
+        peer.close()
+    assert not thread.is_alive()
+    err = capsys.readouterr().err
+    assert "test-token" not in err
+    if verbose:
+        assert "TX b'AUTH required\\r\\n'" in err
+        assert "RX b'AUTH <token>\\r'" in err
+        assert "TX b'OK authenticated" in err
+        assert "19FFFF01" in err
+        assert "RX b'QUIT\\n'" in err
+    else:
+        assert err == ""
+
+
 def test_special_frames_are_kept_raw() -> None:
     """Preserve remote, error, and FD frames without pretending to decode them as RV-C."""
     tool = load_monitor()
@@ -148,9 +186,14 @@ def test_existing_local_command_and_server_options(monkeypatch: pytest.MonkeyPat
         tool.main, ["--interface", "can-test", "server", "--host", "0.0.0.0", "--port", "36001"],
     )
     assert result.exit_code == 0, result.output
-    interface, _spec, _parameterized, host, port, token, timeout = calls[0]
-    assert (interface, host, port, timeout) == ("can-test", "0.0.0.0", 36001, 10)
+    interface, _spec, _parameterized, host, port, token, timeout, verbose = calls[0]
+    assert (interface, host, port, timeout, verbose) == ("can-test", "0.0.0.0", 36001, 10, False)
     assert len(token) == 43
+    for flag in ("-v", "--verbose"):
+        calls.clear()
+        result = CliRunner().invoke(tool.main, ["server", flag])
+        assert result.exit_code == 0, result.output
+        assert calls[0][-1] is True
 
 
 def test_listener_recovers_after_bad_auth_and_invalid_command(monkeypatch: pytest.MonkeyPatch) -> None:
