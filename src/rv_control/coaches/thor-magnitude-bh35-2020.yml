@@ -81,6 +81,7 @@ templates:
   dimmer_switch:
     description: On/off load on a Spyder dimmer channel (lights, fans, pump, heater)
     transport: rvc
+    action_schemas: {on: {}, off: {}, toggle: {}}
     actions:
       on:
         - {dgn: 0x1FEDB, instance: "{instance}", group: 255, level: 100, command: on, delay: 255}
@@ -99,6 +100,9 @@ templates:
   dimmable_light:
     description: Dimmable light; adds brightness to dimmer_switch
     extends: dimmer_switch
+    action_schemas:
+      brightness:
+        level: {type: number, min: 0, max: 100}
     actions:
       brightness:
         - {dgn: 0x1FEDB, instance: "{instance}", group: 255, level: "{level}", command: set-brightness, delay: 255}
@@ -108,6 +112,7 @@ templates:
       Two dimmer channels driving one motor or relay pair. Each action turns the
       opposite channel off first, then energises its own channel for a fixed time.
     transport: rvc
+    action_schemas: {"{first_action}": {}, "{second_action}": {}}
     actions:
       "{first_action}":
         - {dgn: 0x1FEDB, instance: "{second}", group: 255, level: 0, command: off, delay: 255}
@@ -132,6 +137,7 @@ templates:
       Two momentary inputs on a controller that does its own travel (awning).
       Each press is a 1 s pulse; the controller reports no position.
     transport: rvc
+    action_schemas: {"{first_action}": {}, "{second_action}": {}}
     actions:
       "{first_action}":
         - {dgn: 0x1FEDB, instance: "{second}", group: 255, level: 0, command: off, delay: 255}
@@ -165,6 +171,11 @@ templates:
   wled_light:
     description: WLED strip controlled through its JSON state API
     transport: wled
+    action_schemas:
+      on: {}
+      off: {}
+      brightness:
+        bri: {type: integer, min: 0, max: 255}
     actions:
       on:
         - {on: true}
@@ -268,6 +279,7 @@ entities:
     instance: 0               # drives AIR_CONDITIONER inst 1
     sensor: 0
     heat_entity: front_furnace
+    action_schemas: {cool: {}, heat: {}, fan_auto: {}, fan_high: {}, fan_low: {}, setpoint_down: {}, setpoint_up: {}, off: {}}
     actions:
       cool:          [{dgn: 0x1FEF9, payload: "02F0FFFFFFFFFFFF"}, {dgn: 0x1FEF9, payload: "00F1FFFFFFFFFFFF"}]
       heat:          [{dgn: 0x1FEF9, payload: "00F0FFFFFFFFFFFF"}, {dgn: 0x1FEF9, payload: "02F2FFFFFFFFFFFF"}]
@@ -285,6 +297,7 @@ entities:
     template: thermostat
     instance: 1               # drives AIR_CONDITIONER inst 2; no heat
     sensor: 1
+    action_schemas: {cool: {}, off: {}, fan_high: {}, fan_low: {}, setpoint_down: {}, setpoint_up: {}}
     actions:
       cool:          [{dgn: 0x1FEF9, payload: "01F1FFFFFFFFFFFF"}]
       off:           [{dgn: 0x1FEF9, payload: "01C000FFFFFFFFFF"}]   # panel "fan auto" turns the zone off

@@ -84,8 +84,8 @@ def merge_definitions(base: dict[str, Any], override: dict[str, Any]) -> dict[st
     """Merge an entity or child template over a parent template definition.
 
     Top-level keys in ``override`` replace those in ``base``, except
-    ``actions``, whose entries are combined so an entity can add or replace
-    individual actions while inheriting the rest.
+    ``actions`` and ``action_schemas``, whose entries are combined so an entity
+    can add or replace individual actions while inheriting the rest.
 
     Parameters
     ----------
@@ -101,8 +101,8 @@ def merge_definitions(base: dict[str, Any], override: dict[str, Any]) -> dict[st
     """
     merged = copy.deepcopy(base)
     for key, value in override.items():
-        if key == "actions" and isinstance(value, dict) and isinstance(merged.get("actions"), dict):
-            merged["actions"].update(copy.deepcopy(value))
+        if key in {"actions", "action_schemas"} and isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key].update(copy.deepcopy(value))
         else:
             merged[key] = copy.deepcopy(value)
     return merged
@@ -454,13 +454,9 @@ class Coach:
         confirmed = str(kwargs.pop("confirm", "")).strip().lower() in CONFIRM_VALUES
         if entity.get("confirm") and not confirmed:
             raise PermissionError(f"{entity_name} {action_name} requires confirmation (--confirm)")
-        try:
-            frames = substitute_placeholders(frames, kwargs, strict=True)
-        except ValueError as error:
-            raise ValueError(f"{entity_name} {action_name}: {error}") from error
-
         transport = str(entity.get("transport", "")).lower()
         config_section = self.resolve_config_section(entity, entity_name)
+        built = self.prepare_action(entity_name, action_name, kwargs)
         source = self.get_source(config_section)
         result: dict[str, Any] = {
             "status": "ok",
@@ -471,7 +467,6 @@ class Coach:
         }
 
         if transport == "rvc":
-            built = [self._build_rvc_frame(frame, config_section) for frame in frames]
             for wait, payload in built:
                 if wait:
                     self.sleep(wait)
@@ -479,13 +474,29 @@ class Coach:
             result["frames"] = [{"can_id": payload["can_id"], "data": payload["data"], "wait": wait} for wait, payload in built]
             return result
         if transport == "wled":
-            built_wled = [self._build_wled_frame(frame) for frame in frames]
-            for wait, payload in built_wled:
+            for wait, payload in built:
                 if wait:
                     self.sleep(wait)
                 source.handle_command(payload)
-            result["frames"] = [payload for _wait, payload in built_wled]
+            result["frames"] = [payload for _wait, payload in built]
             return result
+        raise ValueError(f"Entity {entity_name!r} uses unsupported transport {transport!r}")
+
+    def prepare_action(
+        self, entity_name: str, action_name: str, params: dict[str, Any],
+    ) -> list[tuple[float, dict[str, Any]]]:
+        """Build an entire entity action without opening hardware or sending any frames."""
+        entity = self.entities[entity_name]
+        frames = entity.get("actions", {}).get(action_name)
+        if frames is None:
+            raise ValueError(f"Action {action_name!r} not supported by entity {entity_name!r}")
+        frames = substitute_placeholders(frames, params, strict=True)
+        transport = entity.get("transport")
+        if transport == "rvc":
+            section = self.resolve_config_section(entity, entity_name)
+            return [self._build_rvc_frame(frame, section) for frame in frames]
+        if transport == "wled":
+            return [self._build_wled_frame(frame) for frame in frames]
         raise ValueError(f"Entity {entity_name!r} uses unsupported transport {transport!r}")
 
     def _resolve_template(self, template_name: str, chain: tuple[str, ...] = ()) -> dict[str, Any]:
@@ -548,6 +559,7 @@ class Coach:
                 self._check_static_reserved(entity_name, frame)
             actions[action_name] = frames
         merged["actions"] = actions
+        merged["action_schemas"] = substitute_placeholders(merged.get("action_schemas", {}), context, strict=False)
         if "state" in merged:
             merged["state"] = substitute_placeholders(merged["state"], context, strict=False)
         return merged

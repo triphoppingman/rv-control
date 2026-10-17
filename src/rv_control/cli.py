@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import logging
 import json
+import sqlite3
 import threading
 from typing import Any
 
 import click
 
 from .coach import Coach
+from .coach_commands import CoachCommandService, api_enabled
+from .coach_mqtt_client import mqtt_command, mqtt_query
 from .coach_state import CoachStatePublisher, wrap_publisher
 from .config import load_config
 from .sources.base import Source
@@ -17,7 +20,8 @@ from .sources.renogy import RenogySource
 from .sources.rvc import RvcSource
 from .sources.wled import WledSource
 from .targets import log as _log, mqtt as _mqtt, store as _store  # noqa: F401  (register targets)
-from .targets.base import Target
+from .targets.base import MultiTarget, Target
+from .targets.mqtt import MqttTarget
 
 
 @click.group()
@@ -144,13 +148,29 @@ def run(config: Any) -> None:
     sources = []
     source_map = {}
     publisher = Target.build(config, lambda topic, payload: _handle_command(config, source_map, topic, payload))
+    command_service = None
     try:
         try:
             publisher = wrap_publisher(config, publisher)
-        except (ValueError, KeyError, FileNotFoundError) as error:
+            if api_enabled(config):
+                if not isinstance(publisher, CoachStatePublisher):
+                    raise ValueError("Coach MQTT API requires a configured coach tracker")
+                raw_publisher = publisher.publisher
+                targets = raw_publisher.targets if isinstance(raw_publisher, MultiTarget) else [raw_publisher]
+                mqtt_targets = [target for target in targets if isinstance(target, MqttTarget)]
+                if len(mqtt_targets) != 1:
+                    raise ValueError("Coach MQTT API requires exactly one MQTT target")
+                mqtt = mqtt_targets[0]
+                command_service = CoachCommandService(
+                    config, publisher.tracker.coach, publisher.tracker, source_map,
+                    mqtt.publish_result, mqtt.connected.is_set,
+                )
+                mqtt.coach_service = command_service
+        except (ValueError, KeyError, OSError, sqlite3.Error) as error:
             raise click.ClickException(f"Unable to load coach entity state: {error}") from error
         publisher.connect()
-        sources, source_map = Source.start_enabled(config, publisher, stop_event)
+        sources, started_sources = Source.start_enabled(config, publisher, stop_event)
+        source_map.update(started_sources)
         if not sources:
             raise click.ClickException("No sources are enabled")
         if isinstance(publisher, CoachStatePublisher):
@@ -161,18 +181,27 @@ def run(config: Any) -> None:
     except KeyboardInterrupt:
         click.echo("Stopping")
     finally:
-        stop_event.set()
-        for source in sources:
-            source.join(timeout=3)
-        publisher.close()
+        try:
+            if command_service is not None:
+                command_service.close()
+        finally:
+            stop_event.set()
+            for source in sources:
+                source.join(timeout=3)
+            publisher.close()
 
 
 def _handle_command(config: Any, source_map: dict[str, Any], topic: str, payload: dict[str, Any]) -> None:
     """Route an MQTT set-topic payload to its configured source."""
     section = config[Target.section_for_type(config, "mqtt") or "mqtt"]
-    prefix = section.get("base_topic", "rv").strip("/") + "/"
+    base_topic = section.get("base_topic", "rv").strip("/")
+    prefix = base_topic + "/" if base_topic else ""
     relative = topic.removeprefix(prefix)
     source_name = relative.removesuffix("/set")
     source = source_map.get(source_name)
     if source and section.getboolean("write_enabled", fallback=False):
         source.handle_command(payload)
+
+
+cli.add_command(mqtt_command)
+cli.add_command(mqtt_query)

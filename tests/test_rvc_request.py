@@ -18,10 +18,12 @@ class FakeBus:
     def __init__(self) -> None:
         """Create an empty send record."""
         self.sent: list[Any] = []
+        self.timeouts: list[float | None] = []
 
-    def send(self, message: Any) -> None:
+    def send(self, message: Any, timeout: float | None = None) -> None:
         """Record a sent message."""
         self.sent.append(message)
+        self.timeouts.append(timeout)
 
 
 def test_request_message_is_global_request_for_dgn() -> None:
@@ -48,6 +50,7 @@ def test_source_sends_queued_requests_once() -> None:
     source._send_pending_requests(bus)
     source._send_pending_requests(bus)
     assert [bytes(message.data) for message in bus.sent] == [bytes.fromhex("DAFE01"), bytes.fromhex("B7FF01")]
+    assert bus.timeouts == [1.0, 1.0]
 
 
 def test_source_rejects_invalid_request_dgn() -> None:

@@ -431,6 +431,10 @@ Topics are `<base_topic>/<source>` for source snapshots. RV-C additionally publi
 
 ## MQTT commands
 
+For a proposed semantic coach action API suitable for configurable dashboard
+controls, see [Coach MQTT command API](docs/COACH-MQTT-COMMANDS.md).
+That API is a design specification, not an implemented command endpoint.
+
 Bidirectional commands are opt-in. Set `mqtt.write_enabled = true` and the relevant source's `write_enabled = true`, then publish JSON to the source command topic.
 
 Send an extended RV-C CAN frame:

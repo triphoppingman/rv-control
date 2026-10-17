@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import math
+import threading
 import time
 from typing import Any
 
@@ -22,6 +24,7 @@ class WledSource(Source, source_name="wled"):
         """Initialize a WLED source without contacting the controller."""
         super().__init__(config, publisher, stop_event, section_name)
         self.session = requests.Session()
+        self._request_lock = threading.Lock()
 
     def _base_url(self) -> str:
         """Return the configured WLED HTTP base URL without a trailing slash."""
@@ -34,12 +37,20 @@ class WledSource(Source, source_name="wled"):
 
     def _request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         """Perform one bounded WLED JSON request and return its object response."""
-        response = self.session.request(
-            method,
-            f"{self._base_url()}{path}",
-            json=payload,
-            timeout=self.section.getfloat("timeout", fallback=5.0),
-        )
+        timeout = self.section.getfloat("timeout", fallback=5.0)
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("WLED timeout must be positive and finite")
+        if not self._request_lock.acquire(timeout=timeout):
+            raise TimeoutError("WLED source is busy with another request")
+        try:
+            response = self.session.request(
+                method,
+                f"{self._base_url()}{path}",
+                json=payload,
+                timeout=timeout,
+            )
+        finally:
+            self._request_lock.release()
         response.raise_for_status()
         data = response.json()
         if not isinstance(data, dict):
@@ -82,6 +93,14 @@ class WledSource(Source, source_name="wled"):
             self.set_state(payload)
         except (OSError, PermissionError, requests.RequestException, ValueError) as error:
             LOGGER.warning("WLED command failed for %s: %s", self.section_name, error)
+
+    def command_ready(self) -> bool:
+        """Report whether the daemon owns an active WLED source."""
+        return self.is_alive()
+
+    def execute_command(self, payload: dict[str, Any]) -> None:
+        """Dispatch state without the legacy handler's log-and-return failure behavior."""
+        self.set_state(payload)
 
     def run(self) -> None:
         """Poll WLED state and publish snapshots until the source is stopped."""

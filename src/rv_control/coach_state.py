@@ -6,6 +6,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable
+from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any
 
@@ -213,8 +214,14 @@ class EntityStateTracker:
         self.republish_seconds = republish_seconds
         self.clock = clock
         self._lock = threading.Lock()
+        self._condition = threading.Condition(self._lock)
+        self._publish_lock = threading.Lock()
         self._states: dict[str, dict[str, Any]] = {}
         self._last_published: dict[str, float] = {}
+        self._field_generations: dict[str, dict[str, int]] = {}
+        self._field_observed_at: dict[str, dict[str, str]] = {}
+        self._field_observed_monotonic: dict[str, dict[str, float]] = {}
+        self._payloads: dict[str, dict[str, Any]] = {}
         self._by_instance: dict[tuple[int, Any], list[StateBlock]] = {}
         self._by_dgn: dict[int, list[StateBlock]] = {}
         for entity_name, entity in coach.entities.items():
@@ -237,8 +244,44 @@ class EntityStateTracker:
         names.update(block.entity_name for blocks in self._by_dgn.values() for block in blocks)
         return sorted(names)
 
-    def status_requests(self) -> dict[str, list[int]]:
+    def monitored_fields(self) -> dict[str, list[str]]:
+        """Return sorted state attribute names for every monitored entity."""
+        fields: dict[str, set[str]] = {}
+        for blocks in (*self._by_instance.values(), *self._by_dgn.values()):
+            for block in blocks:
+                fields.setdefault(block.entity_name, set()).update(block.fields)
+        return {entity: sorted(names) for entity, names in sorted(fields.items())}
+
+    def entity_status_requests(self, entity_names: list[str] | None = None) -> dict[str, dict[str, list[int]]]:
+        """Return status DGNs per selected entity and mapped source section."""
+        selected = set(entity_names) if entity_names is not None else set(self.tracked_entities)
+        unknown = selected.difference(self.tracked_entities)
+        if unknown:
+            raise ValueError(f"Unknown monitored entities: {', '.join(sorted(unknown))}")
+        requests: dict[str, dict[str, set[int]]] = {name: {} for name in selected}
+        blocks = [block for group in (*self._by_instance.values(), *self._by_dgn.values()) for block in group]
+        for block in blocks:
+            if block.entity_name not in selected:
+                continue
+            entity = self.coach.entities[block.entity_name]
+            try:
+                section = self.coach.resolve_config_section(entity, block.entity_name)
+            except ValueError as error:
+                LOGGER.warning("No status request for entity %s: %s", block.entity_name, error)
+                continue
+            requests[block.entity_name].setdefault(section, set()).add(block.dgn)
+        return {
+            entity: {section: sorted(dgns) for section, dgns in sections.items()}
+            for entity, sections in requests.items()
+        }
+
+    def status_requests(self, entity_names: list[str] | None = None) -> dict[str, list[int]]:
         """Return the status DGNs each config section must report, for startup status requests.
+
+        Parameters
+        ----------
+        entity_names : list[str] | None
+            Optional entity selection; ``None`` selects every monitored entity.
 
         Returns
         -------
@@ -246,15 +289,9 @@ class EntityStateTracker:
             Sorted DGNs keyed by the config.ini source section serving the entities.
         """
         requests: dict[str, set[int]] = {}
-        blocks = [block for group in (*self._by_instance.values(), *self._by_dgn.values()) for block in group]
-        for block in blocks:
-            entity = self.coach.entities[block.entity_name]
-            try:
-                section = self.coach.resolve_config_section(entity, block.entity_name)
-            except ValueError as error:
-                LOGGER.warning("No status request for entity %s: %s", block.entity_name, error)
-                continue
-            requests.setdefault(section, set()).add(block.dgn)
+        for sections in self.entity_status_requests(entity_names).values():
+            for section, dgns in sections.items():
+                requests.setdefault(section, set()).update(dgns)
         return {section: sorted(dgns) for section, dgns in requests.items()}
 
     def state(self, entity_name: str) -> dict[str, Any]:
@@ -271,7 +308,112 @@ class EntityStateTracker:
             Latest attribute values; empty when nothing has been received yet.
         """
         with self._lock:
-            return dict(self._states.get(entity_name, {}))
+            return deepcopy(self._states.get(entity_name, {}))
+
+    def observation_baseline(self, entity_names: list[str]) -> dict[str, dict[str, int]]:
+        """Capture per-field observation generations before a refresh dispatch."""
+        fields = self.monitored_fields()
+        unknown = set(entity_names).difference(fields)
+        if unknown:
+            raise ValueError(f"Unknown monitored entities: {', '.join(sorted(unknown))}")
+        with self._lock:
+            return {
+                entity: {
+                    field: self._field_generations.get(entity, {}).get(field, 0)
+                    for field in fields[entity]
+                }
+                for entity in entity_names
+            }
+
+    def observed_fields_since(
+        self,
+        baseline: dict[str, dict[str, int]],
+        entity_names: list[str] | None = None,
+        observed_before: float | None = None,
+    ) -> dict[str, list[str]]:
+        """Return fields newly observed after baseline and before an optional deadline."""
+        selected = list(baseline) if entity_names is None else entity_names
+        with self._lock:
+            return {
+                entity: sorted(
+                    field
+                    for field, generation in self._field_generations.get(entity, {}).items()
+                    if generation > baseline.get(entity, {}).get(field, 0)
+                    and (
+                        observed_before is None
+                        or self._field_observed_monotonic.get(entity, {}).get(field, float("inf"))
+                        <= observed_before
+                    )
+                )
+                for entity in selected
+            }
+
+    def wait_for_observations(
+        self,
+        baseline: dict[str, dict[str, int]],
+        required_fields: dict[str, list[str]],
+        timeout_s: float,
+    ) -> bool:
+        """Wait at most ``timeout_s`` until every required field is newly observed."""
+        deadline = time.monotonic() + max(0.0, timeout_s)
+
+        def complete() -> bool:
+            """Check whether every selected field advanced past its baseline."""
+            return all(
+                self._field_generations.get(entity, {}).get(field, 0)
+                > baseline.get(entity, {}).get(field, 0)
+                for entity, names in required_fields.items()
+                for field in names
+            )
+
+        with self._condition:
+            return self._condition.wait_for(complete, timeout=max(0.0, deadline - time.monotonic()))
+
+    def snapshots(self, entity_names: list[str] | None = None) -> dict[str, dict[str, Any]]:
+        """Return cached entity states and per-field observation timestamps."""
+        fields = self.monitored_fields()
+        selected = list(fields) if entity_names is None else list(entity_names)
+        unknown = set(selected).difference(fields)
+        if unknown:
+            raise ValueError(f"Unknown monitored entities: {', '.join(sorted(unknown))}")
+        with self._lock:
+            result: dict[str, dict[str, Any]] = {}
+            for entity in selected:
+                state = deepcopy(self._states.get(entity, {}))
+                observed_at = {
+                    field: self._field_observed_at.get(entity, {}).get(field)
+                    for field in fields[entity]
+                }
+                result[entity] = {
+                    "entity": entity,
+                    "state": state,
+                    "observed_at": observed_at,
+                    "missing_fields": [field for field in fields[entity] if field not in state],
+                }
+            return result
+
+    def republish_states(self, entity_names: list[str]) -> dict[str, list[str]]:
+        """Republish cached payloads without changing their original timestamps."""
+        unknown = set(entity_names).difference(self.monitored_fields())
+        if unknown:
+            raise ValueError(f"Unknown monitored entities: {', '.join(sorted(unknown))}")
+        published: list[str] = []
+        missing: list[str] = []
+        with self._publish_lock:
+            with self._lock:
+                payloads = {
+                    entity: deepcopy(self._payloads[entity])
+                    for entity in entity_names
+                    if entity in self._payloads
+                }
+            for entity in entity_names:
+                payload = payloads.get(entity)
+                if payload is None:
+                    missing.append(entity)
+                    continue
+                self.publish(f"{ENTITY_TOPIC_PREFIX}/{entity}", payload)
+                published.append(entity)
+        return {"published": published, "missing": missing}
 
     def handle(self, decoded: dict[str, Any]) -> None:
         """Update entity state from one decoded RV-C message and publish changed entities.
@@ -311,17 +453,30 @@ class EntityStateTracker:
             Newly decoded attribute values.
         """
         now = self.clock()
-        with self._lock:
-            current = self._states.setdefault(entity_name, {})
-            changed = any(current.get(key, object()) != value for key, value in values.items())
-            current.update(values)
-            last = self._last_published.get(entity_name)
-            due = last is None or (self.republish_seconds > 0 and now - last >= self.republish_seconds)
-            if not (changed or due):
-                return
-            self._last_published[entity_name] = now
-            snapshot = dict(current)
-        self.publish(f"{ENTITY_TOPIC_PREFIX}/{entity_name}", self._payload(entity_name, snapshot))
+        observed_at = datetime.now(timezone.utc).isoformat()
+        observed_monotonic = time.monotonic()
+        with self._publish_lock:
+            with self._condition:
+                current = self._states.setdefault(entity_name, {})
+                changed = any(current.get(key, object()) != value for key, value in values.items())
+                current.update(values)
+                generations = self._field_generations.setdefault(entity_name, {})
+                timestamps = self._field_observed_at.setdefault(entity_name, {})
+                monotonic_timestamps = self._field_observed_monotonic.setdefault(entity_name, {})
+                for field in values:
+                    generations[field] = generations.get(field, 0) + 1
+                    timestamps[field] = observed_at
+                    monotonic_timestamps[field] = observed_monotonic
+                last = self._last_published.get(entity_name)
+                due = last is None or (self.republish_seconds > 0 and now - last >= self.republish_seconds)
+                self._condition.notify_all()
+                if not (changed or due):
+                    return
+                self._last_published[entity_name] = now
+                snapshot = deepcopy(current)
+                payload = self._payload(entity_name, snapshot)
+                self._payloads[entity_name] = deepcopy(payload)
+            self.publish(f"{ENTITY_TOPIC_PREFIX}/{entity_name}", payload)
 
     def _payload(self, entity_name: str, state: dict[str, Any]) -> dict[str, Any]:
         """Build the published JSON payload: entity metadata plus its state attributes.
@@ -436,13 +591,15 @@ class CoachStatePublisher:
 
 
 def wrap_publisher(config: Any, publisher: Any) -> Any:
-    """Return a publisher that also reports coach entity state, when enabled in ``[coach]``.
+    """Return a publisher with a coach tracker when publishing or the query API needs one.
 
     Entity state is enabled when ``config.ini`` has a ``[coach]`` section and
-    ``publish_state`` is not false. ``state_republish_seconds`` (default 60)
-    controls periodic republishing of unchanged state, and
-    ``request_status_on_start`` (default true) asks RV-C nodes for their
-    current status once the sources start.
+    ``publish_state`` is not false. When publishing is disabled but the coach
+    MQTT API is enabled, a tracker is still created with entity publishing
+    disabled so snapshots and refresh observations remain available.
+    ``state_republish_seconds`` (default 60) controls periodic republishing of
+    unchanged state, and ``request_status_on_start`` (default true) asks RV-C
+    nodes for their current status once the sources start.
 
     Parameters
     ----------
@@ -459,13 +616,24 @@ def wrap_publisher(config: Any, publisher: Any) -> Any:
     if not config.has_section("coach"):
         return publisher
     section = config["coach"]
-    if not section.getboolean("publish_state", fallback=True):
+    publish_state = section.getboolean("publish_state", fallback=True)
+    api_enabled = config.has_section("coach_commands") and (
+        config["coach_commands"].getboolean("enabled", fallback=False)
+        or config["coach_commands"].getboolean("queries_enabled", fallback=False)
+    )
+    if not publish_state and not api_enabled:
         return publisher
     republish = section.getfloat("state_republish_seconds", fallback=DEFAULT_REPUBLISH_SECONDS)
     request_status = section.getboolean("request_status_on_start", fallback=True)
     coach = Coach.load(config)
+
+    def publish_entity(topic: str, payload: dict[str, Any]) -> None:
+        """Publish entity state only when state telemetry publishing is enabled."""
+        if publish_state:
+            publisher.publish(topic, payload)
+
     wrapped = CoachStatePublisher(
-        publisher, lambda publish: EntityStateTracker(coach, publish, republish), request_status
+        publisher, lambda _publish: EntityStateTracker(coach, publish_entity, republish), request_status
     )
     LOGGER.info("Publishing coach entity state for %d entities", len(wrapped.tracker.tracked_entities))
     return wrapped

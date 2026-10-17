@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import configparser
+import threading
+from datetime import datetime
 from typing import Any
 
 import pytest
@@ -199,6 +201,21 @@ def test_wrap_publisher_disabled() -> None:
     assert wrap_publisher(coach_config(publish_state="false"), target) is target
 
 
+def test_query_api_keeps_tracker_when_state_publishing_is_disabled(coach: Coach) -> None:
+    """The query API retains cached state without publishing entity telemetry."""
+    config = coach_config(publish_state="false")
+    config["coach_commands"] = {"queries_enabled": "true"}
+    target = RecordingTarget()
+    wrapped = wrap_publisher(config, target)
+
+    assert isinstance(wrapped, CoachStatePublisher)
+    instance = coach.entities["mid_bath_fan"]["instance"]
+    wrapped.publish("rvc/DC_DIMMER_STATUS_3", dimmer_status(instance, True))
+
+    assert wrapped.tracker.state("mid_bath_fan")["on"] is True
+    assert [topic for topic, _ in target.published] == ["rvc/DC_DIMMER_STATUS_3"]
+
+
 def test_all_entity_state_blocks_compile(coach: Coach) -> None:
     """Every entity with a state block in the coach file is tracked."""
     tracker, _, _ = tracker_for(coach)
@@ -239,3 +256,54 @@ def test_wrapper_requests_initial_status_once() -> None:
     disabled = wrap_publisher(coach_config(rvc="rv_c", request_status_on_start="false"), RecordingTarget())
     disabled.request_initial_status({"rv_c": disabled_source})
     assert disabled_source.requested == []
+
+
+def test_field_observations_advance_for_unchanged_telemetry(coach: Coach) -> None:
+    """Repeated identical telemetry advances every mapped field's generation and timestamp."""
+    tracker, published, _ = tracker_for(coach)
+    entity = "mid_bath_fan"
+    baseline = tracker.observation_baseline([entity])
+    decoded = dimmer_status(coach.entities[entity]["instance"], True)
+
+    tracker.handle(decoded)
+    first = tracker.snapshots([entity])[entity]["observed_at"]
+    first_generations = tracker.observed_fields_since(baseline, [entity])[entity]
+    second_baseline = tracker.observation_baseline([entity])
+    tracker.handle(decoded)
+    second = tracker.snapshots([entity])[entity]["observed_at"]
+    second_generations = tracker.observed_fields_since(second_baseline, [entity])[entity]
+
+    assert first_generations == ["level", "on", "remaining"]
+    assert second_generations == ["level", "on", "remaining"]
+    assert all(first[field] != second[field] for field in first)
+    assert all(datetime.fromisoformat(timestamp).utcoffset() is not None for timestamp in first.values())
+    assert len(published) == 1
+
+
+def test_wait_for_observations_uses_condition(coach: Coach) -> None:
+    """A waiting refresh wakes when a mapped field is observed."""
+    tracker, _, _ = tracker_for(coach)
+    entity = "mid_bath_fan"
+    baseline = tracker.observation_baseline([entity])
+    started = threading.Event()
+    completed: list[bool] = []
+
+    def wait_for_state() -> None:
+        """Wait for the fixture entity's new field generations."""
+        started.set()
+        completed.append(
+            tracker.wait_for_observations(
+                baseline,
+                {entity: ["level", "on", "remaining"]},
+                timeout_s=2,
+            )
+        )
+
+    waiter = threading.Thread(target=wait_for_state)
+    waiter.start()
+    assert started.wait(1)
+    tracker.handle(dimmer_status(coach.entities[entity]["instance"], True))
+    waiter.join(2)
+
+    assert not waiter.is_alive()
+    assert completed == [True]

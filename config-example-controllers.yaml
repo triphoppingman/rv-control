@@ -1,0 +1,40 @@
+# Shared-topic identities are claims, not authentication. Restrict broker access
+# to trusted backends; deny their credentials raw +/set publications.
+controllers:
+  rv-cli: &dashboard
+    actions:
+      kitchen_light:
+        on: {}
+        off: {}
+      living_ceiling_light:
+        on: {}
+        off: {}
+        brightness:
+          params:
+            level: {type: number, min: 0, max: 100}
+      kitchen_fan:
+        on: {}
+        off: {}
+      mid_bath_fan:
+        on: {}
+        off: {}
+      rear_bath_fan:
+        on: {}
+        off: {}
+      all_fans:
+        on: {}
+        off: {}
+      kitchen_fan_lid:
+        open: {confirm: true}
+        close: {confirm: true}
+      generator:
+        start: {confirm: true}
+        stop: {confirm: true}
+    queries:
+      refresh_states: {entities: ["*"]}
+      snapshot: {entities: ["*"]}
+      republish_states: {entities: ["*"]}
+      capabilities: {}
+      health: {}
+      request_status: {}
+  rv-dashboard: *dashboard

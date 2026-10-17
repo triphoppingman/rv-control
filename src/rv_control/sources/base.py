@@ -17,6 +17,7 @@ class Source(threading.Thread, ABC):
 
     source_name = "source"
     config_section = "source"
+    supports_status_requests = False
     _registry = {}
 
     def __init_subclass__(cls, *, source_name: str | None = None, **kwargs: Any) -> None:
@@ -158,6 +159,18 @@ class Source(threading.Thread, ABC):
     def handle_command(self, payload: dict[str, Any]) -> None:
         """Handle a command received from MQTT, when supported."""
         LOGGER.warning("%s does not support write commands: %s", self.source_name, payload)
+
+    def command_ready(self) -> bool:
+        """Report whether a running source supports acknowledged command dispatch."""
+        return False
+
+    def execute_command(self, payload: dict[str, Any]) -> None:
+        """Dispatch a command or raise; never infer success from a legacy handler."""
+        raise NotImplementedError(f"{self.source_name} has no reliable command interface")
+
+    def request_status(self, dgns: list[int]) -> None:
+        """Request mapped telemetry only on sources explicitly supporting safe reads."""
+        raise NotImplementedError(f"{self.source_name} has no safe status request interface")
 
     def interrogate(self) -> dict[str, Any]:
         """Return a current source snapshot, when supported."""

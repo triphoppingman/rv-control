@@ -72,6 +72,7 @@ class RvcSource(Source, source_name="rvc"):
 
     source_name = "rvc"
     config_section = "rv_c"
+    supports_status_requests = True
 
     def __init__(self, config: Any, publisher: Any, stop_event: Any, section_name: str | None = None) -> None:
         """Initialize the RV-C source without opening the CAN bus yet."""
@@ -120,13 +121,15 @@ class RvcSource(Source, source_name="rvc"):
         source = section.getint("source", fallback=SOURCE_ADDRESS)
         for dgn in pending:
             try:
-                bus.send(build_request_message(dgn, source, GLOBAL_ADDRESS, priority))
+                bus.send(build_request_message(dgn, source, GLOBAL_ADDRESS, priority), timeout=1.0)
                 LOGGER.info("Requested RV-C DGN %05X from all nodes", dgn)
             except (OSError, ValueError, can.CanError) as error:
                 LOGGER.warning("RV-C status request for DGN %05X failed: %s", dgn, error)
 
     def handle_command(self, payload: dict[str, Any]) -> None:
         """Validate and send a configured RV-C CAN command when writes are enabled."""
+        import can
+
         section = self.section
         if not section.getboolean("write_enabled", fallback=False):
             LOGGER.warning("RV-C write ignored because it is disabled")
@@ -140,8 +143,6 @@ class RvcSource(Source, source_name="rvc"):
             if bus is not None:
                 send_can_message(bus, (can_id >> 26) & 0x7, (can_id >> 8) & 0x1FFFF, can_id & 0xFF, data)
             else:
-                import can
-
                 interface = section.get("interface", "can0")
                 transient_bus = can.Bus(interface="socketcan", channel=interface)
                 try:
@@ -150,6 +151,23 @@ class RvcSource(Source, source_name="rvc"):
                     transient_bus.shutdown()
         except (KeyError, TypeError, ValueError, OSError, can.CanError) as error:
             LOGGER.warning("Invalid RV-C command: %s", error)
+
+    def command_ready(self) -> bool:
+        """Report whether the daemon currently owns an open CAN bus."""
+        return self.is_alive() and self.bus is not None
+
+    def execute_command(self, payload: dict[str, Any]) -> None:
+        """Send a preflighted command on the running bus with bounded failure reporting."""
+        if not self.section.getboolean("write_enabled", fallback=False):
+            raise PermissionError("RV-C writes are disabled")
+        if not self.command_ready():
+            raise RuntimeError("RV-C source is unavailable")
+        can_id = int(str(payload["can_id"]), 0)
+        data = bytes.fromhex(str(payload["data"]))
+        if not 0 <= can_id <= 0x1FFFFFFF or len(data) > 8:
+            raise ValueError("CAN ID or data length is out of range")
+        message = build_can_message((can_id >> 26) & 7, (can_id >> 8) & 0x1FFFF, can_id & 0xFF, data)
+        self.bus.send(message, timeout=1.0)
 
     def interrogate(self) -> dict[str, Any]:
         """Listen briefly and return the latest decoded state for each DGN."""
@@ -211,3 +229,7 @@ class RvcSource(Source, source_name="rvc"):
                     self.publisher.publish(f"rvc/{decoded['name']}", decoded)
         except Exception:
             LOGGER.exception("RV-C source stopped")
+        finally:
+            bus, self.bus = self.bus, None
+            if bus is not None:
+                bus.shutdown()
