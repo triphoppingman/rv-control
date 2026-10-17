@@ -263,6 +263,8 @@ Coach specifications are configured in the `[coach]` section:
 ```ini
 [coach]
 specfile = src/rv_control/coaches/thor-magnitude-bh35-2020.yml
+# publish_state = true            # publish <base_topic>/coach/entity/<entity> while running
+# state_republish_seconds = 60    # republish unchanged entity state; 0 = on change only
 ```
 
 Coach entities reference transports (such as `rvc` or `wled`) that `[coach]` maps to source sections; they do not contain device hosts, CAN interfaces, or credentials.
@@ -456,6 +458,23 @@ The configured MQTT username and password can be passed to `mosquitto_pub` with 
 ```sh
 mosquitto_sub -h localhost -t 'rv/#' -v
 ```
+
+### Coach entity state
+
+When `config.ini` has a `[coach]` section, `rvcontrol run` turns decoded RV-C status messages into per-entity state using the coach file's `state` blocks and publishes it to `<base_topic>/coach/entity/<entity>` (with the default `base_topic = rv`, for example `rv/coach/entity/mid_bath_fan`):
+
+```json
+{"entity": "mid_bath_fan", "name": "Mid bath fan", "kind": "fan", "area": "mid_bath",
+ "state": {"on": true, "level": 100.0, "remaining": null}, "updated": "2025-01-01T12:00:00+00:00"}
+```
+
+State is published whenever an attribute changes and republished unchanged every `state_republish_seconds` (default 60). The panel reports loads that are on every couple of seconds but reports off loads only when they change, so keep MQTT `retain = true` for subscribers that start later. Watch all entities with:
+
+```sh
+mosquitto_sub -h localhost -t 'rv/coach/entity/#' -v
+```
+
+Set `[coach] publish_state = false` to disable entity state publishing. Raw `rvc/<DGN name>` topics are published as before.
 
 ## Testing and troubleshooting
 

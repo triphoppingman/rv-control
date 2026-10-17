@@ -8,6 +8,7 @@ from typing import Any
 import click
 
 from .coach import Coach
+from .coach_state import wrap_publisher
 from .config import load_config
 from .sources.base import Source
 from .sources.hughes import HughesSource
@@ -144,6 +145,10 @@ def run(config: Any) -> None:
     source_map = {}
     publisher = Target.build(config, lambda topic, payload: _handle_command(config, source_map, topic, payload))
     try:
+        try:
+            publisher = wrap_publisher(config, publisher)
+        except (ValueError, KeyError, FileNotFoundError) as error:
+            raise click.ClickException(f"Unable to load coach entity state: {error}") from error
         publisher.connect()
         sources, source_map = Source.start_enabled(config, publisher, stop_event)
         if not sources:

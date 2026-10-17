@@ -68,8 +68,14 @@ command_groups:
 # runtime parameters (e.g. {level}) when an action runs. An action is a list of
 # frames sent in order; a frame's `wait` is seconds to pause before sending it.
 # DC dimmer frames are padded to 8 bytes with 0xFF, as the panels send them.
-# State `fields` map an entity attribute to a decoded RV-C field name as
-# produced by rv_control.sources.rvc.decode_message.
+# State blocks map decoded RV-C status messages to entity attributes, which
+# the daemon publishes to <base_topic>/coach/entity/<entity>. A block selects
+# messages by `dgn` and optional `match` (field: value or list of values).
+# Each field is either a decoded field name (as produced by
+# rv_control.rvc_util.decode_dgn) or a mapping with `field` plus optional
+# `invalid` (raw values reported as null), `divide_by` (another field),
+# `scale`, `offset`, `round` (decimals) and `map` (raw value -> label).
+# Value = (raw / divide_by) * scale + offset, then rounded, then mapped.
 # ---------------------------------------------------------------------------
 templates:
   dimmer_switch:
@@ -86,9 +92,9 @@ templates:
       dgn: 0x1FEDA              # DC_DIMMER_STATUS_3 from 9F
       match: {instance: "{instance}"}
       fields:
-        on: loadstatus          # 1 on / 0 off
-        level: operatingstatusbrightness
-        remaining: delay_duration
+        on: {field: loadstatus, map: {0: false, 1: true}}
+        level: {field: operatingstatusbrightness, invalid: [255]}
+        remaining: {field: delay_duration, invalid: [255]}   # seconds left on a timed "on"
 
   dimmable_light:
     description: Dimmable light; adds brightness to dimmer_switch
@@ -110,11 +116,16 @@ templates:
         - {dgn: 0x1FEDB, instance: "{first}", group: 255, level: 0, command: off, delay: 255}
         - {dgn: 0x1FEDB, instance: "{second}", group: 255, level: 100, command: on, delay: "{second_seconds}"}
     state:
-      dgn: 0x1FEDA
-      match: {instance: ["{first}", "{second}"]}
-      fields:
-        active: loadstatus
-        remaining: delay_duration
+      - dgn: 0x1FEDA
+        match: {instance: "{first}"}
+        fields:
+          "{first_action}_active": {field: loadstatus, map: {0: false, 1: true}}
+          "{first_action}_remaining": {field: delay_duration, invalid: [255]}
+      - dgn: 0x1FEDA
+        match: {instance: "{second}"}
+        fields:
+          "{second_action}_active": {field: loadstatus, map: {0: false, 1: true}}
+          "{second_action}_remaining": {field: delay_duration, invalid: [255]}
 
   pulse_pair:
     description: >-
@@ -141,15 +152,15 @@ templates:
       - dgn: 0x1FFE2            # THERMOSTAT_STATUS_1
         match: {instance: "{instance}"}
         fields:
-          mode: operatingmode   # 0 off, 1 cool, 2 heat, 3 auto, 4 fan only
-          fan_mode: fanmode     # 0 auto, 1 on
-          fan_speed: fanspeed
-          setpoint_heat: {field: setpointtempheat, scale: 0.03125, offset: -273, unit: C}
-          setpoint_cool: {field: setpointtempcool, scale: 0.03125, offset: -273, unit: C}
+          mode: {field: operatingmode, map: {0: "off", 1: cool, 2: heat, 3: auto, 4: fan_only}}
+          fan_mode: {field: fanmode, map: {0: auto, 1: "on"}}
+          fan_speed: {field: fanspeed, invalid: [255]}
+          setpoint_heat_c: {field: setpointtempheat, invalid: [65535], scale: 0.03125, offset: -273, round: 1}
+          setpoint_cool_c: {field: setpointtempcool, invalid: [65535], scale: 0.03125, offset: -273, round: 1}
       - dgn: 0x1FF9C            # THERMOSTAT_AMBIENT_STATUS
         match: {instance: "{sensor}"}
         fields:
-          ambient: {field: ambienttemp, scale: 0.03125, offset: -273, unit: C}
+          ambient_c: {field: ambienttemp, invalid: [65535], scale: 0.03125, offset: -273, round: 1}
 
   wled_light:
     description: WLED strip controlled through its JSON state API
@@ -169,7 +180,7 @@ templates:
       dgn: 0x1FFB7              # TANK_STATUS
       match: {instance: "{instance}"}
       fields:
-        level: {expr: "relativelevel / resolution * 100", unit: "%"}
+        level: {field: relativelevel, divide_by: resolution, scale: 100, round: 0}   # percent
         relative: relativelevel
         resolution: resolution
 
@@ -191,8 +202,8 @@ entities:
   patio_light:          {name: Patio strip, kind: light, area: exterior, template: wled_light}
 
   # Fans and covers ------------------------------------------------------
-  kitchen_fan:   {name: Kitchen fan, kind: fan, area: kitchen, template: dimmer_switch, instance: 20}
-  mid_bath_fan:  {name: Mid bath fan, kind: fan, area: mid_bath, template: dimmer_switch, instance: 21}
+  kitchen_fan:   {name: Kitchen fan, kind: fan, area: kitchen, template: dimmer_switch, instance: 20, verified: true}
+  mid_bath_fan:  {name: Mid bath fan, kind: fan, area: mid_bath, template: dimmer_switch, instance: 21, verified: true}
   rear_bath_fan: {name: Rear bath fan, kind: fan, area: rear_bath, template: dimmer_switch, instance: 22}
   kitchen_fan_lid:
     name: Kitchen fan lid
@@ -235,10 +246,18 @@ entities:
     second_seconds: 15
     confirm: true
     state:
-      dgn: 0x1FFDC            # GENERATOR_STATUS_1
-      fields:
-        status: {field: status, map: {0: stopped, 3: running}}
-        run_hours: {field: engineruntime, scale: 0.016666667, unit: h}
+      - dgn: 0x1FFDC          # GENERATOR_STATUS_1
+        fields:
+          status: {field: status, map: {0: stopped, 3: running}}
+          run_hours: {field: engineruntime, divide_by: 60, round: 1}
+      - dgn: 0x1FEDA
+        match: {instance: 41}
+        fields:
+          starting: {field: loadstatus, map: {0: false, 1: true}}
+      - dgn: 0x1FEDA
+        match: {instance: 42}
+        fields:
+          stopping: {field: loadstatus, map: {0: false, 1: true}}
 
   # Climate --------------------------------------------------------------
   front_ac:
