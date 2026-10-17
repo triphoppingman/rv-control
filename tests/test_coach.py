@@ -32,37 +32,25 @@ def test_load_coach_yaml(tmp_path: Path) -> None:
         load_coach_yaml(tmp_path / "missing.yml")
 
 
-def test_coach_execution_single_rvc_command(config_file: Path) -> None:
-    """Verify executing a single RV-C command constructs and dispatches the CAN message."""
+class FakeBus:
+    """Collect CAN messages instead of sending them."""
+
+    def __init__(self) -> None:
+        """Start with no recorded messages."""
+        self.sent: list[Any] = []
+
+    def send(self, msg: Any) -> None:
+        """Record one outgoing CAN message."""
+        self.sent.append(msg)
+
+
+@pytest.fixture
+def coach_env(config_file: Path, monkeypatch: Any) -> tuple[Coach, FakeBus, list[dict[str, Any]], list[float]]:
+    """Return a coach wired to a fake CAN bus, a fake WLED source, and a fake sleep."""
     config = load_config(str(config_file))
-    config["source"]["enabled-sources"] = "rv_c_bus"
     config["rv_c_bus"] = {"type": "rvc", "interface": "can0", "write_enabled": "true"}
-
-    sent_messages = []
-
-    class FakeBus:
-        def send(self, msg: Any) -> None:
-            sent_messages.append(msg)
-
-    coach = Coach.load(config)
-    coach.get_source("rv_c_bus").bus = FakeBus()
-    results = coach.execute("livingroom_lights", "on")
-
-    assert len(results) == 1
-    assert results[0]["status"] == "ok"
-    assert results[0]["target"] == "livingroom_lights"
-    assert results[0]["action"] == "on"
-    assert results[0]["transport"] == "rvc"
-    assert len(sent_messages) == 1
-    assert sent_messages[0].arbitration_id == 0x19FEDB00
-
-
-def test_coach_execution_wled_command(config_file: Path, monkeypatch: Any) -> None:
-    """Verify executing a WLED command delegates to WledSource."""
-    config = load_config(str(config_file))
     config["wled_patio"] = {"type": "wled", "base_url": "http://wled.local", "write_enabled": "true"}
-
-    wled_calls = []
+    wled_calls: list[dict[str, Any]] = []
 
     from rv_control.sources.base import Source
 
@@ -80,71 +68,133 @@ def test_coach_execution_wled_command(config_file: Path, monkeypatch: Any) -> No
             pass
 
     monkeypatch.setitem(Source._registry, "wled", FakeWledSource)
-
     coach = Coach.load(config)
-    results = coach.execute("patio_lights", "on")
-    assert len(results) == 1
+    bus = FakeBus()
+    coach.get_source("rv_c_bus").bus = bus
+    sleeps: list[float] = []
+    coach.sleep = sleeps.append
+    return coach, bus, wled_calls, sleeps
+
+
+def frames(bus: FakeBus) -> list[tuple[int, str]]:
+    """Return (CAN ID, hex data) pairs for every message sent on the fake bus."""
+    return [(msg.arbitration_id, bytes(msg.data).hex(" ").upper()) for msg in bus.sent]
+
+
+def test_entity_dimmer_switch(coach_env: Any) -> None:
+    """A dimmer_switch entity sends one panel-format DC_DIMMER_COMMAND_2 frame."""
+    coach, bus, _wled, _sleeps = coach_env
+    results = coach.execute("kitchen_fan", "on")
+    assert results[0]["status"] == "ok"
+    assert results[0]["config_section"] == "rv_c_bus"
+    assert frames(bus) == [(0x19FEDB00, "14 FF C8 01 FF 00 FF FF")]
+
+
+def test_entity_brightness_requires_level(coach_env: Any) -> None:
+    """Dimmable lights take the runtime level parameter and reject a missing one."""
+    coach, bus, _wled, _sleeps = coach_env
+    with pytest.raises(ValueError, match="level"):
+        coach.execute("living_ceiling_light", "brightness")
+    assert bus.sent == []
+    coach.execute("living_ceiling_light", "brightness", level=30)
+    assert frames(bus) == [(0x19FEDB00, "01 FF 3C 00 FF 00 FF FF")]
+
+
+def test_entity_timed_pair_sequence(coach_env: Any) -> None:
+    """The kitchen lid turns the opposite motor side off before running its own side."""
+    coach, bus, _wled, _sleeps = coach_env
+    coach.execute("kitchen_fan_lid", "open")
+    assert frames(bus) == [
+        (0x19FEDB00, "34 FF 00 03 FF 00 FF FF"),
+        (0x19FEDB00, "33 FF C8 01 0F 00 FF FF"),
+    ]
+
+
+def test_entity_confirm_and_wait(coach_env: Any) -> None:
+    """Confirm-only entities refuse to run unconfirmed, and frame waits are honoured."""
+    coach, bus, _wled, sleeps = coach_env
+    with pytest.raises(PermissionError):
+        coach.execute("awning", "extend")
+    assert bus.sent == []
+    coach.execute("awning", "extend", confirm=True)
+    assert frames(bus) == [
+        (0x19FEDB00, "06 FF 00 03 FF 00 FF FF"),
+        (0x19FEDB00, "05 FF C8 01 01 00 FF FF"),
+        (0x19FEDB00, "05 FF 00 03 FF 00 FF FF"),
+    ]
+    assert sleeps == [1.0]
+
+
+def test_entity_raw_payload_climate(coach_env: Any) -> None:
+    """Thermostat actions send their captured THERMOSTAT_COMMAND_1 payloads in order."""
+    coach, bus, _wled, _sleeps = coach_env
+    coach.execute("front_ac", "cool")
+    assert frames(bus) == [
+        (0x19FEF900, "02 F0 FF FF FF FF FF FF"),
+        (0x19FEF900, "00 F1 FF FF FF FF FF FF"),
+    ]
+
+
+def test_entity_wled(coach_env: Any) -> None:
+    """WLED entities pass their JSON state frames to the WLED source."""
+    coach, _bus, wled_calls, _sleeps = coach_env
+    results = coach.execute("patio_light", "on")
     assert results[0]["transport"] == "wled"
     assert wled_calls == [{"on": True}]
 
 
-def test_coach_execute_group(config_file: Path, monkeypatch: Any) -> None:
-    """Verify execute_group runs all step commands in the group."""
-    config = load_config(str(config_file))
-    config["rv_c_bus"] = {"type": "rvc", "interface": "can0", "write_enabled": "true"}
-    config["wled_patio"] = {"type": "wled", "base_url": "http://wled.local", "write_enabled": "true"}
+def test_coach_execute_group(coach_env: Any) -> None:
+    """Member groups apply one action to every member; step groups run explicit steps."""
+    coach, bus, wled_calls, _sleeps = coach_env
+    results = coach.execute("all_fans", "off")
+    assert [r["target"] for r in results] == ["kitchen_fan", "mid_bath_fan", "rear_bath_fan"]
+    assert len(bus.sent) == 3
 
-    from rv_control.sources.base import Source
-
-    class FakeWledSource(Source, source_name="wled"):
-        def __init__(self, _cfg: Any, publisher: Any = None, stop_event: Any = None, section_name: str = "") -> None:
-            self.section_name = section_name
-
-        def handle_command(self, payload: dict[str, Any]) -> None:
-            pass
-
-        def comms_check(self) -> dict[str, Any]:
-            return {"ok": True}
-
-        def run(self) -> None:
-            pass
-
-    monkeypatch.setitem(Source._registry, "wled", FakeWledSource)
-
-    sent_messages = []
-
-    class FakeBus:
-        def send(self, msg: Any) -> None:
-            sent_messages.append(msg)
-
-    coach = Coach.load(config)
-    coach.get_source("rv_c_bus").bus = FakeBus()
-
-    # Execute all_interior_lights -> toggle
-    results = coach.execute("all_interior_lights", "toggle")
-    assert len(results) == 2
-    targets = [r["target"] for r in results]
-    assert targets == ["livingroom_lights", "bedroom_lights"]
-    assert len(sent_messages) == 2
-
-    # Execute evening_scene -> activate
-    sent_messages.clear()
-    results_scene = coach.execute("evening_scene", "activate")
-    assert len(results_scene) == 3
-    targets_scene = [r["target"] for r in results_scene]
-    assert targets_scene == ["livingroom_lights", "bedroom_lights", "patio_lights"]
+    results = coach.execute("evening_scene", "activate")
+    assert [r["target"] for r in results] == ["living_ceiling_light", "bedroom_ceiling_light", "patio_light"]
+    assert frames(bus)[3] == (0x19FEDB00, "01 FF 3C 00 FF 00 FF FF")
+    assert wled_calls == [{"on": True}]
 
 
 def test_coach_error_handling(config_file: Path) -> None:
-    """Verify Coach raises appropriate errors for invalid targets and actions."""
-    config = load_config(str(config_file))
-    coach = Coach.load(config)
-
+    """Unknown targets, unknown actions, and read-only entities raise errors."""
+    coach = Coach.load(load_config(str(config_file)))
     with pytest.raises(KeyError):
         coach.execute("nonexistent_target", "on")
-
     with pytest.raises(ValueError):
-        coach.execute("livingroom_lights", "nonexistent_action")
+        coach.execute("kitchen_fan", "nonexistent_action")
+    with pytest.raises(ValueError):
+        coach.execute("fresh_tank", "on")
+
+
+def test_reserved_instances_rejected(config_file: Path) -> None:
+    """Entities that address a reserved instance are rejected when the coach loads."""
+    data = {
+        "templates": {"switch": {"transport": "rvc", "actions": {"on": [{"dgn": 0x1FEDB, "instance": "{instance}", "command": "on"}]}}},
+        "entities": {"slide": {"template": "switch", "instance": 43}},
+        "reserved": [{"dgn": 0x1FEDB, "instances": [43]}],
+    }
+    with pytest.raises(PermissionError):
+        Coach(load_config(str(config_file)), data)
+
+
+def test_template_extends_loop_rejected(config_file: Path) -> None:
+    """Templates that extend each other in a loop are rejected."""
+    data = {
+        "templates": {"a": {"extends": "b"}, "b": {"extends": "a"}},
+        "entities": {"x": {"template": "a"}},
+    }
+    with pytest.raises(ValueError, match="loop"):
+        Coach(load_config(str(config_file)), data)
+
+
+def test_list_entities(config_file: Path) -> None:
+    """list_entities reports kind, area, actions and confirmation for each entity."""
+    entities = Coach.load(load_config(str(config_file))).list_entities()
+    assert entities["kitchen_fan_lid"]["actions"] == ["open", "close"]
+    assert entities["generator"]["confirm"] is True
+    assert entities["fresh_tank"]["kind"] == "tank"
+    assert entities["fresh_tank"]["actions"] == []
 
 
 def test_coach_load_from_config_section(config_file: Path) -> None:
@@ -164,18 +214,9 @@ def test_coach_transport_mapping_via_coach_section(config_file: Path) -> None:
         "wled": "wled_patio",
     }
     config["my_custom_can_section"] = {"type": "rvc", "interface": "can1", "write_enabled": "true"}
-    config["wled_patio"] = {"type": "wled", "base_url": "http://wled.local", "write_enabled": "true"}
-
-    sent_messages = []
-
-    class FakeBus:
-        def send(self, msg: Any) -> None:
-            sent_messages.append(msg)
-
     coach = Coach.load(config)
-    coach.get_source("my_custom_can_section").bus = FakeBus()
-    results = coach.execute("livingroom_lights", "on")
-
-    assert len(results) == 1
+    bus = FakeBus()
+    coach.get_source("my_custom_can_section").bus = bus
+    results = coach.execute("kitchen_fan", "on")
     assert results[0]["config_section"] == "my_custom_can_section"
-    assert len(sent_messages) == 1
+    assert len(bus.sent) == 1

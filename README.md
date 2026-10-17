@@ -78,17 +78,19 @@ rv-control --config config.ini interrogate
 
 Renogy interrogation connects once, reads every register block defined by the configured Renogy client type, and prints the decoded state. Hughes connects once, waits for a complete notification packet, and prints its decoded power attributes. RV-C listens for `interrogate_seconds` (10 by default), decodes received DGN frames, and prints the latest state for each DGN/source combination. The command exits with status `1` if an enabled source cannot be interrogated.
 
-List available coach semantic commands and command groups:
+List the coach entities and command groups:
 
 ```sh
 rv-control --config config.ini coach-list
 ```
 
-Execute a coach semantic command or command group action:
+Execute an action on a coach entity or command group (`-p` supplies action parameters; `--confirm` is required for entities marked `confirm`, such as the generator):
 
 ```sh
-rv-control --config config.ini coach-exec livingroom_lights toggle
+rv-control --config config.ini coach-exec kitchen_fan toggle
+rv-control --config config.ini coach-exec living_ceiling_light brightness -p level 30
 rv-control --config config.ini coach-exec evening_scene activate
+rv-control --config config.ini coach-exec generator start --confirm
 ```
 
 Run the collectors in the foreground:
@@ -263,7 +265,7 @@ Coach specifications are configured in the `[coach]` section:
 specfile = src/rv_control/coaches/thor-magnitude-bh35-2020.yml
 ```
 
-Coach command mappings reference source sections (such as `config_section: wled_patio` or `config_section: rv_c_bus`); they do not contain device hosts, CAN interfaces, or credentials.
+Coach entities reference transports (such as `rvc` or `wled`) that `[coach]` maps to source sections; they do not contain device hosts, CAN interfaces, or credentials.
 
 WLED `comms-check` requests `/json/info`, `interrogate` requests `/json/state`, and daemon mode polls `/json/state` at `poll_interval` seconds. State snapshots are published to the configured `topic`. WLED commands received on `<base_topic>/<source-section>/set` are sent to `/json/state` only when both global MQTT `write_enabled = true` and the WLED section's `write_enabled = true` are set.
 
@@ -493,7 +495,9 @@ timestamps, DLC, frame flags, and decoded RV-C fields. Unknown messages retain
 their raw data. `QUIT` or disconnect releases the subscription; `Ctrl+C` stops
 the listener. There is no CAN send capability. Host defaults to `127.0.0.1`,
 port to `35001`; `--auth-token` / `RVC_SERVER_AUTH_TOKEN` override the generated
-token, and `--write-timeout` bounds slow-client writes. Use only on the trusted
+token, `--write-timeout` bounds slow-client writes, and `-v` / `--verbose`
+echo the raw bytes sent (`TX`) and received (`RX`) on the client socket to the
+Pi's stderr, with the auth token redacted. Use only on the trusted
 LAN: traffic and authentication are unencrypted. Interface/spec options go
 before `server`. See the [Kiro RV-C debug runbook](docs/RVC-REMOTE-DEBUG.md)
 for protocol details, raw record fields, bounded capture, and handoff instructions.
@@ -614,23 +618,40 @@ RV-C uses the J1939 address-management messages. `ADDRESS_CLAIM_DGN` (`0x0EE00`)
 
 Use `RvcName` with `encode_rvc_name()` and `decode_rvc_name()` to work with NAME values. Use `is_address_claim()` or `address_claim_message()` when receiving frames, and `build_address_claim_message()` or `build_address_claim_request_message()` when preparing announcements and requests. These helpers validate NAME field widths and CAN payload sizes, while the caller remains responsible for handling address conflicts and choosing an available source address.
 
-### Coach command mappings
+### Coach entities
 
-Coach-specific semantic commands live under `src/rv_control/coaches/`. A mapping names the user-facing command, selects a `transport` (e.g. `rvc`, `wled`, `bluetooth`), and specifies protocol-specific payload parameters:
+Coach specifications live under `src/rv_control/coaches/`. Each named device is an entry under `entities`, normally built from a reusable entry under `templates`. Each entity has a display `name`, a `kind` (`light`, `fan`, `cover`, `switch`, `generator`, `climate`, `tank`), an `area`, a `transport` (e.g. `rvc`, `wled`), its `actions`, and a `state` mapping from RV-C status messages to entity attributes. Read-only entities such as tanks have no actions.
 
 ```yaml
-commands:
-  livingroom_lights:
+templates:
+  dimmer_switch:
     transport: rvc
-    rvc:
-      command: dc_dimmer_command_2
-      dgn: 0x1FEDB
-      instance: 1
-      group: 1
     actions:
-      toggle:
-        command: toggle
+      on:
+        - {dgn: 0x1FEDB, instance: "{instance}", group: 255, level: 100, command: on, delay: 255}
+      off:
+        - {dgn: 0x1FEDB, instance: "{instance}", group: 255, level: 0, command: off, delay: 255}
+
+entities:
+  kitchen_fan: {name: Kitchen fan, kind: fan, area: kitchen, template: dimmer_switch, instance: 20}
+  fresh_tank:  {name: Fresh water, kind: tank, template: tank, instance: 0}
+
+command_groups:
+  all_fans:
+    members: [kitchen_fan, mid_bath_fan, rear_bath_fan]
+    actions: [on, off]
+
+reserved:
+  - {dgn: 0x1FEDB, instances: [43, 44]}
 ```
+
+- An action is a list of frames sent in order. A frame's `wait` (seconds, up to 60) is slept before that frame is sent. All of an action's frames are validated before the first one is sent.
+- An RV-C frame is either a DC_DIMMER_COMMAND_2 described by named fields (`instance`, `group`, `level` percent, `command`, `delay`, `interlock`) or a raw hexadecimal `payload` with its `dgn`. Payloads are padded to eight bytes with `0xFF`.
+- `{name}` placeholders are filled from the entity's own keys when the coach loads (e.g. `{instance}`), and from `coach-exec -p` parameters when an action runs (e.g. `{level}`).
+- A template may `extends` another template. An entity's `actions` are merged over its template's actions; other keys replace the template's keys.
+- A command group either lists `members` and the action names applied to each of them, or maps each action to explicit `{entity, action, params}` steps.
+- Frames addressing a `reserved` DGN and instance are refused, both when the coach loads and when an action runs.
+- Entities marked `confirm: true` (on this coach, the generator and awning) run only with `coach-exec --confirm`.
 
 To keep the coach YAML completely independent of specific installation configuration section names, transports or logical target names are mapped to actual `config.ini` sections inside the `[coach]` section of `config.ini`:
 
@@ -641,7 +662,7 @@ rvc = rv_c_bus
 wled = wled_patio
 ```
 
-Connection details belong in those `config.ini` sections (Bluetooth MAC addresses, WLED hosts, SocketCAN interfaces), not in the coach YAML. When executing a command, `Coach` resolves `transport` or `target` through `[coach]` in `config.ini` to obtain the actual configuration section name, retrieves the corresponding `Source`, and dispatches the command.
+Connection details belong in those `config.ini` sections (Bluetooth MAC addresses, WLED hosts, SocketCAN interfaces), not in the coach YAML. When executing an action, `Coach` resolves the entity's `transport` or `target` through `[coach]` in `config.ini` to obtain the actual configuration section name, retrieves the corresponding `Source`, and dispatches the command.
 
 ## systemd
 

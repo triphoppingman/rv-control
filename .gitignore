@@ -28,3 +28,6 @@ config.json
 .DS_Store
 *.swp
 data/
+
+# Local debugging scripts, captures and logs
+debug/

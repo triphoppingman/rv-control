@@ -1,94 +1,299 @@
 # Coach-specific semantic mappings for a 2020 Thor Motor Coach Magnitude BH35.
-# A command selects a transport (e.g. rvc, wled); the [coach] section in config.ini
+# Entities select a transport (e.g. rvc, wled); the [coach] section in config.ini
 # maps transport names to actual installation configuration sections (e.g. rvc = rv_c_bus).
+#
+# Sections
+#   coach           Coach identity.
+#   templates       Reusable entity behaviours: actions (frame lists) and state mappings.
+#   entities        Every named device on this coach, for monitoring and control.
+#                   Run with `rvcontrol coach-exec <entity> <action>`.
+#   command_groups  Actions applied to several entities at once.
+#   reserved        Instances seen on the bus that must never be controlled.
+#
+# Bus facts (observed on this coach)
+#   9F  Spyder Controls monitor panel: switches loads, sends all status frames.
+#   9E  Spyder 7in colour touchscreen: light commands, periodic lock/unlock frames.
+#   FC  Climate panel / gateway: thermostat, generator, fan, lid and awning commands.
+#   All DC_DIMMER_COMMAND_2 frames on this bus use group 0xFF (255).
+#   Commands were captured from the panels; only entities marked `verified: true`
+#   have been sent from rv-control's own source address.
+
 coach:
   manufacturer: Thor Motor Coach
   model: Magnitude BH35
   model_year: 2020
 
-commands:
-  livingroom_lights:
-    description: Living room lighting group
-    transport: rvc
-    rvc:
-      command: dc_dimmer_command_2
-      dgn: 0x1FEDB
-      instance: 1
-      group: 1
-      defaults:
-        level: 100
-        delay: 0
-        interlock: 0
-    actions:
-      on:
-        command: on
-      off:
-        command: off
-      toggle:
-        command: toggle
-      brightness:
-        command: set-brightness
-
-  bedroom_lights:
-    description: Bedroom lighting group
-    transport: rvc
-    rvc:
-      command: dc_dimmer_command_2
-      dgn: 0x1FEDB
-      instance: 2
-      group: 1
-      defaults:
-        level: 100
-        delay: 0
-        interlock: 0
-    actions:
-      on:
-        command: on
-      off:
-        command: off
-      toggle:
-        command: toggle
-      brightness:
-        command: set-brightness
-
-  patio_lights:
-    description: Patio WLED lighting strip
-    transport: wled
-    actions:
-      on:
-        on: true
-      off:
-        on: false
-
 command_groups:
   all_interior_lights:
-    description: All interior coach lighting groups
-    actions:
-      on:
-        - command: livingroom_lights
-          action: on
-        - command: bedroom_lights
-          action: on
-      off:
-        - command: livingroom_lights
-          action: off
-        - command: bedroom_lights
-          action: off
-      toggle:
-        - command: livingroom_lights
-          action: toggle
-        - command: bedroom_lights
-          action: toggle
+    description: All interior lights
+    members:
+      - living_ceiling_light
+      - hall_light
+      - dinette_light
+      - bedroom_ceiling_light
+      - rear_bath_light
+      - kitchen_light
+      - sofa_light
+      - mid_bath_light
+      - accent_light
+      - vanity_light
+    actions: [on, off]
+
+  all_exterior_lights:
+    description: Cargo, step and awning lights
+    members: [cargo_light, step_light, awning_light]
+    actions: [on, off]
+
+  all_fans:
+    description: Kitchen and bath roof fans
+    members: [kitchen_fan, mid_bath_fan, rear_bath_fan]
+    actions: [on, off]
 
   evening_scene:
     description: Evening ambient lighting scene
     actions:
       activate:
-        - command: livingroom_lights
+        - entity: living_ceiling_light
           action: brightness
           params:
             level: 30
-        - command: bedroom_lights
+        - entity: bedroom_ceiling_light
           action: off
-        - command: patio_lights
+        - entity: patio_light
           action: on
+
+# ---------------------------------------------------------------------------
+# Entity model (monitoring + control). Placeholders in braces ({instance},
+# {first}, ...) are filled from the entity's own keys at load time, and from
+# runtime parameters (e.g. {level}) when an action runs. An action is a list of
+# frames sent in order; a frame's `wait` is seconds to pause before sending it.
+# DC dimmer frames are padded to 8 bytes with 0xFF, as the panels send them.
+# State `fields` map an entity attribute to a decoded RV-C field name as
+# produced by rv_control.sources.rvc.decode_message.
+# ---------------------------------------------------------------------------
+templates:
+  dimmer_switch:
+    description: On/off load on a Spyder dimmer channel (lights, fans, pump, heater)
+    transport: rvc
+    actions:
+      on:
+        - {dgn: 0x1FEDB, instance: "{instance}", group: 255, level: 100, command: on, delay: 255}
+      off:
+        - {dgn: 0x1FEDB, instance: "{instance}", group: 255, level: 0, command: off, delay: 255}
+      toggle:
+        - {dgn: 0x1FEDB, instance: "{instance}", group: 255, level: 100, command: toggle, delay: 255}
+    state:
+      dgn: 0x1FEDA              # DC_DIMMER_STATUS_3 from 9F
+      match: {instance: "{instance}"}
+      fields:
+        on: loadstatus          # 1 on / 0 off
+        level: operatingstatusbrightness
+        remaining: delay_duration
+
+  dimmable_light:
+    description: Dimmable light; adds brightness to dimmer_switch
+    extends: dimmer_switch
+    actions:
+      brightness:
+        - {dgn: 0x1FEDB, instance: "{instance}", group: 255, level: "{level}", command: set-brightness, delay: 255}
+
+  timed_pair:
+    description: >-
+      Two dimmer channels driving one motor or relay pair. Each action turns the
+      opposite channel off first, then energises its own channel for a fixed time.
+    transport: rvc
+    actions:
+      "{first_action}":
+        - {dgn: 0x1FEDB, instance: "{second}", group: 255, level: 0, command: off, delay: 255}
+        - {dgn: 0x1FEDB, instance: "{first}", group: 255, level: 100, command: on, delay: "{first_seconds}"}
+      "{second_action}":
+        - {dgn: 0x1FEDB, instance: "{first}", group: 255, level: 0, command: off, delay: 255}
+        - {dgn: 0x1FEDB, instance: "{second}", group: 255, level: 100, command: on, delay: "{second_seconds}"}
+    state:
+      dgn: 0x1FEDA
+      match: {instance: ["{first}", "{second}"]}
+      fields:
+        active: loadstatus
+        remaining: delay_duration
+
+  pulse_pair:
+    description: >-
+      Two momentary inputs on a controller that does its own travel (awning).
+      Each press is a 1 s pulse; the controller reports no position.
+    transport: rvc
+    actions:
+      "{first_action}":
+        - {dgn: 0x1FEDB, instance: "{second}", group: 255, level: 0, command: off, delay: 255}
+        - {dgn: 0x1FEDB, instance: "{first}", group: 255, level: 100, command: on, delay: 1}
+        - {dgn: 0x1FEDB, instance: "{first}", group: 255, level: 0, command: off, delay: 255, wait: 1}
+      "{second_action}":
+        - {dgn: 0x1FEDB, instance: "{first}", group: 255, level: 0, command: off, delay: 255}
+        - {dgn: 0x1FEDB, instance: "{second}", group: 255, level: 100, command: on, delay: 1}
+        - {dgn: 0x1FEDB, instance: "{second}", group: 255, level: 0, command: off, delay: 255, wait: 1}
+
+  thermostat:
+    description: >-
+      THERMOSTAT_COMMAND_1 zone. Byte 1 = mode (bits 0-3) | fan mode (bits 4-5)
+      | schedule (bits 6-7); 0xFF bytes mean "unchanged". Setpoint step bytes
+      5-6 = F9 FF (down) / FA FF (up), as sent by the climate panel.
+    transport: rvc
+    state:
+      - dgn: 0x1FFE2            # THERMOSTAT_STATUS_1
+        match: {instance: "{instance}"}
+        fields:
+          mode: operatingmode   # 0 off, 1 cool, 2 heat, 3 auto, 4 fan only
+          fan_mode: fanmode     # 0 auto, 1 on
+          fan_speed: fanspeed
+          setpoint_heat: {field: setpointtempheat, scale: 0.03125, offset: -273, unit: C}
+          setpoint_cool: {field: setpointtempcool, scale: 0.03125, offset: -273, unit: C}
+      - dgn: 0x1FF9C            # THERMOSTAT_AMBIENT_STATUS
+        match: {instance: "{sensor}"}
+        fields:
+          ambient: {field: ambienttemp, scale: 0.03125, offset: -273, unit: C}
+
+  wled_light:
+    description: WLED strip controlled through its JSON state API
+    transport: wled
+    actions:
+      on:
+        - {on: true}
+      off:
+        - {on: false}
+      brightness:
+        - {on: true, bri: "{bri}"}   # bri 0-255
+
+  tank:
+    description: Read-only tank level
+    transport: rvc
+    state:
+      dgn: 0x1FFB7              # TANK_STATUS
+      match: {instance: "{instance}"}
+      fields:
+        level: {expr: "relativelevel / resolution * 100", unit: "%"}
+        relative: relativelevel
+        resolution: resolution
+
+entities:
+  # Lights ---------------------------------------------------------------
+  living_ceiling_light: {name: Living ceiling, kind: light, area: living, template: dimmable_light, instance: 1, verified: true}
+  hall_light:           {name: Hall, kind: light, area: hall, template: dimmable_light, instance: 2}
+  dinette_light:        {name: Dinette, kind: light, area: living, template: dimmer_switch, instance: 3}
+  bedroom_ceiling_light: {name: Bedroom ceiling, kind: light, area: bedroom, template: dimmable_light, instance: 4}
+  rear_bath_light:      {name: Rear bath, kind: light, area: rear_bath, template: dimmer_switch, instance: 15}
+  kitchen_light:        {name: Kitchen, kind: light, area: kitchen, template: dimmer_switch, instance: 16}
+  sofa_light:           {name: Sofa, kind: light, area: living, template: dimmer_switch, instance: 17}
+  mid_bath_light:       {name: Mid bath, kind: light, area: mid_bath, template: dimmer_switch, instance: 18}
+  accent_light:         {name: Accent, kind: light, area: living, template: dimmer_switch, instance: 19}
+  cargo_light:          {name: Cargo, kind: light, area: exterior, template: dimmer_switch, instance: 24, notes: "Panel toggle uses delay 250"}
+  step_light:           {name: Step, kind: light, area: entry, template: dimmer_switch, instance: 39}
+  awning_light:         {name: Awning light, kind: light, area: exterior, template: dimmer_switch, instance: 57}
+  vanity_light:         {name: Vanity, kind: light, area: bedroom, template: dimmer_switch, instance: 59}
+  patio_light:          {name: Patio strip, kind: light, area: exterior, template: wled_light}
+
+  # Fans and covers ------------------------------------------------------
+  kitchen_fan:   {name: Kitchen fan, kind: fan, area: kitchen, template: dimmer_switch, instance: 20}
+  mid_bath_fan:  {name: Mid bath fan, kind: fan, area: mid_bath, template: dimmer_switch, instance: 21}
+  rear_bath_fan: {name: Rear bath fan, kind: fan, area: rear_bath, template: dimmer_switch, instance: 22}
+  kitchen_fan_lid:
+    name: Kitchen fan lid
+    kind: cover
+    area: kitchen
+    template: timed_pair
+    first_action: open
+    first: 51                 # lid up
+    first_seconds: 15
+    second_action: close
+    second: 52                # lid down
+    second_seconds: 15
+    notes: Panel sends delay 2 on the "on" frame, then an off frame carrying delay 15; motor runs ~15 s.
+
+  # Utilities ------------------------------------------------------------
+  water_pump: {name: Water pump, kind: switch, area: utility, template: dimmer_switch, instance: 23, notes: "Bluetooth app changes show status only; no command frame observed"}
+  tank_heat:  {name: Tank heat, kind: switch, area: utility, template: dimmer_switch, instance: 13, notes: "Bluetooth app changes show status only; no command frame observed"}
+
+  awning:
+    name: Awning
+    kind: cover
+    area: exterior
+    template: pulse_pair
+    first_action: extend
+    first: 5
+    second_action: retract
+    second: 6
+    confirm: true
+
+  generator:
+    name: Generator
+    kind: generator
+    area: utility
+    template: timed_pair
+    first_action: start
+    first: 41                 # start relay
+    first_seconds: 30
+    second_action: stop
+    second: 42                # stop relay
+    second_seconds: 15
+    confirm: true
+    state:
+      dgn: 0x1FFDC            # GENERATOR_STATUS_1
+      fields:
+        status: {field: status, map: {0: stopped, 3: running}}
+        run_hours: {field: engineruntime, scale: 0.016666667, unit: h}
+
+  # Climate --------------------------------------------------------------
+  front_ac:
+    name: Front A/C
+    kind: climate
+    area: front
+    template: thermostat
+    instance: 0               # drives AIR_CONDITIONER inst 1
+    sensor: 0
+    heat_entity: front_furnace
+    actions:
+      cool:          [{dgn: 0x1FEF9, payload: "02F0FFFFFFFFFFFF"}, {dgn: 0x1FEF9, payload: "00F1FFFFFFFFFFFF"}]
+      heat:          [{dgn: 0x1FEF9, payload: "00F0FFFFFFFFFFFF"}, {dgn: 0x1FEF9, payload: "02F2FFFFFFFFFFFF"}]
+      fan_auto:      [{dgn: 0x1FEF9, payload: "00C3FFFFFFFFFFFF"}, {dgn: 0x1FEF9, payload: "02C0FFFFFFFFFFFF"}]
+      fan_high:      [{dgn: 0x1FEF9, payload: "00D4C8FFFFFFFFFF"}]
+      fan_low:       [{dgn: 0x1FEF9, payload: "00D464FFFFFFFFFF"}]
+      setpoint_down: [{dgn: 0x1FEF9, payload: "00FFFFFFFFF9FFFF"}]
+      setpoint_up:   [{dgn: 0x1FEF9, payload: "00FFFFFFFFFAFFFF"}]
+      off:           [{dgn: 0x1FEF9, payload: "00F0FFFFFFFFFFFF"}, {dgn: 0x1FEF9, payload: "02F0FFFFFFFFFFFF"}]   # inferred, not captured
+
+  rear_ac:
+    name: Rear A/C
+    kind: climate
+    area: rear
+    template: thermostat
+    instance: 1               # drives AIR_CONDITIONER inst 2; no heat
+    sensor: 1
+    actions:
+      cool:          [{dgn: 0x1FEF9, payload: "01F1FFFFFFFFFFFF"}]
+      off:           [{dgn: 0x1FEF9, payload: "01C000FFFFFFFFFF"}]   # panel "fan auto" turns the zone off
+      fan_high:      [{dgn: 0x1FEF9, payload: "01D4C8FFFFFFFFFF"}]
+      fan_low:       [{dgn: 0x1FEF9, payload: "01D464FFFFFFFFFF"}]
+      setpoint_down: [{dgn: 0x1FEF9, payload: "01FFFFFFFFF9FFFF"}]
+      setpoint_up:   [{dgn: 0x1FEF9, payload: "01FFFFFFFFFAFFFF"}]
+
+  front_furnace:
+    name: Front furnace (LPG)
+    kind: climate
+    area: front
+    template: thermostat
+    instance: 2               # no ambient sensor; follows front_ac setpoint
+    sensor: 0
+    notes: Controlled through front_ac heat/cool; selecting heat turns thermostat 0 off.
+
+  # Tanks ----------------------------------------------------------------
+  fresh_tank:  {name: Fresh water, kind: tank, template: tank, instance: 0}
+  black_tank:  {name: Black, kind: tank, template: tank, instance: 1}
+  gray_tank:   {name: Gray, kind: tank, template: tank, instance: 2}
+  lpg_tank:    {name: LPG, kind: tank, template: tank, instance: 3}
+  black2_tank: {name: Black 2, kind: tank, template: tank, instance: 17}
+
+reserved:
+  - dgn: 0x1FEDB
+    instances: [32, 43, 44, 53, 54, 55, 56]
+    notes: Touchscreen (9E) cycles lock/unlock on these continuously; probably slides. Do not control.
+  - dgn: 0x1FFB7
+    instances: [18]
+    notes: Tank input with nothing connected; always 0.

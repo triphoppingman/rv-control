@@ -88,12 +88,12 @@ def interrogate(config: Any) -> None:
 @click.option("--coach-spec", default=None, help="Coach specification file path or model stem.")
 @click.pass_obj
 def coach_list(config: Any, coach_spec: str | None) -> None:
-    """List all available coach semantic commands and command groups."""
+    """List all coach entities and command groups."""
     try:
         coach = Coach.load(config, coach_spec)
         result = {
             "coach": coach.info,
-            "commands": coach.list_commands(),
+            "entities": coach.list_entities(),
             "command_groups": coach.list_command_groups(),
         }
         click.echo(json.dumps(result, indent=2, sort_keys=True, default=str))
@@ -106,10 +106,18 @@ def coach_list(config: Any, coach_spec: str | None) -> None:
 @click.argument("action", type=str)
 @click.option("--coach-spec", default=None, help="Coach specification file path or model stem.")
 @click.option("--param", "-p", "params", multiple=True, type=(str, str), help="Extra key-value parameter pairs.")
+@click.option("--confirm", is_flag=True, help="Confirm actions on entities marked confirm (generator, awning).")
 @click.pass_obj
-def coach_exec(config: Any, target: str, action: str, coach_spec: str | None, params: tuple[tuple[str, str], ...]) -> None:
-    """Execute a coach semantic command or command group action."""
-    kw: dict[str, Any] = {}
+def coach_exec(
+    config: Any,
+    target: str,
+    action: str,
+    coach_spec: str | None,
+    params: tuple[tuple[str, str], ...],
+    confirm: bool,
+) -> None:
+    """Execute an action on a coach entity or command group."""
+    kw: dict[str, Any] = {"confirm": True} if confirm else {}
     for key, val in params:
         try:
             kw[key] = int(val, 0)

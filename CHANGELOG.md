@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Coach entities: coach files describe named devices under `entities`, built from reusable `templates`, with multi-frame actions (optional per-frame `wait`), raw-payload or named DC dimmer frames, runtime `{parameter}` placeholders, `reserved` instances that are never controlled, and `confirm: true` entities. `rvcontrol coach-exec <entity> <action>` runs them; the new `--confirm` flag is required for confirm entities; `coach-list` reports `entities`. Command groups may list `members` with shared action names.
+- Thor Magnitude BH35 coach file maps every RV-C entity identified on the bus: 13 lights, 3 roof fans, the kitchen fan lid, awning, water pump, tank heat, generator, front/rear A/C, the LPG furnace, and 5 tanks, plus the patio WLED strip and groups `all_interior_lights`, `all_exterior_lights`, `all_fans` and `evening_scene`.
+- `tools/rvc_monitor.py server -v` / `--verbose` echoes the raw bytes sent (`TX`) and received (`RX`) on the client socket, including the handshake and streamed JSON frames, to local stderr with the auth token redacted.
 - `[service] log_level` in `config.ini` controls the default logging threshold (DEBUG, INFO, WARNING, ERROR, or CRITICAL); `--verbose` continues to override it with DEBUG.
 - `tools/obd_tool.py server -v` / `--verbose` echoes forwarded requests, raw responses, and command errors to local stderr without echoing authentication exchanges or changing the TCP client stream.
 - `tools/rvc_monitor.py server` streams raw CAN fields and decoded RV-C messages over receive-only authenticated TCP, with configurable `--host`, `--port` (default `35001`), `--auth-token` / `RVC_SERVER_AUTH_TOKEN`, and `--write-timeout`. Includes a remote Kiro debug runbook; existing local monitoring remains the default.
@@ -61,3 +64,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Corrected and re-enabled `pid.load` in the OBD example: mode 01 PID 04 now decodes calculated engine load as `b0*100/255` (0-100%) without the incorrect negative offset.
 - Renogy worker restarts and one-shot interrogation now close their event loops, cancel pending work, and disconnect BLE clients, preventing file-descriptor accumulation and eventual `Too many open files` failures. Shutdown after a failed startup no longer attempts to create another event loop.
 - OBD unlimited reconnects no longer stop with a backoff overflow during prolonged `Host is down` or engine-off outages. Retry waits stay capped at `max_reconnect_delay`, reset after ECU recovery, and remain interruptible on shutdown. Invalid non-positive or non-finite retry delays and negative `max_retry` values are rejected before connecting.
+
+### Removed
+
+- Coach `commands` section and its single-frame executor; coach files now use `entities`. The Thor placeholder commands `livingroom_lights`, `bedroom_lights` and `patio_lights` are replaced by `living_ceiling_light`, `bedroom_ceiling_light` and `patio_light`.

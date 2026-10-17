@@ -1,9 +1,13 @@
-"""Coach abstraction manager and command orchestrator."""
+"""Coach entity model: template resolution and entity/group action execution."""
 
 from __future__ import annotations
 
+import copy
 import logging
+import re
 import threading
+import time
+from collections.abc import Callable
 from configparser import ConfigParser
 from pathlib import Path
 from typing import Any
@@ -11,10 +15,10 @@ from typing import Any
 from ruamel.yaml import YAML
 
 from .rvc_util import (
+    DC_DIMMER_COMMAND_DGN,
     RV_C_PRIORITY,
     SOURCE_ADDRESS,
     build_can_id,
-    build_can_message,
     dc_dimmer_payload,
     normalize_can_payload,
 )
@@ -22,6 +26,113 @@ from .sources.base import Source
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_COACH_SPEC = str(Path(__file__).resolve().parent / "coaches/thor-magnitude-bh35-2020.yml")
+PLACEHOLDER_PATTERN = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+MAX_FRAME_WAIT_SECONDS = 60.0
+CONFIRM_VALUES = {"1", "true", "yes", "y", "on"}
+
+
+def substitute_placeholders(value: Any, context: dict[str, Any], strict: bool) -> Any:
+    """Replace ``{name}`` placeholders in a nested YAML value from a context mapping.
+
+    A string that is exactly one placeholder is replaced by the context value
+    itself, preserving its type (so ``"{instance}"`` becomes the integer 20).
+    Placeholders embedded in longer strings are replaced textually. Mapping
+    keys are substituted as well, which lets templates name actions after
+    entity keys such as ``"{first_action}"``.
+
+    Parameters
+    ----------
+    value : Any
+        Scalar, list, or mapping parsed from the coach YAML.
+    context : dict[str, Any]
+        Placeholder values keyed by placeholder name.
+    strict : bool
+        When True, any placeholder missing from ``context`` raises ``ValueError``;
+        when False it is left untouched for a later substitution pass.
+
+    Returns
+    -------
+    Any
+        A new value with placeholders substituted.
+    """
+    if isinstance(value, dict):
+        return {
+            substitute_placeholders(key, context, strict): substitute_placeholders(item, context, strict)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [substitute_placeholders(item, context, strict) for item in value]
+    if not isinstance(value, str):
+        return value
+    whole = PLACEHOLDER_PATTERN.fullmatch(value)
+    if whole and whole.group(1) in context:
+        return context[whole.group(1)]
+
+    def replace(match: re.Match[str]) -> str:
+        """Return the context text for one embedded placeholder match."""
+        key = match.group(1)
+        if key in context:
+            return str(context[key])
+        if strict:
+            raise ValueError(f"missing parameter {key!r}")
+        return match.group(0)
+
+    return PLACEHOLDER_PATTERN.sub(replace, value)
+
+
+def merge_definitions(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """Merge an entity or child template over a parent template definition.
+
+    Top-level keys in ``override`` replace those in ``base``, except
+    ``actions``, whose entries are combined so an entity can add or replace
+    individual actions while inheriting the rest.
+
+    Parameters
+    ----------
+    base : dict[str, Any]
+        Parent template definition.
+    override : dict[str, Any]
+        Child template or entity definition.
+
+    Returns
+    -------
+    dict[str, Any]
+        Newly allocated merged definition.
+    """
+    merged = copy.deepcopy(base)
+    for key, value in override.items():
+        if key == "actions" and isinstance(value, dict) and isinstance(merged.get("actions"), dict):
+            merged["actions"].update(copy.deepcopy(value))
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def _as_int(value: Any, field_name: str) -> int:
+    """Convert an integer or integer string (decimal or ``0x`` hex) from YAML or the CLI.
+
+    Parameters
+    ----------
+    value : Any
+        Value to convert.
+    field_name : str
+        Field name used in error messages.
+
+    Returns
+    -------
+    int
+        Parsed integer.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be an integer: {value!r}")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value, 0)
+        except ValueError:
+            pass
+    raise ValueError(f"{field_name} must be an integer: {value!r}")
 
 
 def load_coach_yaml(path: str | Path) -> dict[str, Any]:
@@ -78,7 +189,7 @@ def find_coach_file(spec_identifier: str | Path | None = None) -> Path:
 
 
 class Coach:
-    """Manage coach semantic abstraction and orchestrate command and group execution."""
+    """Resolve coach entities from templates and execute entity and group actions."""
 
     def __init__(
         self,
@@ -106,8 +217,14 @@ class Coach:
         self._sources: dict[str, Source] = dict(sources) if sources else {}
         self._stop_event = threading.Event()
         self.info: dict[str, Any] = data.get("coach", {})
-        self.commands: dict[str, Any] = data.get("commands", {})
-        self.command_groups: dict[str, Any] = data.get("command_groups", {}) or data.get("groups", {})
+        self.command_groups: dict[str, Any] = data.get("command_groups", {}) or {}
+        self.templates: dict[str, Any] = data.get("templates", {}) or {}
+        self.reserved: dict[int, set[int]] = self._load_reserved(data.get("reserved", []))
+        self.entities: dict[str, dict[str, Any]] = {
+            name: self._resolve_entity(name, definition)
+            for name, definition in (data.get("entities", {}) or {}).items()
+        }
+        self.sleep: Callable[[float], None] = time.sleep
 
     @classmethod
     def load(
@@ -166,18 +283,18 @@ class Coach:
             )
         return self._sources[config_section]
 
-    def resolve_config_section(self, cmd_def: dict[str, Any], command_name: str) -> str:
-        """Resolve the config.ini section for a command.
+    def resolve_config_section(self, entity: dict[str, Any], entity_name: str) -> str:
+        """Resolve the config.ini section for an entity.
 
         Checks candidates (target, config_section, transport) against the [coach]
         section in config.ini, then falls back to matching section names in config.ini.
 
         Parameters
         ----------
-        cmd_def : dict[str, Any]
-            Command definition dictionary.
-        command_name : str
-            Command name string.
+        entity : dict[str, Any]
+            Resolved entity definition.
+        entity_name : str
+            Entity name.
 
         Returns
         -------
@@ -186,7 +303,7 @@ class Coach:
         """
         candidates = []
         for key in ("target", "config_section", "transport"):
-            val = cmd_def.get(key)
+            val = entity.get(key)
             if val and isinstance(val, str) and val.strip():
                 candidates.append(val.strip())
 
@@ -202,348 +319,383 @@ class Coach:
                 return cand
 
         raise ValueError(
-            f"Unable to resolve configuration section for command {command_name!r} "
+            f"Unable to resolve configuration section for entity {entity_name!r} "
             f"(candidates: {candidates})"
         )
 
-    def list_commands(self) -> dict[str, dict[str, Any]]:
-        """Return a dictionary of available individual commands and their actions."""
-        res = {}
-        for name, cmd in self.commands.items():
+    def list_entities(self) -> dict[str, dict[str, Any]]:
+        """Return a summary of every coach entity: kind, area, transport and actions."""
+        result: dict[str, dict[str, Any]] = {}
+        for name, entity in self.entities.items():
             try:
-                resolved_sec = self.resolve_config_section(cmd, name)
+                section = self.resolve_config_section(entity, name)
             except ValueError:
-                resolved_sec = cmd.get("config_section", "")
-            res[name] = {
-                "description": cmd.get("description", ""),
-                "transport": cmd.get("transport", "unknown"),
-                "config_section": resolved_sec,
-                "actions": list(cmd.get("actions", {}).keys()),
+                section = ""
+            result[name] = {
+                "name": entity.get("name", name),
+                "kind": entity.get("kind", ""),
+                "area": entity.get("area", ""),
+                "transport": entity.get("transport", ""),
+                "config_section": section,
+                "actions": list(entity.get("actions", {})),
+                "confirm": bool(entity.get("confirm", False)),
+                "verified": bool(entity.get("verified", False)),
             }
-        return res
+        return result
 
     def list_command_groups(self) -> dict[str, dict[str, Any]]:
-        """Return a dictionary of available command groups and their actions."""
+        """Return a summary of every command group: description, members and actions."""
         return {
             name: {
                 "description": group.get("description", ""),
-                "actions": list(group.get("actions", {}).keys()),
+                "members": list(group.get("members", [])),
+                "actions": list(group.get("actions", {})),
             }
             for name, group in self.command_groups.items()
         }
 
     def execute(self, target: str, action: str, **kwargs: Any) -> list[dict[str, Any]]:
-        """Orchestrate execution of a single command or command group.
+        """Execute an action on an entity or a command group.
 
         Parameters
         ----------
         target : str
-            Name of a command (e.g. 'livingroom_lights') or group (e.g. 'all_lights').
+            Entity name (e.g. ``kitchen_fan``) or command group name (e.g. ``all_interior_lights``).
         action : str
-            Action name to perform (e.g. 'on', 'off', 'toggle', 'brightness').
+            Action name (e.g. ``on``, ``off``, ``toggle``, ``brightness``).
         **kwargs : Any
-            Additional keyword arguments passed to the action.
+            Runtime parameters such as ``level`` or ``confirm``.
 
         Returns
         -------
         list[dict[str, Any]]
-            List of execution result dictionaries from each step performed.
+            One result dictionary per entity action performed.
         """
         if target in self.command_groups:
             return self.execute_group(target, action, **kwargs)
-        if target in self.commands:
-            return [self.execute_command(target, action, **kwargs)]
-        raise KeyError(f"Unknown command or command group: {target!r}")
+        if target in self.entities:
+            return [self.execute_entity(target, action, **kwargs)]
+        raise KeyError(f"Unknown entity or command group: {target!r}")
 
     def execute_group(self, group_name: str, action_name: str, **kwargs: Any) -> list[dict[str, Any]]:
-        """Orchestrate execution of all commands configured in a command group action.
+        """Execute a command group action.
+
+        A group either lists ``members`` and the ``actions`` (names) applied to
+        every member, or maps each action to explicit steps
+        (``{entity, action, params}``).
 
         Parameters
         ----------
         group_name : str
-            Name of the command group.
+            Command group name.
         action_name : str
-            Action name configured for the group.
+            Group action name.
         **kwargs : Any
-            Additional parameter overrides passed to group steps.
+            Runtime parameters passed to every step; they override step params.
 
         Returns
         -------
         list[dict[str, Any]]
-            List of result dictionaries for every step executed in the group.
+            Result dictionaries for every entity action performed.
         """
         group_def = self.command_groups.get(group_name)
         if not group_def:
             raise KeyError(f"Command group not found: {group_name!r}")
-
         actions = group_def.get("actions", {})
-        steps = actions.get(action_name)
-        if steps is None:
+        if action_name not in actions:
             raise ValueError(f"Action {action_name!r} not supported by group {group_name!r}")
 
+        if isinstance(actions, list):
+            results: list[dict[str, Any]] = []
+            for member in group_def.get("members", []):
+                results.extend(self.execute(member, action_name, **kwargs))
+            return results
+
+        steps = actions[action_name]
         if not isinstance(steps, list):
             raise ValueError(f"Group action {action_name!r} in {group_name!r} must be a list of steps")
-
         results = []
         for step in steps:
-            if not isinstance(step, dict) or "command" not in step:
-                continue
-            cmd = step["command"]
-            act = step.get("action", action_name)
+            if not isinstance(step, dict) or "entity" not in step:
+                raise ValueError(f"Group {group_name!r} action {action_name!r} has a step without 'entity'")
             step_params = dict(step.get("params", {}))
             step_params.update(kwargs)
-            results.extend(self.execute(cmd, act, **step_params))
-
+            results.extend(self.execute(step["entity"], step.get("action", action_name), **step_params))
         return results
 
-    def execute_command(self, command_name: str, action_name: str, **kwargs: Any) -> dict[str, Any]:
-        """Execute a single semantic command mapped in the coach specification.
+    def execute_entity(self, entity_name: str, action_name: str, **kwargs: Any) -> dict[str, Any]:
+        """Execute one entity action by sending its frames in order.
+
+        Every frame is built and validated (including reserved-instance checks)
+        before the first one is sent, so a bad parameter cannot leave a motor
+        pair half-commanded. Each frame's ``wait`` is slept before it is sent.
 
         Parameters
         ----------
-        command_name : str
-            Name of the command.
+        entity_name : str
+            Entity name.
         action_name : str
             Action name.
         **kwargs : Any
-            Action parameter overrides.
+            Runtime placeholder values (e.g. ``level``); ``confirm`` is required
+            for entities marked ``confirm: true``.
 
         Returns
         -------
         dict[str, Any]
-            Execution status and response details.
+            Execution summary including every frame sent.
         """
-        cmd_def = self.commands.get(command_name)
-        if not cmd_def:
-            raise KeyError(f"Command not found: {command_name!r}")
+        entity = self.entities.get(entity_name)
+        if entity is None:
+            raise KeyError(f"Entity not found: {entity_name!r}")
+        frames = entity.get("actions", {}).get(action_name)
+        if frames is None:
+            raise ValueError(f"Action {action_name!r} not supported by entity {entity_name!r}")
+        confirmed = str(kwargs.pop("confirm", "")).strip().lower() in CONFIRM_VALUES
+        if entity.get("confirm") and not confirmed:
+            raise PermissionError(f"{entity_name} {action_name} requires confirmation (--confirm)")
+        try:
+            frames = substitute_placeholders(frames, kwargs, strict=True)
+        except ValueError as error:
+            raise ValueError(f"{entity_name} {action_name}: {error}") from error
 
-        actions = cmd_def.get("actions", {})
-        action_def = actions.get(action_name)
-        if action_def is None:
-            raise ValueError(f"Action {action_name!r} not supported by command {command_name!r}")
-
-        transport = cmd_def.get("transport", "").lower()
-        config_section = self.resolve_config_section(cmd_def, command_name)
-
+        transport = str(entity.get("transport", "")).lower()
+        config_section = self.resolve_config_section(entity, entity_name)
         source = self.get_source(config_section)
+        result: dict[str, Any] = {
+            "status": "ok",
+            "target": entity_name,
+            "action": action_name,
+            "transport": transport,
+            "config_section": config_section,
+        }
 
         if transport == "rvc":
-            return self._execute_rvc(source, command_name, action_name, cmd_def, action_def, config_section, **kwargs)
-        elif transport == "wled":
-            return self._execute_wled(source, command_name, action_name, cmd_def, action_def, config_section, **kwargs)
-        elif transport == "bluetooth":
-            return self._execute_bluetooth(source, command_name, action_name, cmd_def, action_def, config_section, **kwargs)
-        else:
-            payload = self._build_generic_payload(action_def, **kwargs)
-            source.handle_command(payload)
-            return {
-                "status": "ok",
-                "target": command_name,
-                "action": action_name,
-                "transport": transport,
-                "config_section": config_section,
-                "payload": payload,
-            }
+            built = [self._build_rvc_frame(frame, config_section) for frame in frames]
+            for wait, payload in built:
+                if wait:
+                    self.sleep(wait)
+                source.handle_command(payload)
+            result["frames"] = [{"can_id": payload["can_id"], "data": payload["data"], "wait": wait} for wait, payload in built]
+            return result
+        if transport == "wled":
+            built_wled = [self._build_wled_frame(frame) for frame in frames]
+            for wait, payload in built_wled:
+                if wait:
+                    self.sleep(wait)
+                source.handle_command(payload)
+            result["frames"] = [payload for _wait, payload in built_wled]
+            return result
+        raise ValueError(f"Entity {entity_name!r} uses unsupported transport {transport!r}")
 
-    def _execute_rvc(
-        self,
-        source: Source,
-        command_name: str,
-        action_name: str,
-        cmd_def: dict[str, Any],
-        action_def: dict[str, Any] | str,
-        config_section: str,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        """Execute an RV-C transport command via Source interface.
+    def _resolve_template(self, template_name: str, chain: tuple[str, ...] = ()) -> dict[str, Any]:
+        """Return a template merged with the templates it ``extends``.
 
         Parameters
         ----------
-        source : Source
-            Instantiated Source object for the RVC section.
-        command_name : str
-            Command identifier.
-        action_name : str
-            Action identifier.
-        cmd_def : dict[str, Any]
-            Full command definition dictionary.
-        action_def : dict[str, Any] | str
-            Specific action definition from YAML.
-        config_section : str
-            Section in config.ini defining the CAN interface.
-        **kwargs : Any
-            Runtime parameter overrides.
+        template_name : str
+            Template name under ``templates``.
+        chain : tuple[str, ...]
+            Templates already visited, used to reject ``extends`` loops.
 
         Returns
         -------
         dict[str, Any]
-            Execution summary dictionary.
+            Fully merged template definition.
+        """
+        if template_name in chain:
+            raise ValueError(f"Template extends loop: {' -> '.join(chain + (template_name,))}")
+        template = self.templates.get(template_name)
+        if not isinstance(template, dict):
+            raise ValueError(f"Template not found: {template_name!r}")
+        parent = template.get("extends")
+        if not parent:
+            return copy.deepcopy(template)
+        return merge_definitions(self._resolve_template(str(parent), chain + (template_name,)), template)
+
+    def _resolve_entity(self, entity_name: str, definition: Any) -> dict[str, Any]:
+        """Merge an entity with its template and fill in entity-level placeholders.
+
+        Parameters
+        ----------
+        entity_name : str
+            Entity name under ``entities``.
+        definition : Any
+            Raw entity definition from YAML.
+
+        Returns
+        -------
+        dict[str, Any]
+            Resolved entity with ``actions`` mapping action names to frame lists.
+        """
+        if not isinstance(definition, dict):
+            raise ValueError(f"Entity {entity_name!r} must be a mapping")
+        template_name = definition.get("template")
+        base = self._resolve_template(str(template_name)) if template_name else {}
+        base.pop("description", None)
+        merged = merge_definitions(base, definition)
+        context = {key: value for key, value in definition.items() if not isinstance(value, (dict, list))}
+        context["entity"] = entity_name
+
+        actions = substitute_placeholders(merged.get("actions") or {}, context, strict=False)
+        if not isinstance(actions, dict):
+            raise ValueError(f"Entity {entity_name!r} actions must be a mapping")
+        for action_name, frames in list(actions.items()):
+            frames = frames if isinstance(frames, list) else [frames]
+            if not all(isinstance(frame, dict) for frame in frames):
+                raise ValueError(f"Entity {entity_name!r} action {action_name!r} frames must be mappings")
+            for frame in frames:
+                self._check_static_reserved(entity_name, frame)
+            actions[action_name] = frames
+        merged["actions"] = actions
+        if "state" in merged:
+            merged["state"] = substitute_placeholders(merged["state"], context, strict=False)
+        return merged
+
+    def _load_reserved(self, entries: Any) -> dict[int, set[int]]:
+        """Parse the ``reserved`` section into a mapping of DGN to forbidden instances.
+
+        Parameters
+        ----------
+        entries : Any
+            Raw ``reserved`` list from YAML.
+
+        Returns
+        -------
+        dict[int, set[int]]
+            Reserved instance numbers keyed by DGN.
+        """
+        reserved: dict[int, set[int]] = {}
+        for entry in entries or []:
+            if not isinstance(entry, dict):
+                raise ValueError("Reserved entries must be mappings with dgn and instances")
+            dgn = _as_int(entry.get("dgn"), "reserved dgn")
+            instances = entry.get("instances", [entry["instance"]] if "instance" in entry else [])
+            reserved.setdefault(dgn, set()).update(_as_int(item, "reserved instance") for item in instances)
+        return reserved
+
+    def _check_reserved(self, dgn: int, instance: int | None, label: str) -> None:
+        """Raise ``PermissionError`` when a frame addresses a reserved instance.
+
+        Parameters
+        ----------
+        dgn : int
+            Frame DGN.
+        instance : int | None
+            Instance addressed by the frame, if known.
+        label : str
+            Entity or frame description used in the error message.
+        """
+        if instance is not None and instance in self.reserved.get(dgn, set()):
+            raise PermissionError(f"{label}: instance {instance} on DGN 0x{dgn:05X} is reserved")
+
+    def _check_static_reserved(self, entity_name: str, frame: dict[str, Any]) -> None:
+        """Reject, at load time, entity frames that hard-code a reserved instance.
+
+        Parameters
+        ----------
+        entity_name : str
+            Entity name used in the error message.
+        frame : dict[str, Any]
+            Frame definition after entity placeholder substitution.
+        """
+        if "dgn" not in frame:
+            return
+        dgn = _as_int(frame["dgn"], "dgn")
+        instance = frame.get("instance")
+        if isinstance(instance, int) and not isinstance(instance, bool):
+            self._check_reserved(dgn, instance, f"Entity {entity_name!r}")
+        payload = frame.get("payload")
+        if isinstance(payload, str) and len(payload) >= 2:
+            self._check_reserved(dgn, int(payload[:2], 16), f"Entity {entity_name!r}")
+
+    def _build_rvc_frame(self, frame: dict[str, Any], config_section: str) -> tuple[float, dict[str, Any]]:
+        """Build and validate one RV-C frame for ``RvcSource.handle_command``.
+
+        A frame either carries a raw hexadecimal ``payload`` or, for
+        DC_DIMMER_COMMAND_2, named fields (``instance``, ``group``, ``level``
+        percent, ``command``, ``delay``, ``interlock``). Short payloads are
+        padded with 0xFF to eight bytes, matching the coach's own panels.
+
+        Parameters
+        ----------
+        frame : dict[str, Any]
+            Frame definition with all placeholders substituted.
+        config_section : str
+            RV-C configuration section providing ``priority`` and ``source``.
+
+        Returns
+        -------
+        tuple[float, dict[str, Any]]
+            Seconds to wait before sending, and the source command payload.
         """
         if not self.config.has_section(config_section):
             raise ValueError(f"Config section [{config_section}] not found in configuration")
-
         section = self.config[config_section]
         priority = section.getint("priority", fallback=RV_C_PRIORITY)
         source_addr = section.getint("source", fallback=SOURCE_ADDRESS)
+        dgn = _as_int(frame.get("dgn", DC_DIMMER_COMMAND_DGN), "dgn")
 
-        rvc_block = cmd_def.get("rvc", {})
-        protocol_cmd = rvc_block.get("command", "").lower()
-        dgn = rvc_block.get("dgn")
-        if isinstance(dgn, str):
-            dgn = int(dgn, 0)
-        instance = rvc_block.get("instance", 0)
-        group = rvc_block.get("group", 1)
-        defaults = rvc_block.get("defaults", {})
-
-        action_dict = action_def if isinstance(action_def, dict) else {"command": str(action_def)}
-        rvc_cmd = kwargs.get("command") or action_dict.get("command") or action_name
-
-        if protocol_cmd == "dc_dimmer_command_2" or dgn == 0x1FEDB:
-            level = kwargs.get("level") if "level" in kwargs else kwargs.get("brightness")
-            if level is None:
-                level = action_dict.get("level", defaults.get("level", 100))
-            delay = kwargs.get("delay", action_dict.get("delay", defaults.get("delay", 0)))
-            interlock = kwargs.get("interlock", action_dict.get("interlock", defaults.get("interlock", 0)))
-
-            payload_bytes = dc_dimmer_payload(instance, group, level, rvc_cmd, delay, interlock)
+        if "payload" in frame:
+            try:
+                data = normalize_can_payload(bytes.fromhex(str(frame["payload"])))
+            except ValueError as error:
+                raise ValueError(f"Invalid RV-C payload {frame['payload']!r}: {error}") from error
+            instance = data[0] if data else None
+        elif dgn == DC_DIMMER_COMMAND_DGN:
+            if "command" not in frame:
+                raise ValueError("DC dimmer frame needs a 'command'")
+            instance = _as_int(frame.get("instance"), "instance")
+            level = frame.get("level", 100)
+            if isinstance(level, str):
+                level = float(level)
+            data = dc_dimmer_payload(
+                instance,
+                _as_int(frame.get("group", 0xFF), "group"),
+                level,
+                frame["command"],
+                _as_int(frame.get("delay", 0xFF), "delay"),
+                _as_int(frame.get("interlock", 0), "interlock"),
+            )
         else:
-            payload_data = kwargs.get("payload") or action_dict.get("payload") or defaults.get("payload")
-            if payload_data is not None:
-                payload_bytes = normalize_can_payload(bytes.fromhex(str(payload_data)) if isinstance(payload_data, str) else payload_data)
-            else:
-                payload_bytes = bytes([instance, group])
+            raise ValueError(f"Frame for DGN 0x{dgn:05X} needs a hexadecimal 'payload'")
 
-        can_id = build_can_id(priority, dgn or 0x1FEDB, source_addr)
-        cmd_payload: dict[str, Any] = {
-            "can_id": f"0x{can_id:08X}",
-            "data": payload_bytes.hex().upper(),
-        }
+        self._check_reserved(dgn, instance, "Frame")
+        data = data.ljust(8, b"\xff")
+        can_id = build_can_id(priority, dgn, source_addr)
+        return self._frame_wait(frame), {"can_id": f"0x{can_id:08X}", "data": data.hex().upper()}
 
-        source.handle_command(cmd_payload)
-
-        return {
-            "status": "ok",
-            "target": command_name,
-            "action": action_name,
-            "transport": "rvc",
-            "config_section": config_section,
-            "can_id": f"0x{can_id:08X}",
-            "payload": payload_bytes.hex().upper(),
-        }
-
-    def _execute_wled(
-        self,
-        source: Source,
-        command_name: str,
-        action_name: str,
-        cmd_def: dict[str, Any],
-        action_def: dict[str, Any] | str,
-        config_section: str,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        """Execute a WLED transport command via Source interface.
+    def _build_wled_frame(self, frame: dict[str, Any]) -> tuple[float, dict[str, Any]]:
+        """Split a WLED frame into its pre-send wait and JSON state payload.
 
         Parameters
         ----------
-        source : Source
-            Instantiated Source object for the WLED section.
-        command_name : str
-            Command identifier.
-        action_name : str
-            Action identifier.
-        cmd_def : dict[str, Any]
-            Full command definition dictionary.
-        action_def : dict[str, Any] | str
-            Action definition from YAML.
-        config_section : str
-            Section in config.ini defining the WLED URL.
-        **kwargs : Any
-            Runtime parameter overrides.
+        frame : dict[str, Any]
+            WLED JSON state fields, optionally with ``wait``.
 
         Returns
         -------
-        dict[str, Any]
-            Execution summary dictionary.
+        tuple[float, dict[str, Any]]
+            Seconds to wait before sending, and the WLED state payload.
         """
-        action_dict = action_def if isinstance(action_def, dict) else {}
+        payload = {key: value for key, value in frame.items() if key != "wait"}
+        return self._frame_wait(frame), payload
 
-        payload: dict[str, Any] = {}
-        if "state" in action_dict and isinstance(action_dict["state"], dict):
-            payload.update(action_dict["state"])
-        elif action_name == "on":
-            payload["on"] = True
-        elif action_name == "off":
-            payload["on"] = False
-        elif action_name in ("brightness", "level"):
-            bri = kwargs.get("brightness") if "brightness" in kwargs else kwargs.get("level", 255)
-            payload["bri"] = bri
-
-        payload.update({k: v for k, v in kwargs.items() if k in ("on", "bri", "seg", "transition")})
-
-        source.handle_command(payload)
-
-        return {
-            "status": "ok",
-            "target": command_name,
-            "action": action_name,
-            "transport": "wled",
-            "config_section": config_section,
-            "payload": payload,
-        }
-
-    def _execute_bluetooth(
-        self,
-        source: Source,
-        command_name: str,
-        action_name: str,
-        cmd_def: dict[str, Any],
-        action_def: dict[str, Any] | str,
-        config_section: str,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        """Execute a Bluetooth transport command via Source interface.
+    @staticmethod
+    def _frame_wait(frame: dict[str, Any]) -> float:
+        """Return a frame's validated pre-send ``wait`` in seconds.
 
         Parameters
         ----------
-        source : Source
-            Instantiated Source object for the Bluetooth section.
-        command_name : str
-            Command identifier.
-        action_name : str
-            Action identifier.
-        cmd_def : dict[str, Any]
-            Full command definition dictionary.
-        action_def : dict[str, Any] | str
-            Action definition from YAML.
-        config_section : str
-            Section in config.ini.
-        **kwargs : Any
-            Runtime parameter overrides.
+        frame : dict[str, Any]
+            Frame definition.
 
         Returns
         -------
-        dict[str, Any]
-            Execution summary dictionary.
+        float
+            Wait in seconds, between 0 and ``MAX_FRAME_WAIT_SECONDS``.
         """
-        action_dict = action_def if isinstance(action_def, dict) else {"payload": str(action_def)}
-        payload_hex = kwargs.get("payload") or action_dict.get("payload", "")
-        payload = {"payload": payload_hex}
-
-        source.handle_command(payload)
-
-        return {
-            "status": "ok",
-            "target": command_name,
-            "action": action_name,
-            "transport": "bluetooth",
-            "config_section": config_section,
-            "payload": payload_hex,
-        }
-
-    def _build_generic_payload(self, action_def: dict[str, Any] | str, **kwargs: Any) -> dict[str, Any]:
-        """Build a generic payload dictionary from action definition and kwargs."""
-        payload: dict[str, Any] = {}
-        if isinstance(action_def, dict):
-            payload.update(action_def)
-        payload.update(kwargs)
-        return payload
+        wait = float(frame.get("wait", 0))
+        if not 0 <= wait <= MAX_FRAME_WAIT_SECONDS:
+            raise ValueError(f"Frame wait must be between 0 and {MAX_FRAME_WAIT_SECONDS:g} seconds: {wait}")
+        return wait

@@ -18,6 +18,8 @@ The default host is `127.0.0.1` and default port is `35001`, distinct from the
 OBD server's port. Use the Pi's LAN IPv4 address instead of `0.0.0.0` to restrict
 the listener to that interface. Interface, `--specfile`, and
 `--parameterized/--no-parameterized` options go **before** `server`.
+Add `-v` / `--verbose` after `server` to echo every raw byte sent (`TX`) and
+received (`RX`) on the client socket to the Pi's stderr; the auth token is redacted.
 The specification is loaded once at startup.
 
 The server prints a newly generated token locally. To supply a reusable token,
