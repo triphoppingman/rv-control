@@ -237,6 +237,26 @@ class EntityStateTracker:
         names.update(block.entity_name for blocks in self._by_dgn.values() for block in blocks)
         return sorted(names)
 
+    def status_requests(self) -> dict[str, list[int]]:
+        """Return the status DGNs each config section must report, for startup status requests.
+
+        Returns
+        -------
+        dict[str, list[int]]
+            Sorted DGNs keyed by the config.ini source section serving the entities.
+        """
+        requests: dict[str, set[int]] = {}
+        blocks = [block for group in (*self._by_instance.values(), *self._by_dgn.values()) for block in group]
+        for block in blocks:
+            entity = self.coach.entities[block.entity_name]
+            try:
+                section = self.coach.resolve_config_section(entity, block.entity_name)
+            except ValueError as error:
+                LOGGER.warning("No status request for entity %s: %s", block.entity_name, error)
+                continue
+            requests.setdefault(section, set()).add(block.dgn)
+        return {section: sorted(dgns) for section, dgns in requests.items()}
+
     def state(self, entity_name: str) -> dict[str, Any]:
         """Return a copy of the latest known attributes of one entity.
 
@@ -337,7 +357,12 @@ class CoachStatePublisher:
     state, which is published through the same wrapped publisher.
     """
 
-    def __init__(self, publisher: Any, tracker_factory: Callable[[Publish], EntityStateTracker]) -> None:
+    def __init__(
+        self,
+        publisher: Any,
+        tracker_factory: Callable[[Publish], EntityStateTracker],
+        request_status_on_start: bool = True,
+    ) -> None:
         """Wrap a target publisher and build the tracker that publishes through it.
 
         Parameters
@@ -346,8 +371,11 @@ class CoachStatePublisher:
             Target (or MultiTarget) with ``connect``, ``publish`` and ``close``.
         tracker_factory : Callable[[Publish], EntityStateTracker]
             Builds the tracker given the wrapped publisher's publish function.
+        request_status_on_start : bool
+            Whether :meth:`request_initial_status` asks sources for current status.
         """
         self.publisher = publisher
+        self.request_status_on_start = request_status_on_start
         self.tracker = tracker_factory(lambda topic, payload: self.publisher.publish(topic, payload))
 
     def connect(self) -> None:
@@ -373,6 +401,31 @@ class CoachStatePublisher:
             except Exception:
                 LOGGER.exception("Coach entity state update failed for %s", topic)
 
+    def request_initial_status(self, source_map: dict[str, Any]) -> None:
+        """Ask running sources once for the status DGNs coach entities need.
+
+        Loads that are off are only reported when they change, so without this
+        request they stay unknown until toggled. Sources without
+        ``request_status`` support are skipped.
+
+        Parameters
+        ----------
+        source_map : dict[str, Any]
+            Started sources keyed by config section.
+        """
+        if not self.request_status_on_start:
+            return
+        for section, dgns in self.tracker.status_requests().items():
+            source = source_map.get(section)
+            request = getattr(source, "request_status", None)
+            if request is None:
+                LOGGER.debug("Source [%s] cannot request status; skipping", section)
+                continue
+            try:
+                request(dgns)
+            except (ValueError, OSError) as error:
+                LOGGER.warning("Coach status request to [%s] failed: %s", section, error)
+
     def close(self) -> None:
         """Close the wrapped publisher."""
         self.publisher.close()
@@ -387,7 +440,9 @@ def wrap_publisher(config: Any, publisher: Any) -> Any:
 
     Entity state is enabled when ``config.ini`` has a ``[coach]`` section and
     ``publish_state`` is not false. ``state_republish_seconds`` (default 60)
-    controls periodic republishing of unchanged state.
+    controls periodic republishing of unchanged state, and
+    ``request_status_on_start`` (default true) asks RV-C nodes for their
+    current status once the sources start.
 
     Parameters
     ----------
@@ -407,7 +462,10 @@ def wrap_publisher(config: Any, publisher: Any) -> Any:
     if not section.getboolean("publish_state", fallback=True):
         return publisher
     republish = section.getfloat("state_republish_seconds", fallback=DEFAULT_REPUBLISH_SECONDS)
+    request_status = section.getboolean("request_status_on_start", fallback=True)
     coach = Coach.load(config)
-    wrapped = CoachStatePublisher(publisher, lambda publish: EntityStateTracker(coach, publish, republish))
+    wrapped = CoachStatePublisher(
+        publisher, lambda publish: EntityStateTracker(coach, publish, republish), request_status
+    )
     LOGGER.info("Publishing coach entity state for %d entities", len(wrapped.tracker.tracked_entities))
     return wrapped

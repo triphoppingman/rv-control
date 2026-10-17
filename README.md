@@ -265,6 +265,7 @@ Coach specifications are configured in the `[coach]` section:
 specfile = src/rv_control/coaches/thor-magnitude-bh35-2020.yml
 # publish_state = true            # publish <base_topic>/coach/entity/<entity> while running
 # state_republish_seconds = 60    # republish unchanged entity state; 0 = on change only
+# request_status_on_start = true  # ask RV-C nodes once for current status at startup
 ```
 
 Coach entities reference transports (such as `rvc` or `wled`) that `[coach]` maps to source sections; they do not contain device hosts, CAN interfaces, or credentials.
@@ -468,7 +469,7 @@ When `config.ini` has a `[coach]` section, `rvcontrol run` turns decoded RV-C st
  "state": {"on": true, "level": 100.0, "remaining": null}, "updated": "2025-01-01T12:00:00+00:00"}
 ```
 
-State is published whenever an attribute changes and republished unchanged every `state_republish_seconds` (default 60). The panel reports loads that are on every couple of seconds but reports off loads only when they change, so keep MQTT `retain = true` for subscribers that start later. Watch all entities with:
+State is published whenever an attribute changes and republished unchanged every `state_republish_seconds` (default 60) while the device keeps reporting. The panel repeats status for loads that are on every couple of seconds but reports loads that are off only when they change, so at startup `rvcontrol run` broadcasts one RV-C Request (DGN `0xEAFF`) for each status DGN the coach file uses (for example `1FEDA` dimmer status) and the panel answers with the current state of every load. The request only asks for status; it does not need `write_enabled`. Set `[coach] request_status_on_start = false` to disable it. Watch all entities with:
 
 ```sh
 mosquitto_sub -h localhost -t 'rv/coach/entity/#' -v

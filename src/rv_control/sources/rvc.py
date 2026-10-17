@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
+from collections.abc import Iterable
 from typing import Any
 
 from ..rvc_util import (
@@ -32,6 +34,7 @@ from ..rvc_util import (
     build_can_id,
     build_can_message,
     build_dc_dimmer_message,
+    build_request_message,
     build_spec_message,
     command_can_id,
     datetime_payload,
@@ -74,6 +77,53 @@ class RvcSource(Source, source_name="rvc"):
         """Initialize the RV-C source without opening the CAN bus yet."""
         super().__init__(config, publisher, stop_event, section_name)
         self.bus = None
+        self._pending_requests: list[int] = []
+        self._requests_lock = threading.Lock()
+
+    def request_status(self, dgns: Iterable[int]) -> None:
+        """Queue RV-C Requests asking every node to send the given DGNs.
+
+        The requests are broadcast from the daemon thread as soon as its CAN bus
+        is open, so this may be called before or after the source starts. A
+        Request asks devices to report status; it does not change any load, so
+        it is not gated by ``write_enabled``.
+
+        Parameters
+        ----------
+        dgns : Iterable[int]
+            DGNs to request, such as ``0x1FEDA`` for DC dimmer status.
+        """
+        validated = []
+        for dgn in dgns:
+            if not 0 <= int(dgn) <= 0x1FFFF:
+                raise ValueError(f"RV-C DGN must fit 17 bits: {dgn}")
+            validated.append(int(dgn))
+        with self._requests_lock:
+            self._pending_requests.extend(dgn for dgn in validated if dgn not in self._pending_requests)
+
+    def _send_pending_requests(self, bus: Any) -> None:
+        """Broadcast queued status requests on an open bus, logging rather than raising send failures.
+
+        Parameters
+        ----------
+        bus : Any
+            Open python-can bus.
+        """
+        with self._requests_lock:
+            pending, self._pending_requests = self._pending_requests, []
+        if not pending:
+            return
+        import can
+
+        section = self.section
+        priority = section.getint("priority", fallback=RV_C_PRIORITY)
+        source = section.getint("source", fallback=SOURCE_ADDRESS)
+        for dgn in pending:
+            try:
+                bus.send(build_request_message(dgn, source, GLOBAL_ADDRESS, priority))
+                LOGGER.info("Requested RV-C DGN %05X from all nodes", dgn)
+            except (OSError, ValueError, can.CanError) as error:
+                LOGGER.warning("RV-C status request for DGN %05X failed: %s", dgn, error)
 
     def handle_command(self, payload: dict[str, Any]) -> None:
         """Validate and send a configured RV-C CAN command when writes are enabled."""
@@ -152,6 +202,7 @@ class RvcSource(Source, source_name="rvc"):
             spec = load_spec(section["specfile"])
             self.bus = can.Bus(interface="socketcan", channel=section.get("interface", "can0"))
             while not self.stop_event.is_set():
+                self._send_pending_requests(self.bus)
                 message = self.bus.recv(timeout=1)
                 if message is None:
                     continue

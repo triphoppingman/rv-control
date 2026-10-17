@@ -458,6 +458,48 @@ def build_address_claim_message(source: int, name: RvcName, priority: int = RV_C
     return build_can_message(priority, ADDRESS_CLAIM_DGN, source, address_claim_payload(name))
 
 
+def request_payload(dgn: int) -> bytes:
+    """Build an RV-C Request payload asking for one DGN, as its three little-endian bytes.
+
+    Parameters
+    ----------
+    dgn : int
+        Requested DGN, such as ``0x1FEDA`` for DC_DIMMER_STATUS_3.
+
+    Returns
+    -------
+    bytes
+        Three-byte request payload.
+    """
+    if not 0 <= dgn <= 0x1FFFF:
+        raise ValueError(f"RV-C DGN must fit 17 bits: {dgn}")
+    return dgn.to_bytes(3, "little")
+
+
+def build_request_message(dgn: int, source: int, destination: int = 0xFF, priority: int = RV_C_PRIORITY) -> Any:
+    """Create an RV-C Request (DGN 0xEAxx) asking ``destination`` (0xFF = all nodes) to send ``dgn``.
+
+    Parameters
+    ----------
+    dgn : int
+        Requested DGN.
+    source : int
+        Our source address.
+    destination : int
+        Destination address; 0xFF broadcasts the request to every node.
+    priority : int
+        CAN priority.
+
+    Returns
+    -------
+    Any
+        ``can.Message`` ready to send.
+    """
+    if not 0 <= destination <= 0xFF:
+        raise ValueError(f"RV-C destination address must fit 8 bits: {destination}")
+    return build_can_message(priority, REQUEST_DGN | destination, source, request_payload(dgn))
+
+
 def address_claim_request_payload() -> bytes:
     """Build a global Request payload asking devices to announce their claims."""
     return REQUEST_DGN.to_bytes(3, "little")

@@ -205,3 +205,37 @@ def test_all_entity_state_blocks_compile(coach: Coach) -> None:
     expected = sorted(name for name, entity in coach.entities.items() if entity.get("state"))
     assert tracker.tracked_entities == expected
     assert "mid_bath_fan" in expected
+
+
+class FakeRvcSource:
+    """Source double recording status requests."""
+
+    def __init__(self) -> None:
+        """Create an empty request record."""
+        self.requested: list[int] = []
+
+    def request_status(self, dgns: list[int]) -> None:
+        """Record requested DGNs."""
+        self.requested.extend(dgns)
+
+
+def test_status_requests_grouped_by_section() -> None:
+    """Every tracked RV-C status DGN is requested from the mapped RV-C section."""
+    tracked = Coach.load(coach_config(rvc="rv_c"))
+    tracker, _, _ = tracker_for(tracked)
+    requests = tracker.status_requests()
+    assert set(requests) == {"rv_c"}
+    assert {0x1FEDA, 0x1FFB7, 0x1FFDC, 0x1FFE2, 0x1FF9C} <= set(requests["rv_c"])
+
+
+def test_wrapper_requests_initial_status_once() -> None:
+    """The wrapper asks the mapped RV-C source for status, unless disabled."""
+    source = FakeRvcSource()
+    wrapped = wrap_publisher(coach_config(rvc="rv_c"), RecordingTarget())
+    wrapped.request_initial_status({"rv_c": source, "hughes": object()})
+    assert 0x1FEDA in source.requested
+
+    disabled_source = FakeRvcSource()
+    disabled = wrap_publisher(coach_config(rvc="rv_c", request_status_on_start="false"), RecordingTarget())
+    disabled.request_initial_status({"rv_c": disabled_source})
+    assert disabled_source.requested == []

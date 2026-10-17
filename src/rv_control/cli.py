@@ -8,7 +8,7 @@ from typing import Any
 import click
 
 from .coach import Coach
-from .coach_state import wrap_publisher
+from .coach_state import CoachStatePublisher, wrap_publisher
 from .config import load_config
 from .sources.base import Source
 from .sources.hughes import HughesSource
@@ -153,6 +153,8 @@ def run(config: Any) -> None:
         sources, source_map = Source.start_enabled(config, publisher, stop_event)
         if not sources:
             raise click.ClickException("No sources are enabled")
+        if isinstance(publisher, CoachStatePublisher):
+            publisher.request_initial_status(source_map)
         Source.run_until_stopped(config, publisher, stop_event, sources, source_map)
     except OSError as error:
         raise click.ClickException(f"Unable to connect to target: {error}") from error
