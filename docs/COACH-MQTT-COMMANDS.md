@@ -25,6 +25,28 @@ member action. Restart `rvcontrol --config config.ini run` after configuration
 or policy changes. Keep broker command topics restricted to trusted backends;
 these options do not configure broker authentication or ACLs.
 
+### Startup error: policy references unknown target
+
+Every target under a controller's `actions` must exist in the loaded coach's
+entities or command groups, even when only queries are enabled. Invalid grants
+stop startup before broker connection or source startup; they are never ignored.
+The error names the missing target.
+
+The factory Thor definition no longer includes the installation-specific
+`patio_light` entity or `evening_scene` group. If an older local controller policy
+still grants either target, load the installation YAML defining it with
+`[coach] overlay` (paths are relative to the INI), or remove those action grants
+from every controller in `[coach_commands] controllers_file` if no longer needed.
+For the shareable patio definitions, use
+`overlay = src/rv_control/coaches/wled-overlay-example.yml` when the INI is in the
+repository root. A transport binding such as `wled = wled_patio` does not load
+entity definitions by itself.
+
+Run `rvcontrol --config config.ini coach-list` to inspect the effective entity
+and group names without starting collectors, then restart the service after
+correcting the overlay or policy. `coach-list` checks the coach definition, not
+the controller policy.
+
 The installed CLI and standalone tool use the MQTT target selected by the
 configuration (host, port, credentials and base topic). They do not invoke the
 coach executor locally or bypass the daemon's policy:

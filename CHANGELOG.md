@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Coach MQTT startup errors now identify unknown controller-policy targets and point to `[coach] specfile` / `overlay` or stale action grants, making missing installation overlays diagnosable without weakening policy validation.
+
 ### Added
 
 - Optional `[coach] overlay` loads additive installation YAML after the factory coach file, with relative paths resolved beside the INI. Conflicting or inherited overrides, invalid state/schema definitions and cyclic/unknown group references fail before hardware access. Factory safety reservations remain in force. A shareable `wled-overlay-example.yml` adds advanced WLED actions without modifying factory definitions; local `coach-overlay.yml` files are Git-ignored.

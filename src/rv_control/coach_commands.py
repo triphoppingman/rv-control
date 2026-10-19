@@ -240,7 +240,10 @@ class ControllerPolicy:
     def definition(self, target: str) -> dict[str, Any]:
         """Return a known entity or group definition without opening sources."""
         if target not in self.coach.entities and target not in self.coach.command_groups:
-            raise ValueError("Policy references unknown target")
+            raise ValueError(
+                f"Policy references unknown target {target!r}; "
+                "check [coach] specfile/overlay or remove the target's controller action grants"
+            )
         return self.coach.entities.get(target) or self.coach.command_groups[target]
 
     def schema(self, target: str, action: str, grant: dict[str, Any] | None = None) -> dict[str, Any]:

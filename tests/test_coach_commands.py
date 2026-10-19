@@ -615,6 +615,22 @@ def test_shareable_example_policy_matches_packaged_coach() -> None:
     assert set(policy.controllers) == {"rv-cli", "rv-dashboard"}
 
 
+@pytest.mark.parametrize("target", ["patio_light", "evening_scene"])
+def test_overlay_policy_target_missing_from_factory(tmp_path: Path, target: str) -> None:
+    """Stale installation grants identify the missing target and configuration remedy."""
+    config = ConfigParser()
+    coach = Coach.load(config)
+    path = tmp_path / "controllers.yaml"
+    path.write_text(f"controllers:\n  rv-cli:\n    actions:\n      {target}: {{off: {{}}}}\n")
+
+    with pytest.raises(ValueError) as error:
+        ControllerPolicy(coach, path, {})
+
+    assert f"Policy references unknown target {target!r}" in str(error.value)
+    assert "[coach] specfile/overlay" in str(error.value)
+    assert "remove the target's controller action grants" in str(error.value)
+
+
 def test_expiry_lifetime_thresholds() -> None:
     """Verify exact 15-second TTL and two-second future-clock boundaries."""
     now = [1000.0]
