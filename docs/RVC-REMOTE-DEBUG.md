@@ -5,6 +5,11 @@ the Pi's temporary authenticated TCP monitor. Both raw CAN evidence and decoded
 RV-C values are included. The server is strictly receive-only: it has no CAN
 send command, no AT interface, and no unsafe-write option.
 
+For the complete workflow from captured traffic to a coach definition, including
+operator-marked changes, uncertainty, and validation, see
+[RV-C discovery and coach authoring](RVC-DISCOVERY.md). The
+[coach reference](COACH.md) defines the resulting YAML format and configuration.
+
 ## Start the server on the Pi
 
 From the repository directory, with SocketCAN already configured:
@@ -82,13 +87,51 @@ timestamps and note gaps during reconnections or slow-client failures.
 
 Provide the endpoint and token separately along with target DGN names/IDs,
 source addresses if known, symptoms, the selected specification, and coach
-operating state. Then give Kiro this instruction:
+operating state. For discovery, provide the physical entity labels and the
+safe actions the operator is willing to perform; DGN and instance mappings may
+not yet be known.
+
+Discovery is collaborative: the operator manipulates an entity in the RV using
+its normal physical controls, while the agent watches for corresponding
+messages on the bus. The agent cannot establish a physical mapping from traffic
+alone, and the receive-only monitor cannot operate equipment. Use this sequence:
+
+1. Agree on one entity and one safe action, such as switching a known light
+   on, and record its initial physical state.
+2. Capture an idle baseline. The agent signals when capture is ready before
+   the operator acts.
+3. The operator performs the agreed action and reports its time, the exact
+   control used, and what physically changed. Use synchronized timestamps or
+   a shared event marker to correlate the observation with the capture.
+4. The agent compares traffic before and after that event, looking for command
+   and status messages, their senders, DGN, instance/group, payload changes,
+   and timing. Do not mistake periodic background traffic for the action.
+5. Repeat safe transitions, including restoring the initial state, to test the
+   candidate mapping. If several candidates remain, agree on the next specific
+   observation rather than guessing or transmitting test commands.
+6. Record the physical observation alongside raw and decoded evidence. Label
+   conclusions as observed state, captured panel command, or inference.
+   Watching a panel command does not verify that RV-Control can control the
+   entity.
+
+Keep an operator present and manipulate only equipment explicitly agreed to be
+safe. Do not experiment with unknown channels or hazardous actuators. For the
+full mapping and coach-authoring workflow, follow
+[RV-C discovery and coach authoring](RVC-DISCOVERY.md).
+
+Then give Kiro this instruction:
 
 > Follow `docs/RVC-REMOTE-DEBUG.md`. Authenticate to the supplied TCP monitor
 > and capture a bounded sample of raw and decoded frames for the requested
 > RV-C issue. Preserve timestamps, CAN IDs, payload bytes, frame flags, and
 > decoded DGN/source fields. Compare the wire data with the project-owned
 > specification and canonical helpers in `src/rv_control/rvc_util.py`.
+> Treat discovery as a collaboration with the operator in the RV: agree on one
+> safe entity/action, capture a baseline, signal readiness, and have the operator
+> manipulate its normal control and report the event time and physical result.
+> Correlate that event with command/status messages and repeat safe transitions
+> to distinguish the entity's traffic from background activity. If the mapping
+> is ambiguous, request the next specific operator observation; do not guess.
 > Do not transmit CAN frames, change bus configuration, or assume missing decoded
 > fields mean missing payload bytes. Filter locally by DGN/source after capture.
 > Explain what the evidence establishes, any timing or specification uncertainty,

@@ -13,6 +13,20 @@ The runtime is self-contained and does not import code or configuration from ext
 
 ## User guide
 
+### Documentation
+
+- [Coach architecture and configuration](docs/COACH.md): the semantic entity
+  model, YAML reference, installation bindings, state, and control boundaries.
+- [RV-C discovery and coach authoring](docs/RVC-DISCOVERY.md): evidence-led
+  device discovery and a repeatable workflow for humans and AI agents creating
+  coach definitions, including lessons from the Thor mapping.
+- [Coach MQTT command API](docs/COACH-MQTT-COMMANDS.md): the implemented, opt-in
+  command/query protocol, controller policy, and result guarantees.
+- [BLE connection reliability](docs/BLE-DESIGN.md): current Renogy and Hughes
+  lifecycle, configuration differences, cleanup, and known limitations.
+- [Remote RV-C debugging](docs/RVC-REMOTE-DEBUG.md) and
+  [remote OBD debugging](docs/OBD-REMOTE-DEBUG.md): temporary diagnostic runbooks.
+
 ## Install
 
 ```sh
@@ -431,9 +445,11 @@ Topics are `<base_topic>/<source>` for source snapshots. RV-C additionally publi
 
 ## MQTT commands
 
-For a proposed semantic coach action API suitable for configurable dashboard
-controls, see [Coach MQTT command API](docs/COACH-MQTT-COMMANDS.md).
-That API is a design specification, not an implemented command endpoint.
+For the implemented, opt-in semantic coach command and monitoring API suitable
+for configurable dashboard controls, see
+[Coach MQTT command API](docs/COACH-MQTT-COMMANDS.md). It adds authorized,
+journaled actions and read-only queries alongside the legacy raw commands below;
+it is disabled by default.
 
 Bidirectional commands are opt-in. Set `mqtt.write_enabled = true` and the relevant source's `write_enabled = true`, then publish JSON to the source command topic.
 
@@ -644,40 +660,12 @@ Use `RvcName` with `encode_rvc_name()` and `decode_rvc_name()` to work with NAME
 
 ### Coach entities
 
-Coach specifications live under `src/rv_control/coaches/`. Each named device is an entry under `entities`, normally built from a reusable entry under `templates`. Each entity has a display `name`, a `kind` (`light`, `fan`, `cover`, `switch`, `generator`, `climate`, `tank`), an `area`, a `transport` (e.g. `rvc`, `wled`), its `actions`, and a `state` mapping from RV-C status messages to entity attributes. Read-only entities such as tanks have no actions.
-
-```yaml
-templates:
-  dimmer_switch:
-    transport: rvc
-    actions:
-      on:
-        - {dgn: 0x1FEDB, instance: "{instance}", group: 255, level: 100, command: on, delay: 255}
-      off:
-        - {dgn: 0x1FEDB, instance: "{instance}", group: 255, level: 0, command: off, delay: 255}
-
-entities:
-  kitchen_fan: {name: Kitchen fan, kind: fan, area: kitchen, template: dimmer_switch, instance: 20}
-  fresh_tank:  {name: Fresh water, kind: tank, template: tank, instance: 0}
-
-command_groups:
-  all_fans:
-    members: [kitchen_fan, mid_bath_fan, rear_bath_fan]
-    actions: [on, off]
-
-reserved:
-  - {dgn: 0x1FEDB, instances: [43, 44]}
-```
-
-- An action is a list of frames sent in order. A frame's `wait` (seconds, up to 60) is slept before that frame is sent. All of an action's frames are validated before the first one is sent.
-- An RV-C frame is either a DC_DIMMER_COMMAND_2 described by named fields (`instance`, `group`, `level` percent, `command`, `delay`, `interlock`) or a raw hexadecimal `payload` with its `dgn`. Payloads are padded to eight bytes with `0xFF`.
-- `{name}` placeholders are filled from the entity's own keys when the coach loads (e.g. `{instance}`), and from `coach-exec -p` parameters when an action runs (e.g. `{level}`).
-- A template may `extends` another template. An entity's `actions` are merged over its template's actions; other keys replace the template's keys.
-- A command group either lists `members` and the action names applied to each of them, or maps each action to explicit `{entity, action, params}` steps.
-- Frames addressing a `reserved` DGN and instance are refused, both when the coach loads and when an action runs.
-- Entities marked `confirm: true` (on this coach, the generator and awning) run only with `coach-exec --confirm`.
-
-To keep the coach YAML completely independent of specific installation configuration section names, transports or logical target names are mapped to actual `config.ini` sections inside the `[coach]` section of `config.ini`:
+The coach is a first-class semantic layer over registered hardware sources, not
+a separate `type = coach` source. It names equipment, defines reusable actions
+and state conversions, and supports local commands, entity telemetry, and the
+optional semantic MQTT API. Definitions live in
+[src/rv_control/coaches/](src/rv_control/coaches/); installation bindings remain
+in the INI:
 
 ```ini
 [coach]
@@ -686,7 +674,12 @@ rvc = rv_c_bus
 wled = wled_patio
 ```
 
-Connection details belong in those `config.ini` sections (Bluetooth MAC addresses, WLED hosts, SocketCAN interfaces), not in the coach YAML. When executing an action, `Coach` resolves the entity's `transport` or `target` through `[coach]` in `config.ini` to obtain the actual configuration section name, retrieves the corresponding `Source`, and dispatches the command.
+Use [Coach architecture and configuration](docs/COACH.md) as the canonical
+architecture and YAML reference, including inheritance, parameter schemas,
+groups, reserved instances, state freshness, file selection, and write gates.
+Use [RV-C discovery and coach authoring](docs/RVC-DISCOVERY.md) to build a new
+definition from observed device behavior rather than copying another vehicle's
+instance assignments. `verified` records evidence; it is not a write gate.
 
 ## systemd
 

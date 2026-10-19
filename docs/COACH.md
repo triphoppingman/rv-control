@@ -1,0 +1,367 @@
+# Coach architecture and configuration
+
+The coach is RV-Control's installation-independent semantic model: named lights,
+fans, covers, climate zones, tanks, and other equipment, rather than CAN bytes or
+controller URLs. It is used by local commands, entity telemetry, and the optional
+MQTT command/query API. Treat the coach definition as a maintained product
+interface, not a collection of ad hoc CAN commands.
+
+Start here for architecture and the file format. Use
+[RV-C discovery and coach authoring](RVC-DISCOVERY.md) to establish the mappings
+for another vehicle, and [Coach MQTT command API](COACH-MQTT-COMMANDS.md) for
+controller authorization, request/result schemas, and delivery guarantees.
+
+## Three configuration layers
+
+| Layer | File | Responsibility |
+| --- | --- | --- |
+| Protocol vocabulary | [rvc-spec.yml](../src/rv_control/data/rvc-spec.yml) | DGN names, wire fields and decoding; shared across coaches. |
+| Coach semantics | [Thor Magnitude example](../src/rv_control/coaches/thor-magnitude-bh35-2020.yml) | Which instance is the kitchen fan, its actions and state, scenes, and forbidden command instances. |
+| Installation and permissions | Local INI based on [config-example.ini](../config-example.ini), plus a local policy based on [config-example-controllers.yaml](../config-example-controllers.yaml) | Interfaces, hosts, credentials, enabled sources/targets, transport bindings, write gates, controller grants, and journal location. |
+
+Do not put device addresses, credentials, SocketCAN interface names, or WLED
+hosts in a shareable coach YAML. Conversely, do not put coach-specific instance
+inventories or panel command sequences in the CLI or generic protocol helpers.
+A model/year file is a starting point: options, wiring, and controller firmware
+can differ between nominally identical coaches.
+
+## Runtime structure
+
+```mermaid
+flowchart TD
+    YAML[Coach YAML] --> Coach[Coach: resolved entities and groups]
+    INI[INI: coach bindings and source sections] --> Coach
+    CLI[coach-list / coach-exec] --> Coach
+    MQTT[MQTT command/query service and policy] --> Coach
+    Coach --> Source[Source abstraction: selected installation section]
+    Source --> Hardware[RV-C or WLED]
+    Hardware --> Raw[Source telemetry]
+    Raw --> Targets[Configured targets: MQTT / store / log]
+    Raw --> Tracker[EntityStateTracker: RV-C state mappings]
+    Coach --> Tracker
+    Tracker --> Targets
+    Tracker --> MQTT
+```
+
+- [Coach](../src/rv_control/coach.py) loads YAML, resolves templates and
+  placeholders, builds frames, checks reserved instances, and executes actions.
+- [Source](../src/rv_control/sources/base.py) is the hardware boundary. The coach
+  resolves a configured source section and uses its registered source type;
+  it does not instantiate transport libraries directly.
+- [CoachStatePublisher and EntityStateTracker](../src/rv_control/coach_state.py)
+  supplement the original source publications with semantic entity state.
+- [CoachCommandService](../src/rv_control/coach_commands.py) authorizes and
+  preflights MQTT plans, journals results, and dispatches through running sources'
+  reliable command interface. [CoachQueries](../src/rv_control/coach_queries.py)
+  supplies monitoring operations.
+- [CLI integration](../src/rv_control/cli.py) starts sources, wraps the target
+  publisher, requests initial status, and optionally starts the MQTT service.
+
+The coach is **not** a registered `type = coach` source or a separate hardware
+thread. Do not add it to `[source] enabled-sources`. It is a layer over sources.
+Current action builders support `rvc` and `wled`; the entity state tracker consumes
+decoded RV-C messages, not arbitrary BLE or WLED snapshots.
+
+## Selecting and binding a coach
+
+Merge this into the installation INI; the referenced source sections must exist:
+
+```ini
+[coach]
+specfile = thor-magnitude-bh35-2020
+rvc = rv_c_bus
+wled = wled_patio
+publish_state = true
+state_republish_seconds = 60
+request_status_on_start = true
+```
+
+The example INI shows complete source and target sections. The daemon's enabled
+hardware still comes from `[source] enabled-sources`, for example
+`rv_c_bus, wled_patio`. A binding alone does not start a source.
+
+### Coach file selection
+
+Selection precedence is:
+
+1. Explicit `--coach-spec` on `coach-list` or `coach-exec`.
+2. First nonblank `[coach] specfile`, `spec`, or `coach_spec`.
+3. Legacy `[service] coach_spec`.
+4. The packaged Thor Magnitude BH35 2020 definition.
+
+An identifier may be an existing file path or a packaged `.yml` filename/stem.
+Packaged files live in [coaches/](../src/rv_control/coaches/) and are included in
+the distribution by [pyproject.toml](../pyproject.toml).
+Existing relative paths are resolved from the **process working directory**, not
+the INI directory. Use an absolute path for a private coach file in deployments
+with a different working directory. Unlike coach spec paths, the MQTT service's
+policy and journal paths are resolved beside the INI.
+
+There is no automatic live reload: restart the daemon after YAML, INI, or policy
+changes. Explicit selection is recommended so a new installation does not
+accidentally use the default Thor mappings.
+
+### Transport bindings
+
+An entity normally declares `transport: rvc` or `transport: wled` through its
+template. Resolution collects its nonblank `target`, `config_section`, and
+`transport` strings in that order. It first looks for those keys in `[coach]`;
+if none has a mapping, it tries them as literal INI section names.
+
+For example, `transport: rvc` plus `[coach] rvc = rv_c_bus` dispatches through
+`[rv_c_bus] type = rvc`. An entity can use `target: roof_lights` with
+`[coach] roof_lights = wled_roof` for a second WLED installation binding while
+retaining `transport: wled` as its action format.
+
+Keep the bound source type consistent with the entity transport. Prefer logical
+bindings over installation-specific `config_section` values in reusable YAML.
+The local executor can construct a source on demand; the semantic MQTT API
+requires the affected source to be enabled, running, and command-ready.
+
+## Coach YAML reference
+
+The file is a YAML mapping with these conventional top-level sections:
+
+| Section | Contents |
+| --- | --- |
+| `coach` | Descriptive identity, normally `manufacturer`, `model`, `model_year`. |
+| `templates` | Reusable entity definitions, optionally extending another template. |
+| `entities` | Stable machine identifiers mapped to named equipment. |
+| `command_groups` | Shared actions across members or ordered scenes. |
+| `reserved` | DGN/instance pairs forbidden in coach-generated command frames. |
+
+The loader is not a complete external schema validator. Some errors are detected
+at load time, others when state mappings compile or actions/policies are
+prepared. Passing `check` alone does not validate a coach file or prove its
+hardware behavior.
+
+### A complete small example
+
+This is a format example, **not a verified mapping for another vehicle**. Instance
+20 and group 255 come from the supplied Thor file; replace them with observations.
+No writes are enabled by this YAML.
+
+```yaml
+coach:
+  manufacturer: Example
+  model: Demonstration
+  model_year: 2026
+
+templates:
+  switched_load:
+    transport: rvc
+    action_schemas:
+      on: {}
+      off: {}
+    actions:
+      on:
+        - {dgn: 0x1FEDB, instance: "{instance}", group: 255, level: 100, command: on, delay: 255}
+      off:
+        - {dgn: 0x1FEDB, instance: "{instance}", group: 255, level: 0, command: off, delay: 255}
+    state:
+      dgn: 0x1FEDA
+      match: {instance: "{instance}"}
+      fields:
+        on: {field: loadstatus, map: {0: false, 1: true}}
+        level: {field: operatingstatusbrightness, invalid: [255]}
+
+entities:
+  kitchen_fan:
+    name: Kitchen fan
+    kind: fan
+    area: kitchen
+    template: switched_load
+    instance: 20
+    verified: false
+
+command_groups:
+  all_fans:
+    description: All mapped fans
+    members: [kitchen_fan]
+    actions: [on, off]
+
+reserved:
+  - {dgn: 0x1FEDB, instances: [43, 44]}
+```
+
+### Entities, inheritance, and parameters
+
+Use stable snake_case entity keys: they become command targets and topic suffixes.
+`name`, `kind`, and `area` are display metadata, not protocol addresses.
+`template` selects a template; a template's `extends` selects its parent.
+Inheritance loops are rejected.
+
+Child definitions override parent keys. Only `actions` and `action_schemas`
+merge by action name; a child `state` block or list **replaces** the inherited
+state, rather than extending it. A template's description is not automatically
+the entity description.
+
+Placeholders such as `"{instance}"` are filled from the entity's own scalar keys
+at load time; `{entity}` is its machine identifier. Substitution applies to
+mapping keys too, enabling pairs with configurable action names. Remaining
+action placeholders, such as `"{level}"`, must be supplied at execution time.
+A whole-placeholder value preserves the supplied type; embedded placeholders
+are textual. State mappings cannot contain unresolved placeholders.
+
+For semantic MQTT actions, declare an `action_schemas` entry for each exposed
+entity action, including `{}` for parameterless actions. Supported scalar types
+are `number`, `integer`, `boolean`, and `string`, with numeric `min`/`max` and
+scalar `enum` restrictions. All declared parameters are required. This strict
+schema is enforced by the semantic MQTT service; legacy local `coach-exec`
+uses its existing parameter conversion and frame validation, not that policy.
+
+`verified` and `notes` record evidence. **`verified: false` is not a write gate.**
+Omit unsafe/unknown actions and withhold policy grants; do not rely on this flag
+to prevent execution. `confirm: true` requires explicit confirmation, but is not
+authorization and does not verify the mapping.
+
+### Actions and frames
+
+An action is an ordered list of frame mappings (a single mapping is normalized
+to a list). `wait` is a delay **before that frame**, between 0 and 60 seconds.
+All frames of a local entity action are built and checked before its first send.
+This is not a transaction: transport failure can leave an action partly sent.
+
+For `rvc`, provide a `dgn` and either:
+
+- Named `DC_DIMMER_COMMAND_2` fields: `instance`, `group`, `level` in percent,
+  `command`, `delay`, and optional `interlock`. The canonical builder encodes
+  half-percent units; do not pre-double `level`.
+- A hexadecimal `payload` for other command DGNs, or for an exact captured
+  payload. Classic CAN payloads must not exceed eight bytes.
+
+Short coach payloads are padded to eight bytes with `FF`. `delay` is an on-wire
+protocol value, **not** the local `wait`. Preserve observed sentinel bytes,
+timing, and multi-frame ordering. The RV-C source section supplies integer
+`priority` and `source` settings; defaults are 6 and 0 respectively. The executor
+does not claim or negotiate a free source address on your behalf.
+
+For `wled`, a frame is a WLED JSON state object, optionally with `wait` removed
+before dispatch. Brightness uses WLED's `bri` range 0-255, not RV-C percent.
+See the supplied `wled_light` template.
+
+### Command groups
+
+A group can use `members: [entity_a, entity_b]` and `actions: [on, off]` to
+apply the selected action in member order. Or define a scene:
+
+```yaml
+command_groups:
+  evening:
+    actions:
+      activate:
+        - {entity: living_ceiling_light, action: brightness, params: {level: 30}}
+        - {entity: bedroom_ceiling_light, action: off}
+```
+
+Runtime parameters override step parameters. Referenced entities/actions must
+exist. Avoid recursive groups. Local execution expands and executes sequentially;
+it does not preflight the entire group before the first entity runs. Semantic
+MQTT execution additionally checks the entire expanded plan and all grants
+before writes. Neither path rolls back completed hardware operations.
+
+### Reserved instances
+
+`reserved` accepts a numeric `dgn` and `instances` list (or singular `instance`).
+Checks apply at load time where static values are known and again when building
+frames, including byte zero of a raw payload. These are command safeguards,
+not a telemetry filter: a reserved tank input may still be observed.
+The byte-zero check is not a universal semantic validator for every possible DGN.
+It also does not govern standalone send tools or legacy raw source MQTT commands.
+
+## State mappings and freshness
+
+`state` is one block or a list. Each block has a status `dgn`, optional `match`
+fields, and a `fields` mapping from entity attributes to decoded fields.
+Use numeric YAML DGNs (for example `0x1FEDA`) and exact canonical decoder names.
+Each match value may be a scalar or a list of accepted values; all match fields
+must agree. Include `source` when observations justify filtering a sender.
+Current matching is by decoded content, not the originating INI section; do not
+assume two buses with identical DGNs/instances are automatically isolated.
+
+A field can be a decoded field name or a mapping containing:
+
+| Key | Effect |
+| --- | --- |
+| `field` | Required decoded source field. |
+| `invalid` | Raw values to publish as JSON `null`, checked before conversion. |
+| `divide_by` | Numeric divisor, or the name of another decoded field. |
+| `scale`, `offset` | Multiply and add after division. |
+| `round` | Decimal places; zero produces an integer. |
+| `map` | Convert the resulting value to a label/boolean; unmatched values pass through. |
+
+Order: invalid check, `(raw / divisor) * scale + offset`, rounding, mapping.
+Missing fields are skipped, not fabricated as zero or false. Conversion failures
+are logged at debug level and skipped. New values merge into the entity's prior
+attributes; fields from different DGNs need not have arrived simultaneously.
+
+The daemon forwards raw telemetry unchanged and publishes entity changes at
+`<base_topic>/coach/entity/<entity>`, for example:
+
+```json
+{
+  "entity": "kitchen_fan",
+  "name": "Kitchen fan",
+  "kind": "fan",
+  "area": "kitchen",
+  "state": {"on": true, "level": 100.0},
+  "updated": "2026-10-18T12:00:00+00:00"
+}
+```
+
+Unchanged state is republished after `state_republish_seconds` **when another
+matching observation arrives**, not by an independent heartbeat. Zero disables
+unchanged republishing. Silent equipment can therefore retain old state; the
+`updated` field is a publication timestamp, not a freshness guarantee for every
+attribute. Queries expose observation/freshness details; republishing cached
+state does not read hardware.
+
+`request_status_on_start = true` asks running sources once for the mapped status
+DGNs. RV-C broadcasts status requests without requiring actuator write flags.
+Some controllers may not respond; request transmission is not proof of fresh
+state. `publish_state = false` suppresses entity publications, but a tracker
+still exists if the MQTT API needs it.
+
+## Operations and write boundaries
+
+From the repository working directory:
+
+```sh
+rvcontrol --config config.ini coach-list
+rvcontrol --config config.ini coach-list --coach-spec /path/to/new-coach.yml
+# Physical actions: only after installation-specific validation and write enablement.
+rvcontrol --config config.ini coach-exec kitchen_fan on
+rvcontrol --config config.ini coach-exec generator start --confirm
+```
+
+`coach-list` loads/resolves the coach without opening hardware; an empty resolved
+section in its output means a binding is unresolved, not that it was validated.
+Local `coach-exec` dispatches through legacy source handlers and source-level
+write flags. It does not use the MQTT policy or journal; its printed `status`
+is not hardware acknowledgement, and a legacy handler may log a disabled write
+instead of raising.
+
+For dashboards and correlated outcomes, use the implemented, opt-in
+[semantic MQTT API](COACH-MQTT-COMMANDS.md). Queries require their own enablement
+and grants but no actuator write flags. Physical MQTT actions require endpoint
+enablement, MQTT and source write flags, controller grants for the full plan,
+and any required confirmation. A successful dispatch still does not prove that
+equipment moved: validate with telemetry and physical observation.
+
+## Maintenance and validation
+
+Keep additions transport-independent, evidence-backed, and hardware-free-testable.
+Add tests for template resolution, payloads and timing, reserved instances, state
+conversions, and MQTT schemas/grants affected by a new definition. Relevant suites:
+
+- [test_coach.py](../tests/test_coach.py) and
+  [test_coach_source_dispatch.py](../tests/test_coach_source_dispatch.py)
+- [test_coach_state.py](../tests/test_coach_state.py)
+- [test_coach_commands.py](../tests/test_coach_commands.py),
+  [test_coach_queries.py](../tests/test_coach_queries.py), and
+  [test_coach_mqtt_routing.py](../tests/test_coach_mqtt_routing.py)
+
+The [authoring guide](RVC-DISCOVERY.md) provides the acceptance checklist.
+Software tests establish structure and encoding, never physical compatibility
+with a different coach. Preserve local captures privately and redact installation
+details before sharing evidence.

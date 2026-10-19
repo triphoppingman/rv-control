@@ -2,6 +2,11 @@
 
 Status: implemented, opt-in. Nothing in this document enables writes by itself.
 
+For the underlying entity model, YAML format, transport bindings, and local
+execution boundaries, see [Coach architecture and configuration](COACH.md).
+For evidence-led mapping of a new vehicle, see
+[RV-C discovery and coach authoring](RVC-DISCOVERY.md).
+
 ## Setup and command-line testing
 
 Copy the `[coach_commands]` section from `config-example.ini` and customize
