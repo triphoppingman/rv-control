@@ -50,6 +50,9 @@ def coach_env(config_file: Path, monkeypatch: Any) -> tuple[Coach, FakeBus, list
     config = load_config(str(config_file))
     config["rv_c_bus"] = {"type": "rvc", "interface": "can0", "write_enabled": "true"}
     config["wled_patio"] = {"type": "wled", "base_url": "http://wled.local", "write_enabled": "true"}
+    config["coach"]["overlay"] = str(
+        Path(__file__).parents[1] / "src/rv_control/coaches/wled-overlay-example.yml"
+    )
     wled_calls: list[dict[str, Any]] = []
 
     from rv_control.sources.base import Source

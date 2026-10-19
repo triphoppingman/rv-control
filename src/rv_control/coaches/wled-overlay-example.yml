@@ -1,0 +1,42 @@
+# Additive customization example, not a standalone coach definition.
+entities:
+  patio_light: {name: Patio strip, kind: light, area: exterior, template: wled_light}
+
+command_groups:
+  evening_scene:
+    description: Evening ambient lighting scene
+    actions:
+      activate:
+        - {entity: living_ceiling_light, action: brightness, params: {level: 30}}
+        - {entity: bedroom_ceiling_light, action: off}
+        - {entity: patio_light, action: on}
+
+templates:
+  wled_light:
+    action_schemas:
+      color:
+        segment: {type: integer, min: 0, max: 255}
+        red: {type: integer, min: 0, max: 255}
+        green: {type: integer, min: 0, max: 255}
+        blue: {type: integer, min: 0, max: 255}
+      effect:
+        segment: {type: integer, min: 0, max: 255}
+        effect_id: {type: integer, min: 0, max: 255}
+      palette:
+        segment: {type: integer, min: 0, max: 255}
+        palette_id: {type: integer, min: 0, max: 255}
+      transition:
+        duration: {type: integer, min: 0, max: 65535}
+      preset:
+        preset_id: {type: integer, min: 1, max: 250}
+    actions:
+      color:
+        - {seg: [{id: "{segment}", col: [["{red}", "{green}", "{blue}"]]}]}
+      effect:
+        - {seg: [{id: "{segment}", fx: "{effect_id}"}]}
+      palette:
+        - {seg: [{id: "{segment}", pal: "{palette_id}"}]}
+      transition:
+        - {transition: "{duration}"}
+      preset:
+        - {ps: "{preset_id}"}

@@ -101,7 +101,10 @@ def service_env(tmp_path: Path) -> Any:
         "_meta": {"path": str(tmp_path / "config.ini")},
         "target": {"enabled-targets": "mqtt"},
         "mqtt": {"type": "mqtt", "write_enabled": "true"},
-        "coach": {"rvc": "rv_c_bus", "wled": "wled_patio"},
+        "coach": {
+            "rvc": "rv_c_bus", "wled": "wled_patio",
+            "overlay": str(Path(__file__).parents[1] / "src/rv_control/coaches/wled-overlay-example.yml"),
+        },
         "rv_c_bus": {"type": "rvc", "write_enabled": "true"},
         "wled_patio": {"type": "wled", "write_enabled": "false"},
         "coach_commands": {"enabled": "true", "queries_enabled": "true", "controllers_file": str(policy), "journal_file": str(tmp_path / "journal.sqlite3")},

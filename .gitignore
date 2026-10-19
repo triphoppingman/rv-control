@@ -17,6 +17,7 @@ dist/
 # Local configuration and runtime files
 config.ini
 config.local.ini
+coach-overlay.yml
 config.json
 *.local.ini
 *.log

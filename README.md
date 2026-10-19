@@ -103,6 +103,7 @@ Execute an action on a coach entity or command group (`-p` supplies action param
 ```sh
 rv-control --config config.ini coach-exec kitchen_fan toggle
 rv-control --config config.ini coach-exec living_ceiling_light brightness -p level 30
+# Requires the customization overlay defining evening_scene:
 rv-control --config config.ini coach-exec evening_scene activate
 rv-control --config config.ini coach-exec generator start --confirm
 ```
@@ -325,8 +326,11 @@ PYTHONPATH=src .venv/bin/python tools/wled_tool.py \
 
 Direct write commands require `write_enabled = true` in the selected WLED section. The tool does not embed controller addresses; `base_url`, timeout, and other connection details remain in `config.ini`.
 
-The coach `wled_light` template also exposes `color`, `effect`, `palette`,
-`transition`, and saved `preset` selection. See
+The optional [WLED overlay](src/rv_control/coaches/wled-overlay-example.yml) adds
+`color`, `effect`, `palette`, `transition`, and saved `preset` selection to the
+factory `wled_light` template. Copy it to a local `coach-overlay.yml` and set
+`[coach] overlay = coach-overlay.yml` (relative to the INI). Overlays are strictly
+additive: conflicts fail instead of changing factory definitions. See
 [WLED coach actions](docs/COACH.md#wled-controls-and-discovery) for parameters,
 units, and MQTT policy requirements. These commands do not add controller
 power sequencing, readiness waits, or WLED entity-state tracking.

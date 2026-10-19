@@ -49,19 +49,6 @@ command_groups:
     members: [kitchen_fan, mid_bath_fan, rear_bath_fan]
     actions: [on, off]
 
-  evening_scene:
-    description: Evening ambient lighting scene
-    actions:
-      activate:
-        - entity: living_ceiling_light
-          action: brightness
-          params:
-            level: 30
-        - entity: bedroom_ceiling_light
-          action: off
-        - entity: patio_light
-          action: on
-
 # ---------------------------------------------------------------------------
 # Entity model (monitoring + control). Placeholders in braces ({instance},
 # {first}, ...) are filled from the entity's own keys at load time, and from
@@ -176,21 +163,6 @@ templates:
       off: {}
       brightness:
         bri: {type: integer, min: 0, max: 255}
-      color:
-        segment: {type: integer, min: 0, max: 255}
-        red: {type: integer, min: 0, max: 255}
-        green: {type: integer, min: 0, max: 255}
-        blue: {type: integer, min: 0, max: 255}
-      effect:
-        segment: {type: integer, min: 0, max: 255}
-        effect_id: {type: integer, min: 0, max: 255}
-      palette:
-        segment: {type: integer, min: 0, max: 255}
-        palette_id: {type: integer, min: 0, max: 255}
-      transition:
-        duration: {type: integer, min: 0, max: 65535}
-      preset:
-        preset_id: {type: integer, min: 1, max: 250}
     actions:
       on:
         - {on: true}
@@ -198,16 +170,6 @@ templates:
         - {on: false}
       brightness:
         - {on: true, bri: "{bri}"}   # bri 0-255
-      color:
-        - {seg: [{id: "{segment}", col: [["{red}", "{green}", "{blue}"]]}]}
-      effect:
-        - {seg: [{id: "{segment}", fx: "{effect_id}"}]}
-      palette:
-        - {seg: [{id: "{segment}", pal: "{palette_id}"}]}
-      transition:
-        - {transition: "{duration}"}   # WLED units: 100 ms
-      preset:
-        - {ps: "{preset_id}"}
 
   tank:
     description: Read-only tank level
@@ -235,7 +197,6 @@ entities:
   step_light:           {name: Step, kind: light, area: entry, template: dimmer_switch, instance: 39}
   awning_light:         {name: Awning light, kind: light, area: exterior, template: dimmer_switch, instance: 57}
   vanity_light:         {name: Vanity, kind: light, area: bedroom, template: dimmer_switch, instance: 59}
-  patio_light:          {name: Patio strip, kind: light, area: exterior, template: wled_light}
 
   # Fans and covers ------------------------------------------------------
   kitchen_fan:   {name: Kitchen fan, kind: fan, area: kitchen, template: dimmer_switch, instance: 20, verified: true}

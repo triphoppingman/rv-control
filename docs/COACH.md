@@ -97,6 +97,48 @@ the INI directory. Use an absolute path for a private coach file in deployments
 with a different working directory. Unlike coach spec paths, the MQTT service's
 policy and journal paths are resolved beside the INI.
 
+### Optional additive installation overlay
+
+Keep factory mappings in `specfile` and installation customizations in one
+optional YAML selected with `[coach] overlay`:
+
+```ini
+[coach]
+specfile = thor-magnitude-bh35-2020
+overlay = coach-overlay.yml
+```
+
+Missing or blank `overlay` loads only the factory definition. A configured file
+must exist and parse successfully; there is no silent fallback. Relative overlay
+paths resolve beside the INI (unlike existing relative factory paths). An explicit
+CLI `--coach-spec` changes the factory selection but still applies the configured
+overlay.
+
+The loader merges **factory first, overlay second, then resolves inheritance**.
+Overlays use the same top-level sections: `coach`, `templates`, `entities`,
+`command_groups`, and `reserved`. They may add named definitions, absent metadata,
+and new actions/schemas to existing templates/entities/groups. Existing values
+must not be redefined, even identically. Existing action sequences, state
+mappings and action schemas cannot be replaced or modified; ordinary lists are
+not concatenated. `reserved` is the sole list exception: new restrictions append
+to the factory restrictions, never remove them.
+
+Conflicts fail with the overlay filename and conflicting definition path.
+Resolved factory templates/entities are checked too: adding an entity-level
+action or transport cannot silently shadow an inherited factory definition.
+The merged model validates template inheritance, action schemas, state blocks,
+frame waits, reserved instances, and group references/cycles without opening
+hardware. Validation is not proof of device compatibility, complete raw-payload
+semantics, or controller-specific WLED ID availability. Normal transport checks
+and semantic command preflight still apply at execution.
+
+Copy [wled-overlay-example.yml](../src/rv_control/coaches/wled-overlay-example.yml)
+to a local `coach-overlay.yml` beside your INI to add advanced WLED actions.
+That local filename is Git-ignored; the packaged example is shareable.
+Neither the overlay nor its loading enables writes or grants controller access.
+Keep MQTT grants in the separate controller policy, and restart after changes.
+Source discovery and raw state operations do not depend on an overlay.
+
 There is no automatic live reload: restart the daemon after YAML, INI, or policy
 changes. Explicit selection is recommended so a new installation does not
 accidentally use the default Thor mappings.
@@ -126,9 +168,10 @@ HTTP session, write gate, and telemetry topic. A single `wled = wled_patio`
 binding is only a default for entities without a more specific logical target;
 it does not limit the coach to one controller.
 
-The Thor installation has two WLED devices, but the packaged coach file
-currently models only `patio_light`. Its second physical device is not yet
-represented there. The following two-controller example uses illustrative
+The Thor installation has two customized WLED devices. The factory coach file
+does not define `patio_light`; the local overlay and shareable WLED example add
+that entity and its dependent `evening_scene`. The second physical device is
+not yet mapped. The following two-controller example uses illustrative
 labels/hosts, not an asserted mapping of that second device:
 
 ```ini
@@ -325,7 +368,9 @@ write flag. Available effects, palettes, and segments depend on firmware and
 hardware; numeric schema bounds are not proof that an ID exists on a device.
 Special/custom palette IDs may not appear in the returned name catalog.
 
-The reusable `wled_light` template supports:
+The factory `wled_light` template provides on/off/brightness. Loading the
+[WLED example overlay](../src/rv_control/coaches/wled-overlay-example.yml) adds
+the remaining actions below to that template and its inheriting entities:
 
 | Action | Required parameters | State update |
 | --- | --- | --- |
@@ -362,8 +407,9 @@ rvcontrol --config config.ini mqtt-command patio_light color --param segment 0 -
 ```
 
 Semantic MQTT validates all declared parameters and requires an explicit grant
-for each new action; the example controller policy includes these grants for
-`patio_light`, but existing local policies are not changed automatically.
+for each new action; the example controller policy shows optional commented
+grants for `patio_light`. Uncomment them only when the overlay is loaded and
+access is intended; existing local policies are not changed automatically.
 Local `coach-exec` retains legacy frame validation rather than enforcing the
 MQTT scalar schemas. Direct tool `state` and source `set_state()` remain
 advanced raw JSON interfaces. No configuration-write API, preset-file management,

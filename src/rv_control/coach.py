@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from ruamel.yaml import YAML
+from ruamel.yaml.error import YAMLError
 
 from .rvc_util import (
     DC_DIMMER_COMMAND_DGN,
@@ -158,6 +159,40 @@ def load_coach_yaml(path: str | Path) -> dict[str, Any]:
     return data
 
 
+def merge_coach_overlay(
+    base: dict[str, Any], additions: dict[str, Any], label: str, path: str = "",
+) -> dict[str, Any]:
+    """Add mapping keys without replacing existing values or command sequences."""
+    merged = copy.deepcopy(base)
+    for key, value in additions.items():
+        location = f"{path}.{key}" if path else str(key)
+        if key not in merged:
+            merged[key] = copy.deepcopy(value)
+        elif key == "state" or path.endswith(".action_schemas"):
+            raise ValueError(f"Coach overlay {label}: cannot replace existing definition {location}")
+        elif isinstance(merged[key], dict) and isinstance(value, dict):
+            merged[key] = merge_coach_overlay(merged[key], value, label, location)
+        elif location == "reserved" and isinstance(merged[key], list) and isinstance(value, list):
+            merged[key].extend(copy.deepcopy(value))
+        else:
+            raise ValueError(f"Coach overlay {label}: cannot replace existing definition {location}")
+    return merged
+
+
+def _require_preserved(base: Any, merged: Any, label: str, path: str) -> None:
+    """Reject effective overrides of inherited factory values after resolution."""
+    if path.endswith(".state") or ".action_schemas." in path:
+        if type(base) is not type(merged) or base != merged:
+            raise ValueError(f"Coach overlay {label}: changes inherited definition {path}")
+    elif isinstance(base, dict) and isinstance(merged, dict):
+        for key, value in base.items():
+            if key not in merged:
+                raise ValueError(f"Coach overlay {label}: removes inherited definition {path}.{key}")
+            _require_preserved(value, merged[key], label, f"{path}.{key}")
+    elif type(base) is not type(merged) or base != merged:
+        raise ValueError(f"Coach overlay {label}: changes inherited definition {path}")
+
+
 def find_coach_file(spec_identifier: str | Path | None = None) -> Path:
     """Resolve a coach specification path or model name to an existing YAML file.
 
@@ -260,7 +295,99 @@ class Coach:
             coach_spec = config["service"].get("coach_spec", "").strip() or None
         file_path = find_coach_file(coach_spec)
         data = load_coach_yaml(file_path)
-        return cls(config=config, data=data, coach_file=file_path, sources=sources)
+        overlay = config.get("coach", "overlay", fallback="").strip()
+        if not overlay:
+            return cls(config=config, data=data, coach_file=file_path, sources=sources)
+        config_path = Path(config.get("_meta", "path", fallback="config.ini")).resolve()
+        overlay_path = (config_path.parent / overlay).resolve()
+        try:
+            additions = load_coach_yaml(overlay_path)
+            unknown = set(additions) - {"coach", "templates", "entities", "command_groups", "reserved"}
+            if unknown:
+                raise ValueError(f"Unknown overlay sections: {', '.join(sorted(map(str, unknown)))}")
+            for section, value in additions.items():
+                expected = list if section == "reserved" else dict
+                if not isinstance(value, expected):
+                    raise ValueError(f"Overlay section {section!r} must be a {expected.__name__}")
+            for section in ("templates", "entities", "command_groups"):
+                for name, definition in additions.get(section, {}).items():
+                    if not isinstance(name, str) or not name or not isinstance(definition, dict):
+                        raise ValueError(f"Overlay {section} entries need names and mapping definitions")
+            factory = cls(config=config, data=data, coach_file=file_path)
+            merged = merge_coach_overlay(data, additions, str(overlay_path))
+            coach = cls(config=config, data=merged, coach_file=file_path, sources=sources)
+            for name in factory.templates:
+                _require_preserved(
+                    factory._resolve_template(name), coach._resolve_template(name),
+                    str(overlay_path), f"templates.{name}",
+                )
+            _require_preserved(factory.entities, coach.entities, str(overlay_path), "entities")
+            coach._validate_overlay()
+        except (ValueError, KeyError, TypeError, AttributeError, PermissionError, YAMLError) as error:
+            raise ValueError(f"Invalid coach overlay {overlay_path}: {error}") from error
+        return coach
+
+    def _validate_overlay(self) -> None:
+        """Validate merged mappings, state, schemas and group references without hardware."""
+        from .coach_commands import validate_schema
+        from .coach_state import EntityStateTracker
+
+        for name in self.templates:
+            self._resolve_template(name)
+        for dgn, instances in self.reserved.items():
+            if not 0 <= dgn <= 0x1FFFF or any(not 0 <= instance <= 255 for instance in instances):
+                raise ValueError("Reserved DGN or instance is out of range")
+        if set(self.entities) & set(self.command_groups):
+            raise ValueError("Entity and group names must not overlap")
+        for name, entity in self.entities.items():
+            if entity.get("actions") and entity.get("transport") not in {"rvc", "wled"}:
+                raise ValueError(f"Entity {name!r} uses unsupported transport")
+            for action, schema in entity.get("action_schemas", {}).items():
+                if action not in entity["actions"]:
+                    raise ValueError(f"Entity {name!r} schema references unknown action {action!r}")
+                validate_schema(schema)
+            for action, frames in entity["actions"].items():
+                for frame in frames:
+                    self._frame_wait(frame)
+                    if entity.get("transport") == "wled" and not any(key != "wait" for key in frame):
+                        raise ValueError(f"Entity {name!r} action {action!r} has an empty WLED frame")
+        EntityStateTracker(self, lambda _topic, _payload: None)
+
+        def visit(target: str, action: str, chain: tuple[str, ...] = ()) -> None:
+            """Check one group expansion for cycles and missing targets/actions."""
+            if target in chain:
+                raise ValueError(f"Command group cycle: {' -> '.join(chain + (target,))}")
+            if target in self.entities:
+                if action not in self.entities[target]["actions"]:
+                    raise ValueError(f"Unknown action {target}.{action}")
+                return
+            if target not in self.command_groups:
+                raise ValueError(f"Unknown group member {target!r}")
+            group = self.command_groups[target]
+            actions = group.get("actions", {})
+            if action not in actions:
+                raise ValueError(f"Unknown group action {target}.{action}")
+            steps = (
+                [{"entity": member, "action": action} for member in group.get("members", [])]
+                if isinstance(actions, list) else actions[action]
+            )
+            if not isinstance(steps, list):
+                raise ValueError(f"Group {target!r} steps must be a list")
+            for step in steps:
+                if not isinstance(step, dict) or "entity" not in step:
+                    raise ValueError(f"Group {target!r} step needs an entity")
+                visit(step["entity"], step.get("action", action), chain + (target,))
+
+        for name, group in self.command_groups.items():
+            actions = group.get("actions", {})
+            if not isinstance(actions, (list, dict)):
+                raise ValueError(f"Group {name!r} actions must be a mapping or list")
+            for action, schema in group.get("action_schemas", {}).items():
+                if action not in actions:
+                    raise ValueError(f"Group {name!r} schema references unknown action {action!r}")
+                validate_schema(schema)
+            for action in group.get("actions", {}):
+                visit(name, action)
 
     def get_source(self, config_section: str) -> Source:
         """Get or construct a Source instance for a configuration section via source.py interface.
