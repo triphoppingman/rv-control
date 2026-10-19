@@ -76,7 +76,7 @@ controllers:
       kitchen_fan: {on: {}, off: {}}
       mid_bath_fan: {on: {}, off: {}}
       rear_bath_fan: {on: {}, off: {}}
-      patio_light: {on: {}, off: {}, brightness: {}}
+      patio_light: {on: {}, off: {}, brightness: {}, color: {}, effect: {}, palette: {}, transition: {}, preset: {}}
     queries:
       snapshot: {entities: ["*"]}
       republish_states: {entities: ["*"]}
@@ -138,6 +138,56 @@ def dispatch(env: Any, request: dict[str, Any], kind: str = "command", retained:
         service._worker.join(timeout=3)
         assert not service._worker.is_alive()
     return results[-1]
+
+
+@pytest.mark.parametrize(("action", "params", "payload"), [
+    ("color", {"segment": 0, "red": 0, "green": 128, "blue": 255},
+     {"seg": [{"id": 0, "col": [[0, 128, 255]]}]}),
+    ("effect", {"segment": 0, "effect_id": 0}, {"seg": [{"id": 0, "fx": 0}]}),
+    ("palette", {"segment": 1, "palette_id": 255}, {"seg": [{"id": 1, "pal": 255}]}),
+    ("transition", {"duration": 65535}, {"transition": 65535}),
+    ("preset", {"preset_id": 250}, {"ps": 250}),
+])
+def test_wled_extended_semantic_actions(
+    service_env: Any, action: str, params: dict[str, int], payload: dict[str, Any],
+) -> None:
+    """New actions pass full policy preflight and dispatch exact state payloads."""
+    service, _source, _results, clock, _tracker = service_env
+    wled = FakeSource(service.config)
+    service.sources["wled_patio"] = wled
+    service.config["wled_patio"]["write_enabled"] = "true"
+    result = dispatch(service_env, envelope(clock, target="patio_light", action=action, params=params))
+    assert result["status"] == "completed"
+    assert wled.calls == [payload]
+
+
+@pytest.mark.parametrize(("action", "params"), [
+    ("color", {"segment": 0, "red": 256, "green": 0, "blue": 0}),
+    ("color", {"segment": -1, "red": 0, "green": 0, "blue": 0}),
+    ("color", {"segment": 0, "red": True, "green": 0, "blue": 0}),
+    ("color", {"segment": 0, "red": 0, "green": 0}),
+    ("effect", {"segment": 0, "effect_id": -1}),
+    ("effect", {"segment": 0, "effect_id": 256}),
+    ("palette", {"segment": 256, "palette_id": 0}),
+    ("palette", {"segment": 0, "palette_id": "1"}),
+    ("transition", {"duration": -1}),
+    ("transition", {"duration": 65536}),
+    ("transition", {"duration": 1.5}),
+    ("preset", {"preset_id": 0}),
+    ("preset", {"preset_id": 251}),
+    ("preset", {"preset_id": 1, "psave": 2}),
+])
+def test_wled_extended_semantic_params_rejected(
+    service_env: Any, action: str, params: dict[str, Any],
+) -> None:
+    """Invalid types, bounds, missing fields and overrides cannot reach WLED."""
+    service, _source, _results, clock, _tracker = service_env
+    wled = FakeSource(service.config)
+    service.sources["wled_patio"] = wled
+    service.config["wled_patio"]["write_enabled"] = "true"
+    result = dispatch(service_env, envelope(clock, target="patio_light", action=action, params=params))
+    assert result["code"] == "invalid_params"
+    assert wled.calls == []
 
 
 def test_kitchen_light_dispatch_and_duplicate(service_env: Any) -> None:

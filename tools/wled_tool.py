@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from typing import Any
 
 import click
@@ -26,9 +27,10 @@ def cli(context: click.Context, config_path: str, section: str) -> None:
         raise click.UsageError(f"Configuration section [{section}] must have type = wled")
     context.ensure_object(dict)
     context.obj["source"] = WledSource(config, None, None, section)
+    context.call_on_close(context.obj["source"].session.close)
 
 
-def emit(value: dict[str, Any]) -> None:
+def emit(value: dict[str, Any] | list[str]) -> None:
     """Print a WLED JSON response in a readable stable format."""
     click.echo(json.dumps(value, indent=2, sort_keys=True, default=str))
 
@@ -38,7 +40,7 @@ def source_from(context: click.Context) -> WledSource:
     return context.obj["source"]
 
 
-def run_request(operation: Any) -> None:
+def run_request(operation: Callable[[], dict[str, Any] | list[str]]) -> None:
     """Run one WLED operation and convert expected failures into CLI errors."""
     try:
         emit(operation())
@@ -58,6 +60,20 @@ def status(context: click.Context) -> None:
 def info(context: click.Context) -> None:
     """Display WLED controller identity and firmware information."""
     run_request(source_from(context).info)
+
+
+@cli.command()
+@click.pass_context
+def effects(context: click.Context) -> None:
+    """List effect names as a JSON array whose indexes are effect IDs."""
+    run_request(source_from(context).effects)
+
+
+@cli.command()
+@click.pass_context
+def palettes(context: click.Context) -> None:
+    """List palette names as a JSON array whose indexes are palette IDs."""
+    run_request(source_from(context).palettes)
 
 
 @cli.command()

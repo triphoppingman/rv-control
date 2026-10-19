@@ -118,6 +118,72 @@ bindings over installation-specific `config_section` values in reusable YAML.
 The local executor can construct a source on demand; the semantic MQTT API
 requires the affected source to be enabled, running, and command-ready.
 
+### Multiple WLED controllers
+
+`wled` is a transport type, **not a singleton device**. Any number of named
+source sections can use `type = wled`, each with its own host, polling loop,
+HTTP session, write gate, and telemetry topic. A single `wled = wled_patio`
+binding is only a default for entities without a more specific logical target;
+it does not limit the coach to one controller.
+
+The Thor installation has two WLED devices, but the packaged coach file
+currently models only `patio_light`. Its second physical device is not yet
+represented there. The following two-controller example uses illustrative
+labels/hosts, not an asserted mapping of that second device:
+
+```ini
+[source]
+enabled-sources = rv_c_bus, wled_patio, wled_roof
+
+[coach]
+specfile = thor-magnitude-bh35-2020
+rvc = rv_c_bus
+patio_strip = wled_patio
+roof_strip = wled_roof
+
+[wled_patio]
+type = wled
+base_url = http://patio-wled.local
+topic = wled/patio
+write_enabled = false
+
+[wled_roof]
+type = wled
+base_url = http://roof-wled.local
+topic = wled/roof
+write_enabled = false
+```
+
+These are fragments to merge with a complete INI. In the selected coach YAML,
+both entities reuse `wled_light`, but select different logical bindings:
+
+```yaml
+entities:
+  patio_light:
+    name: Patio strip
+    template: wled_light
+    target: patio_strip
+  roof_light:
+    name: Roof strip
+    template: wled_light
+    target: roof_strip
+```
+
+Both retain inherited `transport: wled`. The explicit `[coach]` target mappings
+select their source sections ahead of a generic `wled` mapping. Use explicit
+bindings for every controller when ambiguous fallback would be undesirable.
+In particular, an unmapped/misspelled `target` can fall through to a configured
+generic `wled` binding; it is not automatically rejected as an unknown target.
+Inspect `coach-list`'s resolved `config_section` for every entity before writes.
+
+Groups/scenes may include entities on either controller without a new transport
+or group format. Semantic MQTT grants remain entity/action-based, and each
+resolved source must independently be enabled, running, and write-enabled.
+Use distinct source telemetry topics to keep their snapshots distinguishable.
+WLED snapshots still do not populate the RV-C-only entity state tracker:
+adding a second controller does not add WLED entity snapshots or state refresh
+support to the semantic query API.
+
 ## Coach YAML reference
 
 The file is a YAML mapping with these conventional top-level sections:
@@ -239,6 +305,70 @@ does not claim or negotiate a free source address on your behalf.
 For `wled`, a frame is a WLED JSON state object, optionally with `wait` removed
 before dispatch. Brightness uses WLED's `bri` range 0-255, not RV-C percent.
 See the supplied `wled_light` template.
+
+### WLED controls and discovery
+
+The Python source provides read-only `effects()` and `palettes()` catalogs via
+`GET /json/effects` and `GET /json/palettes`. The standalone tool exposes the
+same operations:
+
+```sh
+PYTHONPATH=src .venv/bin/python tools/wled_tool.py --config config.ini --section wled_patio effects
+PYTHONPATH=src .venv/bin/python tools/wled_tool.py --config config.ini --section wled_patio palettes
+```
+
+Both return JSON arrays of names in the order supplied by that controller;
+array indexes are the corresponding catalog IDs. Order, duplicate names, and
+empty lists are preserved. Invalid response shapes and HTTP errors fail
+explicitly. Catalogs are read on demand, not on every poll, and require no
+write flag. Available effects, palettes, and segments depend on firmware and
+hardware; numeric schema bounds are not proof that an ID exists on a device.
+Special/custom palette IDs may not appear in the returned name catalog.
+
+The reusable `wled_light` template supports:
+
+| Action | Required parameters | State update |
+| --- | --- | --- |
+| `on` / `off` | None | Controller `on` flag. |
+| `brightness` | `bri`: integer 0-255 | Turns output on and sets brightness. |
+| `color` | `segment`, `red`, `green`, `blue`: integers 0-255 | Primary RGB color of the explicitly addressed segment. |
+| `effect` | `segment`, `effect_id`: integers 0-255 | Segment effect (`fx`). |
+| `palette` | `segment`, `palette_id`: integers 0-255 | Segment palette (`pal`). |
+| `transition` | `duration`: integer 0-65535 | Controller default transition duration, in WLED's 100 ms units. |
+| `preset` | `preset_id`: integer 1-250 | Apply an existing saved preset (`ps`); does not save or delete presets. |
+
+Segment parameters select an existing segment explicitly, rather than relying
+on WLED's selected/main-segment behavior. They do not create LED ranges.
+`color`, `effect`, `palette`, and `transition` do not implicitly turn output on,
+change brightness, or enable a disabled segment. A color update does not force
+the Solid effect; the active effect determines how it uses primary color.
+A preset can change multiple saved settings, including output state.
+
+`transition` changes the controller's default crossfade setting, not a local
+sleep or one-shot `tt` override. For example `duration = 10` requests one second.
+Firmware may cap the effective duration; the schema represents the API field
+range, not a guarantee of a 6553.5-second fade. Refer to the controller's version
+of the [WLED JSON API](https://kno.wled.ge/interfaces/json-api/).
+
+Examples for a configured, reviewed installation:
+
+```sh
+rvcontrol --config config.ini coach-exec patio_light color -p segment 0 -p red 255 -p green 80 -p blue 20
+rvcontrol --config config.ini coach-exec patio_light effect -p segment 0 -p effect_id 0
+rvcontrol --config config.ini coach-exec patio_light palette -p segment 0 -p palette_id 0
+rvcontrol --config config.ini coach-exec patio_light transition -p duration 10
+rvcontrol --config config.ini coach-exec patio_light preset -p preset_id 1
+rvcontrol --config config.ini mqtt-command patio_light color --param segment 0 --param red 255 --param green 80 --param blue 20
+```
+
+Semantic MQTT validates all declared parameters and requires an explicit grant
+for each new action; the example controller policy includes these grants for
+`patio_light`, but existing local policies are not changed automatically.
+Local `coach-exec` retains legacy frame validation rather than enforcing the
+MQTT scalar schemas. Direct tool `state` and source `set_state()` remain
+advanced raw JSON interfaces. No configuration-write API, preset-file management,
+boot waiting, or awning power sequencing is introduced by these actions.
+No additional MQTT telemetry topics are created.
 
 ### Command groups
 

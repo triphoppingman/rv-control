@@ -12,6 +12,15 @@ controllers:
         brightness:
           params:
             level: {type: number, min: 0, max: 100}
+      patio_light:
+        on: {}
+        off: {}
+        brightness: {}
+        color: {}
+        effect: {}
+        palette: {}
+        transition: {}
+        preset: {}
       kitchen_fan:
         on: {}
         off: {}

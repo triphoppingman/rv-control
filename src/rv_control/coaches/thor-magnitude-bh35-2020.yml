@@ -176,6 +176,21 @@ templates:
       off: {}
       brightness:
         bri: {type: integer, min: 0, max: 255}
+      color:
+        segment: {type: integer, min: 0, max: 255}
+        red: {type: integer, min: 0, max: 255}
+        green: {type: integer, min: 0, max: 255}
+        blue: {type: integer, min: 0, max: 255}
+      effect:
+        segment: {type: integer, min: 0, max: 255}
+        effect_id: {type: integer, min: 0, max: 255}
+      palette:
+        segment: {type: integer, min: 0, max: 255}
+        palette_id: {type: integer, min: 0, max: 255}
+      transition:
+        duration: {type: integer, min: 0, max: 65535}
+      preset:
+        preset_id: {type: integer, min: 1, max: 250}
     actions:
       on:
         - {on: true}
@@ -183,6 +198,16 @@ templates:
         - {on: false}
       brightness:
         - {on: true, bri: "{bri}"}   # bri 0-255
+      color:
+        - {seg: [{id: "{segment}", col: [["{red}", "{green}", "{blue}"]]}]}
+      effect:
+        - {seg: [{id: "{segment}", fx: "{effect_id}"}]}
+      palette:
+        - {seg: [{id: "{segment}", pal: "{palette_id}"}]}
+      transition:
+        - {transition: "{duration}"}   # WLED units: 100 ms
+      preset:
+        - {ps: "{preset_id}"}
 
   tank:
     description: Read-only tank level

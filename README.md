@@ -293,7 +293,16 @@ PYTHONPATH=src .venv/bin/python tools/wled_tool.py \
 	--config config.ini --section wled_patio status
 PYTHONPATH=src .venv/bin/python tools/wled_tool.py \
 	--config config.ini --section wled_patio info
+PYTHONPATH=src .venv/bin/python tools/wled_tool.py \
+	--config config.ini --section wled_patio effects
+PYTHONPATH=src .venv/bin/python tools/wled_tool.py \
+	--config config.ini --section wled_patio palettes
 ```
+
+`effects` and `palettes` return read-only JSON arrays of names in controller ID
+order (array index = ID); they do not require write enablement. The Python
+source exposes the same catalogs through `effects()` and `palettes()`. Discover
+IDs on each controller rather than assuming matching firmware/catalogs.
 
 Basic controls are available with `on`, `off`, and brightness values from `0` through `255`:
 
@@ -315,6 +324,12 @@ PYTHONPATH=src .venv/bin/python tools/wled_tool.py \
 ```
 
 Direct write commands require `write_enabled = true` in the selected WLED section. The tool does not embed controller addresses; `base_url`, timeout, and other connection details remain in `config.ini`.
+
+The coach `wled_light` template also exposes `color`, `effect`, `palette`,
+`transition`, and saved `preset` selection. See
+[WLED coach actions](docs/COACH.md#wled-controls-and-discovery) for parameters,
+units, and MQTT policy requirements. These commands do not add controller
+power sequencing, readiness waits, or WLED entity-state tracking.
 
 ELM327 Bluetooth OBD-II adapters use a named source section. The source connects with a raw Bluetooth RFCOMM socket (no `rfcomm bind`, no serial device node), so pair and trust the adapter once with `bluetoothctl` before first use (see [ELM327 OBD-II adapter (Bluetooth Classic)](#elm327-obd-ii-adapter-bluetooth-classic) for discovery, pairing, and controller selection). `adapter` selects the local controller by `hciN` name or controller MAC address, and the RFCOMM socket is bound to it:
 

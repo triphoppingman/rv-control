@@ -143,6 +143,39 @@ def test_entity_wled(coach_env: Any) -> None:
     assert wled_calls == [{"on": True}]
 
 
+@pytest.mark.parametrize(("action", "params", "payload"), [
+    ("color", {"segment": 0, "red": 255, "green": 80, "blue": 0},
+     {"seg": [{"id": 0, "col": [[255, 80, 0]]}]}),
+    ("effect", {"segment": 1, "effect_id": 2}, {"seg": [{"id": 1, "fx": 2}]}),
+    ("palette", {"segment": 1, "palette_id": 3}, {"seg": [{"id": 1, "pal": 3}]}),
+    ("transition", {"duration": 10}, {"transition": 10}),
+    ("preset", {"preset_id": 7}, {"ps": 7}),
+])
+def test_entity_wled_advanced_actions(
+    coach_env: Any, action: str, params: dict[str, int], payload: dict[str, Any],
+) -> None:
+    """Expanded coach actions preserve typed nested WLED fields without powering on."""
+    coach, _bus, wled_calls, _sleeps = coach_env
+    coach.execute("patio_light", action, **params)
+    assert wled_calls == [payload]
+
+
+def test_wled_entities_select_distinct_controllers(coach_env: Any) -> None:
+    """Logical entity bindings select separate WLED sources sharing one template."""
+    coach, _bus, wled_calls, _sleeps = coach_env
+    coach.config["wled_roof"] = {"type": "wled", "write_enabled": "true"}
+    coach.config["coach"]["patio_strip"] = "wled_patio"
+    coach.config["coach"]["roof_strip"] = "wled_roof"
+    coach.entities["patio_light"]["target"] = "patio_strip"
+    coach.entities["roof_light"] = dict(coach.entities["patio_light"], target="roof_strip")
+    patio = coach.execute("patio_light", "effect", segment=0, effect_id=1)[0]
+    roof = coach.execute("roof_light", "palette", segment=0, palette_id=2)[0]
+    assert patio["config_section"] == "wled_patio"
+    assert roof["config_section"] == "wled_roof"
+    assert coach.get_source("wled_patio") is not coach.get_source("wled_roof")
+    assert wled_calls == [{"seg": [{"id": 0, "fx": 1}]}, {"seg": [{"id": 0, "pal": 2}]}]
+
+
 def test_coach_execute_group(coach_env: Any) -> None:
     """Member groups apply one action to every member; step groups run explicit steps."""
     coach, bus, wled_calls, _sleeps = coach_env

@@ -37,6 +37,13 @@ class WledSource(Source, source_name="wled"):
 
     def _request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         """Perform one bounded WLED JSON request and return its object response."""
+        data = self._request_json(method, path, payload)
+        if not isinstance(data, dict):
+            raise ValueError(f"WLED returned a non-object response from {path}")
+        return data
+
+    def _request_json(self, method: str, path: str, payload: dict[str, Any] | None = None) -> object:
+        """Perform a serialized, bounded request without assuming the JSON shape."""
         timeout = self.section.getfloat("timeout", fallback=5.0)
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("WLED timeout must be positive and finite")
@@ -52,10 +59,7 @@ class WledSource(Source, source_name="wled"):
         finally:
             self._request_lock.release()
         response.raise_for_status()
-        data = response.json()
-        if not isinstance(data, dict):
-            raise ValueError(f"WLED returned a non-object response from {path}")
-        return data
+        return response.json()
 
     def comms_check(self) -> dict[str, Any]:
         """Check WLED reachability and report controller identity information."""
@@ -74,6 +78,21 @@ class WledSource(Source, source_name="wled"):
     def info(self) -> dict[str, Any]:
         """Read and return WLED controller identity and firmware information."""
         return self._request("GET", "/json/info")
+
+    def effects(self) -> list[str]:
+        """Return effect names in controller ID order without enabling writes."""
+        return self._catalog("/json/effects")
+
+    def palettes(self) -> list[str]:
+        """Return palette names in controller ID order without enabling writes."""
+        return self._catalog("/json/palettes")
+
+    def _catalog(self, path: str) -> list[str]:
+        """Read a catalog and reject responses that are not arrays of names."""
+        data = self._request_json("GET", path)
+        if not isinstance(data, list) or not all(isinstance(name, str) for name in data):
+            raise ValueError(f"WLED returned a non-string-array response from {path}")
+        return data
 
     def status(self) -> dict[str, Any]:
         """Read and return the current WLED light state."""
