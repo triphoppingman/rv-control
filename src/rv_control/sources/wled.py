@@ -4,21 +4,117 @@ import logging
 import math
 import threading
 import time
+from collections.abc import Mapping
 from typing import Any
 
 import requests
 
-from .base import Source
+from .writable import ActionDefinition, WritableSource
 
 
 LOGGER = logging.getLogger(__name__)
 
+STATE_PATTERNS: dict[str, dict[str, Any]] = {
+    "on": {"on": True},
+    "off": {"on": False},
+    "brightness": {"on": True, "bri": "$bri"},
+    "color": {"seg": [{"id": "$segment", "col": [["$red", "$green", "$blue"]]}]},
+    "effect": {"seg": [{"id": "$segment", "fx": "$effect_id"}]},
+    "palette": {"seg": [{"id": "$segment", "pal": "$palette_id"}]},
+    "transition": {"transition": "$duration"},
+    "preset": {"ps": "$preset_id"},
+}
 
-class WledSource(Source, source_name="wled"):
+
+def _render_state(value: Any, params: Mapping[str, Any]) -> Any:
+    """Expand a source-owned state recipe using validated action parameters."""
+    if isinstance(value, dict):
+        return {key: _render_state(item, params) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_render_state(item, params) for item in value]
+    if isinstance(value, str) and value.startswith("$"):
+        return params[value[1:]]
+    return value
+
+
+def _match_state(pattern: Any, value: Any, params: dict[str, Any]) -> bool:
+    """Recognize a complete legacy state recipe without discarding extra fields."""
+    if isinstance(pattern, str) and pattern.startswith("$"):
+        params[pattern[1:]] = value
+        return True
+    if isinstance(pattern, dict):
+        return isinstance(value, dict) and pattern.keys() == value.keys() and all(
+            _match_state(item, value[key], params) for key, item in pattern.items()
+        )
+    if isinstance(pattern, list):
+        return isinstance(value, list) and len(pattern) == len(value) and all(
+            _match_state(item, actual, params) for item, actual in zip(pattern, value)
+        )
+    return type(pattern) is type(value) and pattern == value
+
+
+class WledSource(WritableSource, source_name="wled"):
     """Poll and control a WLED controller through its local JSON API."""
 
     source_name = "wled"
     config_section = "wled"
+
+    @classmethod
+    def supported_actions(cls) -> dict[str, ActionDefinition]:
+        """Describe controller and segment actions supported by the local JSON API."""
+        byte = {"type": "integer", "min": 0, "max": 255}
+        return {
+            "on": ActionDefinition("Turn controller output on.", {}),
+            "off": ActionDefinition("Turn controller output off.", {}),
+            "brightness": ActionDefinition("Turn output on and set brightness (0-255).", {"bri": dict(byte)}),
+            "color": ActionDefinition("Set primary segment RGB without changing output power.", {
+                key: dict(byte) for key in ("segment", "red", "green", "blue")
+            }),
+            "effect": ActionDefinition("Select a segment effect ID.", {
+                "segment": dict(byte), "effect_id": dict(byte),
+            }),
+            "palette": ActionDefinition("Select a segment palette ID.", {
+                "segment": dict(byte), "palette_id": dict(byte),
+            }),
+            "transition": ActionDefinition("Set default transition in 100 ms units.", {
+                "duration": {"type": "integer", "min": 0, "max": 65535},
+            }),
+            "preset": ActionDefinition("Apply an existing saved preset.", {
+                "preset_id": {"type": "integer", "min": 1, "max": 250},
+            }),
+            "state": ActionDefinition("Advanced raw JSON state update; no configuration endpoints.", {
+                "state": {"type": "object"},
+            }),
+        }
+
+    @classmethod
+    def translate_frame(cls, frame: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
+        """Recognize existing coach JSON recipes, retaining arbitrary state updates."""
+        payload = dict(frame)
+        for name, pattern in STATE_PATTERNS.items():
+            params: dict[str, Any] = {}
+            if _match_state(pattern, payload, params):
+                return name, params
+        return "state", {"state": payload}
+
+    @classmethod
+    def _encode_action(
+        cls, action: str, params: dict[str, Any], section: Mapping[str, str],
+        *, reserved: Mapping[int, set[int]] | None = None,
+    ) -> dict[str, Any]:
+        """Build a local state update without accepting endpoint or host overrides."""
+        payload = params["state"] if action == "state" else _render_state(STATE_PATTERNS[action], params)
+        if not payload:
+            raise ValueError("WLED state payload must be a non-empty object")
+        return payload
+
+    @classmethod
+    def dispatch_budget(cls, section: Mapping[str, str]) -> float:
+        """Budget lock acquisition, connection and response waits using the HTTP timeout."""
+        timeout = float(section.get("timeout", "5"))
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("WLED action timeout must be positive and finite")
+        return 3 * timeout
 
     def __init__(self, config: Any, publisher: Any, stop_event: Any, section_name: str | None = None) -> None:
         """Initialize a WLED source without contacting the controller."""

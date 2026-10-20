@@ -123,9 +123,14 @@ enabled command receiver, not a replacement.
   on every successful connection. Semantic routing preserves the original
   bytes and retain flag for strict validation.
 - `CoachCommandService` authorizes and preflights a whole expanded group using
-  the coach's canonical frame builders, without constructing extra sources.
+  source-owned action contracts and encoders, without constructing extra sources.
+  Coach translates existing YAML frames through each source's adapter; YAML
+  action definitions and controller grants do not need to change.
 - A bounded worker dispatches through the running sources' reliable
-  `execute_command` interface, not legacy handlers that may log and return.
+  `execute_action` interface, not legacy handlers that may log and return.
+  Source action names, parameter schemas and descriptions can be inspected
+  locally with `rvcontrol source-actions rvc` or `rvcontrol source-actions wled`.
+  These catalogs describe implemented support, not controller permissions.
 - Existing raw handlers and local `coach-exec` retain their compatibility
   contract; only the semantic API provides the journaled result guarantees.
 

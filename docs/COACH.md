@@ -349,6 +349,72 @@ For `wled`, a frame is a WLED JSON state object, optionally with `wait` removed
 before dispatch. Brightness uses WLED's `bri` range 0-255, not RV-C percent.
 See the supplied `wled_light` template.
 
+### Source-owned action interface
+
+Existing coach/installation YAML does not need to change. Coach still resolves
+entity actions, placeholders, confirmation, groups and per-frame waits. It now
+passes each resolved frame to a `WritableSource` adapter, rather than encoding
+CAN frames or constructing WLED state updates itself.
+
+The writable-source contract is implemented by RV-C and WLED:
+
+| Method | Contract |
+| --- | --- |
+| `supported_actions()` | Return source-owned action definitions and parameter schemas, without hardware access. |
+| `describe_actions()` | Return a fresh JSON-compatible description of those actions. |
+| `translate_frame(frame)` | Map an existing YAML frame to a source action name and parameters. Coach removes `wait` first. |
+| `prepare_action(name, params, section, reserved=...)` | Validate and encode without constructing sources or contacting hardware. Return an immutable snapshot and a dispatch planning budget. |
+| `execute_action(name, params)` | Recheck source write permission/readiness, validate again, and dispatch once; failures raise. |
+| `handle_action(name, params)` | Compatibility adapter for local `coach-exec`, retaining the legacy command handler's logging behavior. |
+
+Discovery and preparation are class methods, so preflight does not create extra
+HTTP sessions or CAN sources. Unknown actions/parameters, missing required
+parameters, invalid types and out-of-range values are rejected. Parameters with
+a `default` in their source schema are optional; other parameters are required.
+Source schemas also support object parameters for advanced state updates and
+string/integer alternatives for RV-C command codes. Prepared parameter/payload
+accessors return independent copies.
+
+Inspect supported names and exact contracts without starting collectors:
+
+```sh
+rvcontrol --config config.ini source-actions rvc
+rvcontrol --config config.ini source-actions wled
+```
+
+RV-C advertises `dc_dimmer` (instance, command, optional group/percent level/delay/
+interlock) and `frame` (DGN and hexadecimal payload). Its adapter retains named
+and numeric command support, canonical protocol encoding, address settings,
+eight-byte padding and coach reserved-instance checks.
+
+WLED advertises `on`, `off`, `brightness`, `color`, `effect`, `palette`,
+`transition`, `preset` and an advanced `state` action accepting a non-empty JSON
+state object. Exact existing lighting recipes translate into named actions;
+other JSON updates use `state` without dropping custom fields. The destination
+always comes from the configured source, never action parameters. Source
+validation also applies to recognized local coach recipes; this does not add
+controller-policy validation to local `coach-exec`.
+
+Source action names are separate from entity-facing action names. For example,
+an entity's `on` can map to RV-C `dc_dimmer`, while a WLED entity's custom
+`evening` action can map to `preset`. Entity `action_schemas` and controller
+policies remain unchanged and can restrict access further.
+
+Catalogs describe implemented support, not controller authorization, current
+readiness, discovered firmware features, or verified physical outcomes. The
+existing MQTT `capabilities` query continues to describe authorized **entity**
+actions, not grant access to raw source actions. No MQTT topics or configuration
+keys are added.
+
+The semantic executor sums source-provided budgets instead of branching on
+transport type. RV-C reserves its one-second send timeout; WLED reserves three
+times its configured timeout for lock/connection/response waits. The semantic
+30-second plan limit therefore still limits WLED timeouts to at most ten
+seconds; larger positive timeouts remain usable locally. This is a planning
+budget, not a strict total HTTP deadline. Each YAML frame remains one journaled
+dispatch step, preserving existing partial/unknown outcome accounting and
+no-retry behavior.
+
 ### WLED controls and discovery
 
 The Python source provides read-only `effects()` and `palettes()` catalogs via

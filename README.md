@@ -98,6 +98,19 @@ List the coach entities and command groups:
 rv-control --config config.ini coach-list
 ```
 
+Inspect source-owned action names, parameter schemas and descriptions without
+contacting hardware:
+
+```sh
+rv-control --config config.ini source-actions rvc
+rv-control --config config.ini source-actions wled
+```
+
+Coach translates existing YAML actions to these source contracts; no YAML
+migration is required. Source catalogs describe implemented support, not write
+permission or current device availability. See the
+[source action interface](docs/COACH.md#source-owned-action-interface).
+
 Execute an action on a coach entity or command group (`-p` supplies action parameters; `--confirm` is required for entities marked `confirm`, such as the generator):
 
 ```sh

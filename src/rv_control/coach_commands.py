@@ -24,6 +24,7 @@ from .coach import Coach
 from .coach_queries import CoachQueries
 from .coach_state import EntityStateTracker
 from .sources.base import Source
+from .sources.writable import SourceAction, WritableSource
 
 LOGGER = logging.getLogger(__name__)
 IDENTIFIER = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
@@ -180,7 +181,7 @@ class ActionStep:
     entity: str
     section: str
     wait: float
-    payload: dict[str, Any]
+    action: SourceAction
 
 
 class ControllerPolicy:
@@ -543,30 +544,26 @@ class CoachCommandService:
                 raise CommandError("confirmation_required", "Deliberate user confirmation is required")
             try:
                 section = self.coach.resolve_config_section(entity, entity_name)
-                frames = self.coach.prepare_action(entity_name, member_action, params)
+                frames = self.coach.prepare_source_actions(entity_name, member_action, params)
             except (KeyError, ValueError, PermissionError) as error:
                 raise CommandError("invalid_params", "Configured action cannot be preflighted") from error
             if not frames:
                 raise CommandError("invalid_request", "Action has no transport operations")
             if availability:
                 self._check_source(section)
-            transport = entity.get("transport")
-            timeout = self.config.getfloat(section, "timeout", fallback=5.0) if transport == "wled" else 1.0
-            if not math.isfinite(timeout) or not 0 < timeout <= 10:
-                raise CommandError("invalid_request", "Source timeout is not safely bounded")
-            for wait, payload in frames:
-                duration += wait + (3 * timeout if transport == "wled" else timeout)
-                plan.append(ActionStep(entity_name, section, wait, payload))
+            for wait, prepared in frames:
+                duration += wait + prepared.dispatch_budget_seconds
+                plan.append(ActionStep(entity_name, section, wait, prepared))
                 if len(plan) > 64 or duration > 30:
                     raise CommandError("invalid_request", "Action plan exceeds 64 steps or 30 seconds")
         return plan
 
-    def _check_source(self, section: str) -> Source:
+    def _check_source(self, section: str) -> WritableSource:
         """Recheck every write gate and require an existing, ready daemon source."""
         if not self.enabled or not self.config[self.mqtt_section].getboolean("write_enabled", fallback=False) or not self.config[section].getboolean("write_enabled", fallback=False):
             raise CommandError("writes_disabled", "Physical writes are disabled")
         source = self.sources.get(section)
-        if source is None or not source.command_ready():
+        if not isinstance(source, WritableSource) or not source.command_ready():
             raise CommandError("source_unavailable", "Required source is unavailable")
         return source
 
@@ -636,7 +633,7 @@ class CoachCommandService:
                         if self.clock() >= expires:
                             raise CommandError("expired", "Request expired while recording execution intent")
                     attempted = True
-                    source.execute_command(step.payload)
+                    source.execute_action(step.action.name, step.action.params)
                     completed += 1
                     progress[step.entity] = progress.get(step.entity, 0) + 1
                 result = self.result(request, "completed", "executed", "Configured action dispatched; physical state is not confirmed")

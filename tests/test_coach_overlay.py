@@ -39,6 +39,8 @@ def test_overlay_adds_wled_actions_without_mutating_factory(config_file: Path) -
     config = load_config(str(config_file))
     factory = Coach.load(config)
     before = copy.deepcopy(factory.data)
+    with config_file.open("a") as handle:
+        handle.write("\n[wled_patio]\ntype = wled\n")
     merged = load_overlay(config_file, load_coach_yaml(path))
     assert merged.prepare_action("patio_light", "color", {
         "segment": 0, "red": 1, "green": 2, "blue": 3,

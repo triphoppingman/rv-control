@@ -16,13 +16,15 @@ from rv_control.coach_commands import (
     parse_json, timestamp, validate_envelope,
 )
 from rv_control.coach_state import EntityStateTracker
-from rv_control.sources.base import Source
+from rv_control.sources.rvc import RvcSource
+from rv_control.sources.wled import WledSource
 
 
-class FakeSource(Source):
+class FakeSource(RvcSource):
     """Capture reliable commands without hardware and expose controllable readiness."""
 
     supports_status_requests = True
+    source_name = "source"
 
     def __init__(self, config: ConfigParser) -> None:
         """Initialize an inert source with deterministic readiness."""
@@ -54,6 +56,11 @@ class FakeSource(Source):
         if self.failure:
             raise self.failure
         self.calls.append(payload)
+
+    def execute_action(self, action: str, params: dict[str, Any]) -> None:
+        """Capture the real source encoder output without touching either transport."""
+        source_type = RvcSource if action in RvcSource.supported_actions() else WledSource
+        self.execute_command(source_type.prepare_action(action, params, self.section).payload)
 
     def request_status(self, dgns: list[int]) -> None:
         """Do not touch a bus from query tests."""
@@ -263,6 +270,36 @@ def test_wled_semantic_params_remain_transport_specific(service_env: Any) -> Non
     assert dispatch(service_env, dict(request, request_id="wrong-param", params={"level": 32}))["code"] == "invalid_params"
     assert dispatch(service_env, dict(request, request_id="out-of-range", params={"bri": 256}))["code"] == "invalid_params"
     assert len(wled.calls) == 1
+
+
+def test_wled_source_budget_preserves_exact_plan_limit(service_env: Any) -> None:
+    """A ten-second WLED timeout fits one 30-second plan; larger timeouts do not."""
+    service, _source, _results, clock, _tracker = service_env
+    service.sources["wled_patio"] = FakeSource(service.config)
+    service.config["wled_patio"].update(write_enabled="true", timeout="10")
+    request = envelope(clock, target="patio_light", action="on")
+    plan = service._plan(request)
+    assert plan[0].action.name == "on"
+    assert plan[0].action.dispatch_budget_seconds == 30
+    service.config["wled_patio"]["timeout"] = "10.001"
+    with pytest.raises(CommandError) as error:
+        service._plan(request)
+    assert error.value.code == "invalid_request"
+
+
+def test_source_actions_preserve_exact_step_limit(service_env: Any) -> None:
+    """Fast WLED operations still cannot exceed the independent 64-step bound."""
+    service, _source, _results, clock, _tracker = service_env
+    service.sources["wled_patio"] = FakeSource(service.config)
+    service.config["wled_patio"].update(write_enabled="true", timeout="0.001")
+    frames = [{"on": True} for _ in range(64)]
+    service.coach.entities["patio_light"]["actions"]["on"] = frames
+    request = envelope(clock, target="patio_light", action="on")
+    assert len(service._plan(request)) == 64
+    frames.append({"on": True})
+    with pytest.raises(CommandError) as error:
+        service._plan(request)
+    assert error.value.code == "invalid_request"
 
 
 def test_group_preflight_is_all_or_nothing(service_env: Any) -> None:

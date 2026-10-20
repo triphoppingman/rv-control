@@ -104,7 +104,6 @@ def test_run_wires_commands_to_running_source_map(monkeypatch: Any, config_file:
     import json
     import threading
     import time
-    from types import SimpleNamespace
 
     import rv_control.cli as cli_module
     from rv_control.coach_commands import timestamp
@@ -126,11 +125,14 @@ def test_run_wires_commands_to_running_source_map(monkeypatch: Any, config_file:
     mqtt.close = lambda: closed.append(True)
     mqtt.publish = lambda *_args: None
     mqtt.publish_result = lambda _topic, payload, _wait=False: results.append(payload)
-    source = SimpleNamespace(
-        command_ready=lambda: True, execute_command=calls.append,
-        is_alive=lambda: True, join=lambda **_kwargs: None,
-        supports_status_requests=False,
-    )
+    from rv_control.sources.rvc import RvcSource
+    from rv_control.config import load_config
+    source = RvcSource(load_config(str(config_file)), None, threading.Event(), "rv_c_bus")
+    source.command_ready = lambda: True
+    source.execute_command = calls.append
+    source.is_alive = lambda: True
+    source.join = lambda **_kwargs: None
+    source.supports_status_requests = False
     monkeypatch.setattr(cli_module.Target, "build", lambda *_args: mqtt)
     monkeypatch.setattr(cli_module.Source, "start_enabled", lambda *_args: ([source], {"rv_c_bus": source}))
 

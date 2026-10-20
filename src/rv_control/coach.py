@@ -15,15 +15,8 @@ from typing import Any
 from ruamel.yaml import YAML
 from ruamel.yaml.error import YAMLError
 
-from .rvc_util import (
-    DC_DIMMER_COMMAND_DGN,
-    RV_C_PRIORITY,
-    SOURCE_ADDRESS,
-    build_can_id,
-    dc_dimmer_payload,
-    normalize_can_payload,
-)
 from .sources.base import Source
+from .sources.writable import SourceAction, WritableSource, action_integer as _as_int
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_COACH_SPEC = str(Path(__file__).resolve().parent / "coaches/thor-magnitude-bh35-2020.yml")
@@ -107,33 +100,6 @@ def merge_definitions(base: dict[str, Any], override: dict[str, Any]) -> dict[st
         else:
             merged[key] = copy.deepcopy(value)
     return merged
-
-
-def _as_int(value: Any, field_name: str) -> int:
-    """Convert an integer or integer string (decimal or ``0x`` hex) from YAML or the CLI.
-
-    Parameters
-    ----------
-    value : Any
-        Value to convert.
-    field_name : str
-        Field name used in error messages.
-
-    Returns
-    -------
-    int
-        Parsed integer.
-    """
-    if isinstance(value, bool):
-        raise ValueError(f"{field_name} must be an integer: {value!r}")
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str):
-        try:
-            return int(value, 0)
-        except ValueError:
-            pass
-    raise ValueError(f"{field_name} must be an integer: {value!r}")
 
 
 def load_coach_yaml(path: str | Path) -> dict[str, Any]:
@@ -340,8 +306,10 @@ class Coach:
         if set(self.entities) & set(self.command_groups):
             raise ValueError("Entity and group names must not overlap")
         for name, entity in self.entities.items():
-            if entity.get("actions") and entity.get("transport") not in {"rvc", "wled"}:
-                raise ValueError(f"Entity {name!r} uses unsupported transport")
+            if entity.get("actions"):
+                source_type = Source.source_class(str(entity.get("transport", "")))
+                if not issubclass(source_type, WritableSource):
+                    raise ValueError(f"Entity {name!r} uses a source without action support")
             for action, schema in entity.get("action_schemas", {}).items():
                 if action not in entity["actions"]:
                     raise ValueError(f"Entity {name!r} schema references unknown action {action!r}")
@@ -583,8 +551,10 @@ class Coach:
             raise PermissionError(f"{entity_name} {action_name} requires confirmation (--confirm)")
         transport = str(entity.get("transport", "")).lower()
         config_section = self.resolve_config_section(entity, entity_name)
-        built = self.prepare_action(entity_name, action_name, kwargs)
+        built = self.prepare_source_actions(entity_name, action_name, kwargs)
         source = self.get_source(config_section)
+        if not isinstance(source, WritableSource):
+            raise ValueError(f"Source [{config_section}] does not support actions")
         result: dict[str, Any] = {
             "status": "ok",
             "target": entity_name,
@@ -593,38 +563,52 @@ class Coach:
             "config_section": config_section,
         }
 
-        if transport == "rvc":
-            for wait, payload in built:
-                if wait:
-                    self.sleep(wait)
-                source.handle_command(payload)
-            result["frames"] = [{"can_id": payload["can_id"], "data": payload["data"], "wait": wait} for wait, payload in built]
-            return result
-        if transport == "wled":
-            for wait, payload in built:
-                if wait:
-                    self.sleep(wait)
-                source.handle_command(payload)
-            result["frames"] = [payload for _wait, payload in built]
-            return result
-        raise ValueError(f"Entity {entity_name!r} uses unsupported transport {transport!r}")
+        for wait, prepared in built:
+            if wait:
+                self.sleep(wait)
+            source.handle_action(prepared.name, prepared.params)
+        result["frames"] = [
+            {**prepared.payload, "wait": wait} if transport == "rvc" else prepared.payload
+            for wait, prepared in built
+        ]
+        return result
 
     def prepare_action(
         self, entity_name: str, action_name: str, params: dict[str, Any],
     ) -> list[tuple[float, dict[str, Any]]]:
-        """Build an entire entity action without opening hardware or sending any frames."""
+        """Return legacy payload previews using the source-owned action preparation."""
+        return [
+            (wait, prepared.payload)
+            for wait, prepared in self.prepare_source_actions(entity_name, action_name, params)
+        ]
+
+    def prepare_source_actions(
+        self, entity_name: str, action_name: str, params: dict[str, Any],
+    ) -> list[tuple[float, SourceAction]]:
+        """Translate unchanged YAML to validated source actions without creating sources."""
         entity = self.entities[entity_name]
         frames = entity.get("actions", {}).get(action_name)
         if frames is None:
             raise ValueError(f"Action {action_name!r} not supported by entity {entity_name!r}")
         frames = substitute_placeholders(frames, params, strict=True)
-        transport = entity.get("transport")
-        if transport == "rvc":
-            section = self.resolve_config_section(entity, entity_name)
-            return [self._build_rvc_frame(frame, section) for frame in frames]
-        if transport == "wled":
-            return [self._build_wled_frame(frame) for frame in frames]
-        raise ValueError(f"Entity {entity_name!r} uses unsupported transport {transport!r}")
+        section = self.resolve_config_section(entity, entity_name)
+        if not self.config.has_section(section):
+            raise ValueError(f"Config section [{section}] not found in configuration")
+        source_type = Source.source_class(self.config[section].get("type", "").strip())
+        if not issubclass(source_type, WritableSource):
+            raise ValueError(f"Source [{section}] does not support actions")
+        if source_type.source_name != entity.get("transport"):
+            raise ValueError(f"Source [{section}] does not match entity transport")
+        prepared: list[tuple[float, SourceAction]] = []
+        for frame in frames:
+            wait = self._frame_wait(frame)
+            action, source_params = source_type.translate_frame({
+                key: value for key, value in frame.items() if key != "wait"
+            })
+            prepared.append((wait, source_type.prepare_action(
+                action, source_params, self.config[section], reserved=self.reserved,
+            )))
+        return prepared
 
     def _resolve_template(self, template_name: str, chain: tuple[str, ...] = ()) -> dict[str, Any]:
         """Return a template merged with the templates it ``extends``.
@@ -747,78 +731,6 @@ class Coach:
         payload = frame.get("payload")
         if isinstance(payload, str) and len(payload) >= 2:
             self._check_reserved(dgn, int(payload[:2], 16), f"Entity {entity_name!r}")
-
-    def _build_rvc_frame(self, frame: dict[str, Any], config_section: str) -> tuple[float, dict[str, Any]]:
-        """Build and validate one RV-C frame for ``RvcSource.handle_command``.
-
-        A frame either carries a raw hexadecimal ``payload`` or, for
-        DC_DIMMER_COMMAND_2, named fields (``instance``, ``group``, ``level``
-        percent, ``command``, ``delay``, ``interlock``). Short payloads are
-        padded with 0xFF to eight bytes, matching the coach's own panels.
-
-        Parameters
-        ----------
-        frame : dict[str, Any]
-            Frame definition with all placeholders substituted.
-        config_section : str
-            RV-C configuration section providing ``priority`` and ``source``.
-
-        Returns
-        -------
-        tuple[float, dict[str, Any]]
-            Seconds to wait before sending, and the source command payload.
-        """
-        if not self.config.has_section(config_section):
-            raise ValueError(f"Config section [{config_section}] not found in configuration")
-        section = self.config[config_section]
-        priority = section.getint("priority", fallback=RV_C_PRIORITY)
-        source_addr = section.getint("source", fallback=SOURCE_ADDRESS)
-        dgn = _as_int(frame.get("dgn", DC_DIMMER_COMMAND_DGN), "dgn")
-
-        if "payload" in frame:
-            try:
-                data = normalize_can_payload(bytes.fromhex(str(frame["payload"])))
-            except ValueError as error:
-                raise ValueError(f"Invalid RV-C payload {frame['payload']!r}: {error}") from error
-            instance = data[0] if data else None
-        elif dgn == DC_DIMMER_COMMAND_DGN:
-            if "command" not in frame:
-                raise ValueError("DC dimmer frame needs a 'command'")
-            instance = _as_int(frame.get("instance"), "instance")
-            level = frame.get("level", 100)
-            if isinstance(level, str):
-                level = float(level)
-            data = dc_dimmer_payload(
-                instance,
-                _as_int(frame.get("group", 0xFF), "group"),
-                level,
-                frame["command"],
-                _as_int(frame.get("delay", 0xFF), "delay"),
-                _as_int(frame.get("interlock", 0), "interlock"),
-            )
-        else:
-            raise ValueError(f"Frame for DGN 0x{dgn:05X} needs a hexadecimal 'payload'")
-
-        self._check_reserved(dgn, instance, "Frame")
-        data = data.ljust(8, b"\xff")
-        can_id = build_can_id(priority, dgn, source_addr)
-        return self._frame_wait(frame), {"can_id": f"0x{can_id:08X}", "data": data.hex().upper()}
-
-    def _build_wled_frame(self, frame: dict[str, Any]) -> tuple[float, dict[str, Any]]:
-        """Split a WLED frame into its pre-send wait and JSON state payload.
-
-        Parameters
-        ----------
-        frame : dict[str, Any]
-            WLED JSON state fields, optionally with ``wait``.
-
-        Returns
-        -------
-        tuple[float, dict[str, Any]]
-            Seconds to wait before sending, and the WLED state payload.
-        """
-        payload = {key: value for key, value in frame.items() if key != "wait"}
-        return self._frame_wait(frame), payload
 
     @staticmethod
     def _frame_wait(frame: dict[str, Any]) -> float:

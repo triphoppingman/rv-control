@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 from ..rvc_util import (
@@ -61,18 +61,83 @@ from ..rvc_util import (
     spec_dgn,
     spec_payload_length,
 )
-from .base import Source
+from .writable import ActionDefinition, WritableSource, action_integer
 
 
 LOGGER = logging.getLogger(__name__)
 
 
-class RvcSource(Source, source_name="rvc"):
+class RvcSource(WritableSource, source_name="rvc"):
     """RV-C source lifecycle and integration with the shared utility library."""
 
     source_name = "rvc"
     config_section = "rv_c"
     supports_status_requests = True
+
+    @classmethod
+    def supported_actions(cls) -> dict[str, ActionDefinition]:
+        """Describe named dimmer commands and arbitrary bounded RV-C payload frames."""
+        byte = {"type": "integer", "min": 0, "max": 255}
+        return {
+            "dc_dimmer": ActionDefinition("Send DC_DIMMER_COMMAND_2 with percent brightness.", {
+                "instance": dict(byte),
+                "command": {"type": ["string", "integer"], "enum": [*DC_DIMMER_COMMANDS, *range(256)]},
+                "group": {**byte, "default": 255},
+                "level": {"type": "number", "min": 0, "max": 100, "default": 100},
+                "delay": {**byte, "default": 255},
+                "interlock": {"type": "integer", "min": 0, "max": 3, "default": 0},
+            }),
+            "frame": ActionDefinition("Send a DGN with up to eight hexadecimal payload bytes.", {
+                "dgn": {"type": "integer", "min": 0, "max": 0x1FFFF},
+                "payload": {"type": "string"},
+            }),
+        }
+
+    @classmethod
+    def translate_frame(cls, frame: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
+        """Translate existing named/raw coach frames without changing their YAML format."""
+        dgn = action_integer(frame.get("dgn", DC_DIMMER_COMMAND_DGN), "dgn")
+        if "payload" in frame:
+            return "frame", {"dgn": dgn, "payload": frame["payload"]}
+        if dgn != DC_DIMMER_COMMAND_DGN:
+            raise ValueError(f"Frame for DGN 0x{dgn:05X} needs a hexadecimal 'payload'")
+        params = {key: value for key, value in frame.items() if key != "dgn"}
+        for name in ("instance", "group", "delay", "interlock"):
+            if name in params:
+                params[name] = action_integer(params[name], name)
+        if isinstance(params.get("level"), str):
+            params["level"] = float(params["level"])
+        command = params.get("command")
+        if isinstance(command, str):
+            params["command"] = command.lower() if command.lower() in DC_DIMMER_COMMANDS else action_integer(command, "command")
+        return "dc_dimmer", params
+
+    @classmethod
+    def _encode_action(
+        cls, action: str, params: dict[str, Any], section: Mapping[str, str],
+        *, reserved: Mapping[int, set[int]] | None = None,
+    ) -> dict[str, Any]:
+        """Encode using canonical RV-C helpers and enforce coach safety reservations."""
+        if action == "frame":
+            dgn = params["dgn"]
+            data = normalize_can_payload(bytes.fromhex(params["payload"]))
+        else:
+            dgn = DC_DIMMER_COMMAND_DGN
+            data = dc_dimmer_payload(
+                params["instance"], params["group"], params["level"],
+                params["command"], params["delay"], params["interlock"],
+            )
+        if data and data[0] in (reserved or {}).get(dgn, set()):
+            raise PermissionError(f"Frame: instance {data[0]} on DGN 0x{dgn:05X} is reserved")
+        priority = int(section.get("priority", str(RV_C_PRIORITY)))
+        source = int(section.get("source", str(SOURCE_ADDRESS)))
+        can_id = build_can_id(priority, dgn, source)
+        return {"can_id": f"0x{can_id:08X}", "data": data.ljust(8, b"\xff").hex().upper()}
+
+    @classmethod
+    def dispatch_budget(cls, section: Mapping[str, str]) -> float:
+        """Reserve the reliable CAN send timeout for each operation."""
+        return 1.0
 
     def __init__(self, config: Any, publisher: Any, stop_event: Any, section_name: str | None = None) -> None:
         """Initialize the RV-C source without opening the CAN bus yet."""

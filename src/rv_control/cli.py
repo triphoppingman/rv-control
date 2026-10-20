@@ -19,6 +19,7 @@ from .sources.obd import ObdSource
 from .sources.renogy import RenogySource
 from .sources.rvc import RvcSource
 from .sources.wled import WledSource
+from .sources.writable import WritableSource
 from .targets import log as _log, mqtt as _mqtt, store as _store  # noqa: F401  (register targets)
 from .targets.base import MultiTarget, Target
 from .targets.mqtt import MqttTarget
@@ -103,6 +104,19 @@ def coach_list(config: Any, coach_spec: str | None) -> None:
         }
         click.echo(json.dumps(result, indent=2, sort_keys=True, default=str))
     except (FileNotFoundError, ValueError, KeyError) as error:
+        raise click.ClickException(str(error)) from error
+
+
+@cli.command("source-actions")
+@click.argument("source_type")
+def source_actions(source_type: str) -> None:
+    """Describe a writable source type's actions without contacting hardware."""
+    try:
+        source_class = Source.source_class(source_type)
+        if not issubclass(source_class, WritableSource):
+            raise ValueError(f"Source {source_type!r} does not support actions")
+        click.echo(json.dumps(source_class.describe_actions(), indent=2, sort_keys=True))
+    except ValueError as error:
         raise click.ClickException(str(error)) from error
 
 

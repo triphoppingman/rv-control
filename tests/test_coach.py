@@ -55,22 +55,9 @@ def coach_env(config_file: Path, monkeypatch: Any) -> tuple[Coach, FakeBus, list
     )
     wled_calls: list[dict[str, Any]] = []
 
-    from rv_control.sources.base import Source
+    from rv_control.sources.wled import WledSource
 
-    class FakeWledSource(Source, source_name="wled"):
-        def __init__(self, _cfg: Any, publisher: Any = None, stop_event: Any = None, section_name: str = "") -> None:
-            self.section_name = section_name
-
-        def handle_command(self, payload: dict[str, Any]) -> None:
-            wled_calls.append(payload)
-
-        def comms_check(self) -> dict[str, Any]:
-            return {"ok": True}
-
-        def run(self) -> None:
-            pass
-
-    monkeypatch.setitem(Source._registry, "wled", FakeWledSource)
+    monkeypatch.setattr(WledSource, "handle_command", lambda _self, payload: wled_calls.append(payload))
     coach = Coach.load(config)
     bus = FakeBus()
     coach.get_source("rv_c_bus").bus = bus
