@@ -18,6 +18,7 @@ dist/
 config.ini
 config.local.ini
 coach-overlay.yml
+coach-command-controllers.yaml
 config.json
 *.local.ini
 *.log
