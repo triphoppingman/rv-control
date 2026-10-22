@@ -16,6 +16,7 @@ LOGGER = logging.getLogger(__name__)
 class HughesSource(Source, source_name="hughes"):
     """Hughes BLE telemetry source with optional daemon reconnects."""
     source_name = "hughes"
+    default_topic = "hughes"
     config_section = "hughes"
     LEGACY_HEADER = b"\x01\x03\x20"
     MODERN_HEADER = b"$yw@"

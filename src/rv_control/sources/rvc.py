@@ -4,6 +4,7 @@ import logging
 import threading
 import time
 from collections.abc import Iterable, Mapping
+from configparser import ConfigParser
 from typing import Any
 
 from ..rvc_util import (
@@ -73,6 +74,11 @@ class RvcSource(WritableSource, source_name="rvc"):
     source_name = "rvc"
     config_section = "rv_c"
     supports_status_requests = True
+
+    @classmethod
+    def published_topic_root(cls, config: ConfigParser, section_name: str) -> str:
+        """Describe the fixed RV-C publish root without changing existing topic behavior."""
+        return "rvc"
 
     @classmethod
     def supported_actions(cls) -> dict[str, ActionDefinition]:

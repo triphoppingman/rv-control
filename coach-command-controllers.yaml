@@ -1,0 +1,77 @@
+controllers:
+  rv-control-web:
+    actions:
+      living_ceiling_light: &dimmable
+        on: {}
+        off: {}
+        toggle: {}
+        brightness: {}
+      hall_light: *dimmable
+      bedroom_ceiling_light: *dimmable
+
+      kitchen_light: &switch
+        on: {}
+        off: {}
+        toggle: {}
+      dinette_light: *switch
+      rear_bath_light: *switch
+      sofa_light: *switch
+      mid_bath_light: *switch
+      accent_light: *switch
+      cargo_light: *switch
+      step_light: *switch
+      awning_light: *switch
+      vanity_light: *switch
+      kitchen_fan: *switch
+      mid_bath_fan: *switch
+      rear_bath_fan: *switch
+      water_pump: *switch
+      tank_heat: *switch
+
+      patio_strip:
+        on: {}
+        off: {}
+        brightness: {}
+
+      kitchen_fan_lid:
+        open: {confirm: true}
+        close: {confirm: true}
+      awning:
+        extend: {confirm: true}
+        retract: {confirm: true}
+      generator:
+        start: {confirm: true}
+        stop: {confirm: true}
+
+      front_ac:
+        cool: {}
+        heat: {}
+        fan_auto: {}
+        fan_high: {}
+        fan_low: {}
+        setpoint_down: {}
+        setpoint_up: {}
+        off: {}
+      rear_ac:
+        cool: {}
+        fan_high: {}
+        fan_low: {}
+        setpoint_down: {}
+        setpoint_up: {}
+        off: {}
+
+      all_interior_lights: &on_off
+        on: {}
+        off: {}
+      all_exterior_lights: *on_off
+      all_fans: *on_off
+      evening_scene:
+        activate: {}
+
+    queries:
+      refresh_states: {entities: ["*"]}
+      snapshot: {entities: ["*"]}
+      republish_states: {entities: ["*"]}
+      capabilities: {}
+      health: {}
+      request_status: {}

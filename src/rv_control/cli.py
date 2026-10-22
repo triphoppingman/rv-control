@@ -13,6 +13,7 @@ from .coach_commands import CoachCommandService, api_enabled
 from .coach_mqtt_client import mqtt_command, mqtt_query
 from .coach_state import CoachStatePublisher, wrap_publisher
 from .config import load_config
+from .runtime import RuntimeContext, RuntimePublisher
 from .sources.base import Source
 from .sources.hughes import HughesSource
 from .sources.obd import ObdSource
@@ -50,6 +51,10 @@ def cli(context: click.Context, config_path: str, verbose: bool) -> None:
 @click.pass_obj
 def check(config: Any) -> None:
     """Validate configuration without opening hardware connections."""
+    try:
+        RuntimeContext(config).validate_sources(config)
+    except ValueError as error:
+        raise click.ClickException(str(error)) from error
     click.echo(f"Configuration OK: {config['_meta']['path']}")
     for section in config["source"].get("enabled-sources", "").split(","):
         section = section.strip()
@@ -158,6 +163,11 @@ def coach_exec(
 @click.pass_obj
 def run(config: Any) -> None:
     """Run collectors until interrupted."""
+    try:
+        runtime = RuntimeContext(config)
+        runtime.validate_sources(config)
+    except ValueError as error:
+        raise click.ClickException(str(error)) from error
     stop_event = threading.Event()
     sources = []
     source_map = {}
@@ -182,13 +192,15 @@ def run(config: Any) -> None:
                 mqtt.coach_service = command_service
         except (ValueError, KeyError, OSError, sqlite3.Error) as error:
             raise click.ClickException(f"Unable to load coach entity state: {error}") from error
+        coach_publisher = publisher if isinstance(publisher, CoachStatePublisher) else None
+        publisher = RuntimePublisher(publisher, runtime)
         publisher.connect()
         sources, started_sources = Source.start_enabled(config, publisher, stop_event)
         source_map.update(started_sources)
         if not sources:
             raise click.ClickException("No sources are enabled")
-        if isinstance(publisher, CoachStatePublisher):
-            publisher.request_initial_status(source_map)
+        if coach_publisher is not None:
+            coach_publisher.request_initial_status(source_map)
         Source.run_until_stopped(config, publisher, stop_event, sources, source_map)
     except OSError as error:
         raise click.ClickException(f"Unable to connect to target: {error}") from error

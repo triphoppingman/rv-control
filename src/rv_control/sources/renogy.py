@@ -12,6 +12,7 @@ LOGGER = logging.getLogger(__name__)
 
 class RenogySource(Source, source_name="renogy"):
     source_name = "renogy"
+    default_topic = "renogy"
     config_section = "renogy"
     CLIENTS = {
         "RNG_CTRL": ("rv_control.sources.renogybt.RoverClient", "RoverClient"),

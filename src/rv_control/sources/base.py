@@ -18,6 +18,8 @@ class Source(threading.Thread, ABC):
     source_name = "source"
     config_section = "source"
     supports_status_requests = False
+    runtime_options: tuple[str, ...] = ()
+    default_topic: str | None = None
     _registry = {}
 
     def __init_subclass__(cls, *, source_name: str | None = None, **kwargs: Any) -> None:
@@ -55,6 +57,15 @@ class Source(threading.Thread, ABC):
         return tuple(sorted(cls._registry))
 
     @classmethod
+    def validate_config(cls, config: ConfigParser, section_name: str) -> None:
+        """Validate source-specific static settings without contacting hardware."""
+
+    @classmethod
+    def published_topic_root(cls, config: ConfigParser, section_name: str) -> str:
+        """Describe this instance's telemetry root for runtime dependency validation."""
+        return config[section_name].get("topic", cls.default_topic or section_name).strip().strip("/")
+
+    @classmethod
     def enabled_sources(cls, config: ConfigParser) -> tuple[tuple[str, type[Source]], ...]:
         """Return configured source instances as section names and source classes."""
         if not config.has_section("source"):
@@ -85,7 +96,10 @@ class Source(threading.Thread, ABC):
         """Run communication checks for every registered source."""
         results = {}
         for name, source_type in cls.enabled_sources(config):
-            results[name] = source_type(config, None, threading.Event(), name).comms_check()
+            try:
+                results[name] = source_type(config, None, threading.Event(), name).comms_check()
+            except ValueError as error:
+                results[name] = {"ok": False, "message": f"Invalid source configuration: {error}"}
         return results
 
     @classmethod
@@ -93,8 +107,8 @@ class Source(threading.Thread, ABC):
         """Interrogate every enabled source and return per-source results."""
         results = {}
         for name, source_type in cls.enabled_sources(config):
-            source = source_type(config, None, threading.Event(), name)
             try:
+                source = source_type(config, None, threading.Event(), name)
                 results[name] = {"ok": True, "data": source.interrogate()}
             except Exception as error:
                 LOGGER.exception("%s interrogation failed", name)
@@ -151,6 +165,15 @@ class Source(threading.Thread, ABC):
     def section(self) -> Any:
         """Return this source instance's configuration section."""
         return self.config[self.section_name]
+
+    def resolve_settings(self, settings: dict[str, str]) -> dict[str, Any]:
+        """Resolve supported settings atomically using the shared telemetry context."""
+        from ..runtime import RuntimeContext
+
+        context = getattr(self.publisher, "runtime_context", None)
+        if context is None:
+            context = RuntimeContext(self.config)
+        return context.resolve(settings)
 
     @abstractmethod
     def run(self) -> None:

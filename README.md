@@ -9,6 +9,7 @@ The runtime is self-contained and does not import code or configuration from ext
 - `src/rv_control/sources/hughes.py` contains the standalone Hughes BLE implementation.
 - `src/rv_control/sources/wled.py` contains the WLED local JSON API source.
 - `src/rv_control/sources/gpsd.py` contains the gpsd JSON TCP source.
+- `src/rv_control/sources/open_meteo.py` contains the opt-in Open-Meteo weather source.
 - `src/rv_control/sources/obd.py` contains the read-only ELM327 Bluetooth OBD-II PID source.
 
 ## User guide
@@ -37,6 +38,98 @@ pip install -e .
 ```
 
 The editable install provides both `rv-control` and `rvcontrol` commands. The equivalent module form is `python -m rv_control`.
+
+## Runtime variables and Open-Meteo weather
+
+The supplied example enables `gpsd, weather` in `[source] enabled-sources`
+alongside the other sources. For an existing configuration, add those entries
+to enable weather. The supplied example contains:
+
+```ini
+[gpsd]
+type = gpsd
+host = localhost
+port = 2947
+topic = gpsd
+
+[variables.location]
+topic = gpsd/TPV
+fields = latitude:lat, longitude:lon
+require = mode >= 2
+max_age = 300
+
+[weather]
+type = open_meteo
+latitude = ${location.latitude}
+longitude = ${location.longitude}
+poll_interval = 900
+timeout = 10
+retry_delay = 30
+max_retry_delay = 900
+current = temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m
+topic = weather
+```
+
+**Enabling weather sends your coordinates to Open-Meteo over HTTPS.** Remove
+`weather` from the example's enabled-source list to disable these requests.
+See [Open-Meteo](https://open-meteo.com/en/docs)
+for supported current-weather variables and applicable usage terms. This source
+uses the public forecast endpoint, without an API key. It does not enable writes
+or forward any other telemetry.
+
+Bindings observe exact internal telemetry topics, before the MQTT base prefix.
+They work with any source and any target combination, including without MQTT.
+Neither GPSD nor Open-Meteo knows about the other: configuration connects them.
+`fields` is a comma-separated list of `variable:payload.path` mappings; dotted
+paths traverse JSON objects. Only non-null, finite scalar values are accepted.
+`require` optionally compares a payload path with a JSON scalar using `==`,
+`!=`, `<`, `<=`, `>`, or `>=` (for example `mode >= 2` or `status == "ready"`).
+It is a single comparison, not Python or shell code.
+
+Each `[variables.NAME]` section exposes `${NAME.field}` variables. `[variables]`
+without a namespace exposes `$field` or `${field}`. `${location.latitude}` is
+the recommended spelling for namespaced variables. `$$` escapes a literal dollar
+sign; command substitution, environment lookup, defaults, and recursive variable
+expansion are not supported. A whole-value reference preserves its scalar type;
+embedded references produce strings. Resolution occurs only on source settings
+explicitly supporting runtime variables, currently Open-Meteo's `latitude` and
+`longitude`, not globally on INI values or action parameters.
+
+All fields in a binding update together from one report; an incomplete report or
+failed predicate invalidates the entire group, including the previous good fix.
+`max_age` is positive seconds since local receipt, measured with a monotonic
+clock (default 300); GPSD's report time is not used. Inputs are resolved from one
+atomic snapshot per request. There is no startup ordering requirement, persisted
+variable cache, or automatic fallback to stale coordinates or `0,0`.
+
+`check` and daemon startup validate bindings, references, enabled producers,
+source dependency cycles, and weather's static options without network access.
+Producer inference uses the longest matching source-declared topic prefix; use
+distinct, literal topic roots for source instances. Most sources use `topic`;
+RV-C retains its existing fixed `rvc` root. A binding for a disabled producer is
+allowed when no enabled consumer references it. Self-dependencies and ambiguous
+producer roots are rejected when consumed.
+
+The daemon checks missing/stale inputs at most every five seconds, without making
+HTTP requests, and polls weather every `poll_interval` seconds after success
+(default 900). HTTP/response failures use exponential backoff from `retry_delay`
+to `max_retry_delay` (defaults 30 and 900 seconds); `timeout` defaults to 10 seconds.
+All durations must be positive and finite. `latitude` must be within -90..90 and
+`longitude` within -180..180; both may instead be literal numbers for a fixed
+location. Static configuration is compiled once per source instance.
+
+Successful responses are published as JSON on `weather` (`rv/weather` with the
+default MQTT prefix), preserving Open-Meteo's forecast fields and units, plus
+`requested_location: {"latitude": ..., "longitude": ...}` and UTC `fetched_at`.
+Open-Meteo's returned grid coordinates can differ from the requested location.
+Failures do not publish a replacement forecast; downstream consumers must use
+`fetched_at` / `current.time` to recognize old stored or retained weather.
+
+`comms-check` and `interrogate` remain one-shot operations. With runtime-bound
+coordinates they fail promptly because those invocations have no live telemetry
+context; they do not start GPSD, reuse daemon state, or wait indefinitely.
+Use literal coordinates to test the weather API in isolation, or `run` to consume
+live bindings.
 
 ## Commands
 
@@ -72,6 +165,8 @@ Configuration OK: /path/to/config.ini
 rv_c_bus: rvc
 renogy_controller: renogy
 hughes_power_watchdog: hughes
+gpsd: gpsd
+weather: open_meteo
 ```
 
 Check communications for every configured source without starting the service:
