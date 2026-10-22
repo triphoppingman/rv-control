@@ -53,6 +53,10 @@ class OpenMeteoSource(Source, source_name="open_meteo"):
         )
         if not self.current:
             raise ValueError(f"[{self.section_name}] current must list weather variables")
+        daily = self.section.get("daily", "").strip()
+        self.daily = ",".join(field.strip() for field in daily.split(",") if field.strip())
+        if daily and not self.daily:
+            raise ValueError(f"[{self.section_name}] daily must list weather variables or be blank")
 
     @classmethod
     def validate_config(cls, config: ConfigParser, section_name: str) -> None:
@@ -84,9 +88,12 @@ class OpenMeteoSource(Source, source_name="open_meteo"):
         """Fetch one forecast or fail immediately if required variables are unavailable."""
         resolved = self.resolve_settings(self.coordinates)
         coordinates = {key: self._coordinate(resolved[key], key) for key in self.runtime_options}
+        params = {**coordinates, "current": self.current}
+        if self.daily:
+            params.update(daily=self.daily, timezone="auto", forecast_days=7)
         with requests.Session() as session:
             response = session.get(
-                FORECAST_URL, params={**coordinates, "current": self.current},
+                FORECAST_URL, params=params,
                 timeout=self.timeout,
             )
             response.raise_for_status()
@@ -100,6 +107,13 @@ class OpenMeteoSource(Source, source_name="open_meteo"):
             key in current for key in ("time", *self.current.split(","))
         ):
             raise ValueError("Open-Meteo response is missing requested current weather fields")
+        if self.daily:
+            daily = data.get("daily")
+            if not isinstance(daily, dict) or not all(
+                isinstance(daily.get(key), list) and len(daily[key]) == 7
+                for key in ("time", *self.daily.split(","))
+            ):
+                raise ValueError("Open-Meteo response is missing requested seven-day forecast fields")
         return {
             **data, "requested_location": coordinates,
             "fetched_at": datetime.now(timezone.utc).isoformat(),

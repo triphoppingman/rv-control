@@ -87,6 +87,70 @@ def test_literal_one_shot_request_and_output(
     assert closed == [True, True]
 
 
+def test_dashboard_selections_and_seven_day_output(
+    weather_config: ConfigParser, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Request the example dashboard fields and preserve aligned arrays and units."""
+    example = ConfigParser()
+    example.read(Path(__file__).resolve().parents[1] / "config-example.ini")
+    for key in ("current", "daily"):
+        weather_config["weather"][key] = example["weather"][key]
+    current_fields = example["weather"]["current"].split(",")
+    daily_fields = example["weather"]["daily"].split(",")
+    days = [f"2026-10-{day}" for day in range(22, 29)]
+    data = {
+        "current": {"time": "2026-10-22T12:00", **dict.fromkeys(current_fields, 1)},
+        "current_units": dict.fromkeys(current_fields, "unit"),
+        "daily": {"time": days, **{key: [None, 1, 2, 3, 4, 5, 6] for key in daily_fields}},
+        "daily_units": dict.fromkeys(daily_fields, "unit"),
+        "timezone": "America/New_York", "timezone_abbreviation": "EDT",
+        "utc_offset_seconds": -14400,
+    }
+    calls: list[dict[str, Any]] = []
+
+    def get(_session: Any, _url: str, **kwargs: Any) -> Response:
+        """Capture dashboard query parameters without accessing the network."""
+        calls.append(kwargs["params"])
+        return Response(data)
+
+    monkeypatch.setattr(requests.Session, "get", get)
+    source = OpenMeteoSource(weather_config, None, threading.Event(), "weather")
+    result = source.interrogate()
+    assert calls == [{
+        "latitude": 12.5, "longitude": -45.5,
+        "current": example["weather"]["current"], "daily": example["weather"]["daily"],
+        "timezone": "auto", "forecast_days": 7,
+    }]
+    for key, value in data.items():
+        assert result[key] == value
+    assert len(current_fields) == 15
+    assert len(daily_fields) == 18
+    assert len(result["daily"]["time"]) == 7
+
+
+@pytest.mark.parametrize("daily", [None, {}, {"time": ["today"]}, {
+    "time": ["today"] * 7, "temperature_2m_max": [20] * 6,
+}, {"time": "invalid", "temperature_2m_max": [20] * 7}])
+def test_incomplete_daily_response_rejected(
+    weather_config: ConfigParser, monkeypatch: pytest.MonkeyPatch, daily: Any,
+) -> None:
+    """Reject missing or misaligned requested daily data rather than publish success."""
+    weather_config["weather"]["daily"] = "temperature_2m_max"
+    data = {"current": {"time": "now", "temperature_2m": 20}, "daily": daily}
+    monkeypatch.setattr(requests.Session, "get", lambda *_args, **_kwargs: Response(data))
+    source = OpenMeteoSource(weather_config, None, threading.Event(), "weather")
+    with pytest.raises(ValueError, match="seven-day forecast"):
+        source.interrogate()
+
+
+def test_blank_daily_preserves_current_only(
+    weather_config: ConfigParser, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicitly blank daily option must not alter current-only API requests."""
+    weather_config["weather"]["daily"] = "  "
+    test_literal_one_shot_request_and_output(weather_config, monkeypatch)
+
+
 @pytest.mark.parametrize("response", [
     Response([], None), Response({"error": True, "reason": "bad field"}),
     Response({}), Response({"current": {}}),
@@ -113,7 +177,7 @@ def test_bad_response_closes_session(
     ("latitude", "nan"), ("longitude", "inf"), ("latitude", ""),
     ("timeout", "0"), ("timeout", "nan"), ("poll_interval", "-1"),
     ("retry_delay", "0"), ("max_retry_delay", "1"), ("current", ","),
-    ("latitude", "$(id)"), ("topic", ""),
+    ("latitude", "$(id)"), ("topic", ""), ("daily", ","),
 ])
 def test_static_validation_without_http(
     weather_config: ConfigParser, key: str, value: str,

@@ -66,7 +66,8 @@ poll_interval = 900
 timeout = 10
 retry_delay = 30
 max_retry_delay = 900
-current = temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m
+current = temperature_2m,relative_humidity_2m,apparent_temperature,is_day,precipitation,rain,showers,snowfall,weather_code,cloud_cover,pressure_msl,surface_pressure,wind_speed_10m,wind_direction_10m,wind_gusts_10m
+daily = weather_code,temperature_2m_max,temperature_2m_min,apparent_temperature_max,apparent_temperature_min,sunrise,sunset,daylight_duration,sunshine_duration,uv_index_max,precipitation_sum,rain_sum,showers_sum,snowfall_sum,precipitation_probability_max,wind_speed_10m_max,wind_gusts_10m_max,wind_direction_10m_dominant
 topic = weather
 ```
 
@@ -121,6 +122,25 @@ location. Static configuration is compiled once per source instance.
 Successful responses are published as JSON on `weather` (`rv/weather` with the
 default MQTT prefix), preserving Open-Meteo's forecast fields and units, plus
 `requested_location: {"latitude": ..., "longitude": ...}` and UTC `fetched_at`.
+The example requests expanded current conditions and a seven-day daily forecast.
+`daily` is an optional comma-separated Open-Meteo variable list; omitted or blank
+keeps the existing current-only behavior. With daily forecasts enabled, requests
+use `forecast_days=7` and `timezone=auto` so each day, sunrise, and sunset refer
+to the requested location's local calendar. Existing `current` selections and
+the default current fields are unchanged; update your deployed configuration to
+the selections above to obtain the expanded dashboard data.
+
+The same MQTT payload includes `current` / `current_units`, `daily` /
+`daily_units`, and the API's timezone metadata (`timezone`, `timezone_abbreviation`,
+`utc_offset_seconds`). Daily data uses parallel arrays: `daily.time[i]` identifies
+the date for `daily.temperature_2m_max[i]`, `daily.sunrise[i]`, and every other
+daily field at index `i`. There are seven entries, starting with today. Values
+may be JSON `null` where the API has no data; dashboards should display these
+as unavailable rather than zero. Read the supplied units rather than assuming
+Fahrenheit or mph (API defaults are Celsius, km/h, mm for rain, cm for snow,
+and seconds for durations). `weather_code` is the API's numeric WMO code and
+`is_day` is 1 for day and 0 for night. No hourly forecast is requested.
+
 Open-Meteo's returned grid coordinates can differ from the requested location.
 Failures do not publish a replacement forecast; downstream consumers must use
 `fetched_at` / `current.time` to recognize old stored or retained weather.
