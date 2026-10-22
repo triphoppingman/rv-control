@@ -151,7 +151,30 @@ Choose a different adapter or scan duration when needed:
 .venv/bin/python tools/bt_discovery.py --adapter hci0 --timeout 15
 ```
 
-The tool prints each matching device's family, Bluetooth address, advertised name, and signal strength. It does not connect to or modify any device. It scans BLE only; ELM327 OBD-II adapters use Bluetooth Classic and are discovered and paired with `bluetoothctl` as described in [ELM327 OBD-II adapter (Bluetooth Classic)](#elm327-obd-ii-adapter-bluetooth-classic).
+The default scan prints each matching device's family, Bluetooth address,
+advertised name, and signal strength without connecting. Include unknown devices
+and advertisement bytes, or explicitly inspect a selected device:
+
+```sh
+.venv/bin/python tools/bt_discovery.py --all --details
+.venv/bin/python tools/bt_discovery.py --all --output scan.json
+.venv/bin/python tools/bt_discovery.py --adapter hci0 inspect DEVICE_ADDRESS --output gatt.json
+.venv/bin/python tools/bt_discovery.py read DEVICE_ADDRESS --characteristic CHARACTERISTIC_UUID
+.venv/bin/python tools/bt_discovery.py listen DEVICE_ADDRESS --characteristic CHARACTERISTIC_UUID --duration 30 --output capture.jsonl
+```
+
+`inspect` enumerates GATT metadata, `read` accesses only a selected readable
+characteristic, and `listen` streams bounded raw notifications. No arbitrary
+application writes or explicit pairing are implemented; notification subscription
+can write BLE subscription descriptors. Output files must be new. Shared
+`--adapter`/`--timeout` options go before subcommands. Close the phone app and
+coordinate collector ownership before connecting.
+
+See the [unknown BLE device discovery job aid](docs/BLE-DISCOVERY.md) for the
+human/AI-agent workflow, capture formats, limits and protocol-evidence checklist.
+The tool scans BLE only; ELM327 OBD-II adapters use Bluetooth Classic and are
+discovered and paired with `bluetoothctl` as described in
+[ELM327 OBD-II adapter (Bluetooth Classic)](#elm327-obd-ii-adapter-bluetooth-classic).
 
 ## Targets
 

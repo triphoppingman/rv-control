@@ -24,6 +24,15 @@ PLACEHOLDER_PATTERN = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 MAX_FRAME_WAIT_SECONDS = 60.0
 CONFIRM_VALUES = {"1", "true", "yes", "y", "on"}
 
+# Flow map:
+#   load -> parse base/overlay -> __init__ -> resolve templates/entities.
+#   execute -> expand groups -> execute_entity -> prepare_source_actions -> send.
+#   Semantic MQTT takes a different execution path: CoachCommandService expands
+#   and authorizes the whole plan, calls prepare_source_actions here, then uses
+#   the running sources directly for journaled execute_action dispatch.
+# Loading and preparation do not open hardware. Only the local execution path
+# obtains source instances here; protocol encoding belongs to WritableSource.
+
 
 def substitute_placeholders(value: Any, context: dict[str, Any], strict: bool) -> Any:
     """Replace ``{name}`` placeholders in a nested YAML value from a context mapping.
@@ -58,6 +67,8 @@ def substitute_placeholders(value: Any, context: dict[str, Any], strict: bool) -
         return [substitute_placeholders(item, context, strict) for item in value]
     if not isinstance(value, str):
         return value
+    # Preserve scalar types for whole placeholders; embedded replacements below
+    # are text. This distinction keeps JSON booleans/numbers from becoming strings.
     whole = PLACEHOLDER_PATTERN.fullmatch(value)
     if whole and whole.group(1) in context:
         return context[whole.group(1)]
@@ -93,6 +104,8 @@ def merge_definitions(base: dict[str, Any], override: dict[str, Any]) -> dict[st
     dict[str, Any]
         Newly allocated merged definition.
     """
+    # This is inheritance, not overlay merging: child actions may replace parent
+    # actions, while unrelated inherited actions remain available.
     merged = copy.deepcopy(base)
     for key, value in override.items():
         if key in {"actions", "action_schemas"} and isinstance(value, dict) and isinstance(merged.get(key), dict):
@@ -129,6 +142,8 @@ def merge_coach_overlay(
     base: dict[str, Any], additions: dict[str, Any], label: str, path: str = "",
 ) -> dict[str, Any]:
     """Add mapping keys without replacing existing values or command sequences."""
+    # Overlays are additive, unlike template inheritance. Existing sequences
+    # cannot be patched/reordered; only safety reservations may be extended.
     merged = copy.deepcopy(base)
     for key, value in additions.items():
         location = f"{path}.{key}" if path else str(key)
@@ -147,6 +162,8 @@ def merge_coach_overlay(
 
 def _require_preserved(base: Any, merged: Any, label: str, path: str) -> None:
     """Reject effective overrides of inherited factory values after resolution."""
+    # Comparing raw YAML is insufficient: a new entity-level key could override
+    # an inherited value without colliding with a key in the raw factory entity.
     if path.endswith(".state") or ".action_schemas." in path:
         if type(base) is not type(merged) or base != merged:
             raise ValueError(f"Coach overlay {label}: changes inherited definition {path}")
@@ -192,6 +209,7 @@ def find_coach_file(spec_identifier: str | Path | None = None) -> Path:
 class Coach:
     """Resolve coach entities from templates and execute entity and group actions."""
 
+    # Construction/loading: turn declarative YAML into effective entity mappings.
     def __init__(
         self,
         config: ConfigParser,
@@ -220,6 +238,8 @@ class Coach:
         self.info: dict[str, Any] = data.get("coach", {})
         self.command_groups: dict[str, Any] = data.get("command_groups", {}) or {}
         self.templates: dict[str, Any] = data.get("templates", {}) or {}
+        # Reservations must exist before entity resolution performs static checks.
+        # Resolve into new mappings so template reuse does not share mutable actions.
         self.reserved: dict[int, set[int]] = self._load_reserved(data.get("reserved", []))
         self.entities: dict[str, dict[str, Any]] = {
             name: self._resolve_entity(name, definition)
@@ -250,6 +270,8 @@ class Coach:
         Coach
             Initialized Coach instance.
         """
+        # Explicit caller selection wins, followed by coach settings, the legacy
+        # service setting, and finally find_coach_file's packaged default.
         if coach_spec is None and config.has_section("coach"):
             coach_spec = (
                 config["coach"].get("specfile", "").strip()
@@ -264,6 +286,7 @@ class Coach:
         overlay = config.get("coach", "overlay", fallback="").strip()
         if not overlay:
             return cls(config=config, data=data, coach_file=file_path, sources=sources)
+        # Overlay paths follow the INI location, not the process working directory.
         config_path = Path(config.get("_meta", "path", fallback="config.ini")).resolve()
         overlay_path = (config_path.parent / overlay).resolve()
         try:
@@ -279,6 +302,9 @@ class Coach:
                 for name, definition in additions.get(section, {}).items():
                     if not isinstance(name, str) or not name or not isinstance(definition, dict):
                         raise ValueError(f"Overlay {section} entries need names and mapping definitions")
+            # Build both effective models: first reject raw collisions during
+            # merge, then check that inheritance did not indirectly change factory
+            # templates/entities. Only the merged model receives supplied sources.
             factory = cls(config=config, data=data, coach_file=file_path)
             merged = merge_coach_overlay(data, additions, str(overlay_path))
             coach = cls(config=config, data=merged, coach_file=file_path, sources=sources)
@@ -288,6 +314,8 @@ class Coach:
                     str(overlay_path), f"templates.{name}",
                 )
             _require_preserved(factory.entities, coach.entities, str(overlay_path), "entities")
+            # Full overlay validation follows resolution, so it sees inherited
+            # actions, substituted entity values, and newly added group members.
             coach._validate_overlay()
         except (ValueError, KeyError, TypeError, AttributeError, PermissionError, YAMLError) as error:
             raise ValueError(f"Invalid coach overlay {overlay_path}: {error}") from error
@@ -295,9 +323,13 @@ class Coach:
 
     def _validate_overlay(self) -> None:
         """Validate merged mappings, state, schemas and group references without hardware."""
+        # These modules depend on Coach; import their validators only after this
+        # module has loaded. The temporary tracker validates state without publishing.
         from .coach_commands import validate_schema
         from .coach_state import EntityStateTracker
 
+        # Validate even unused templates, then entity-level declarations. Runtime
+        # placeholders cannot yet be encoded; source preparation checks them later.
         for name in self.templates:
             self._resolve_template(name)
         for dgn, instances in self.reserved.items():
@@ -321,6 +353,8 @@ class Coach:
                         raise ValueError(f"Entity {name!r} action {action!r} has an empty WLED frame")
         EntityStateTracker(self, lambda _topic, _payload: None)
 
+        # Walk each group/action as a graph. Track only the current ancestry:
+        # reusing an entity in different branches is valid, revisiting an ancestor is not.
         def visit(target: str, action: str, chain: tuple[str, ...] = ()) -> None:
             """Check one group expansion for cycles and missing targets/actions."""
             if target in chain:
@@ -357,6 +391,7 @@ class Coach:
             for action in group.get("actions", {}):
                 visit(name, action)
 
+    # Source binding and read-only summaries.
     def get_source(self, config_section: str) -> Source:
         """Get or construct a Source instance for a configuration section via source.py interface.
 
@@ -370,6 +405,8 @@ class Coach:
         Source
             Instantiated Source subclass.
         """
+        # Cache by installation section, not transport: two WLED controllers need
+        # distinct instances. Creating an instance here does not start its thread.
         if config_section not in self._sources:
             if not self.config.has_section(config_section):
                 raise ValueError(f"Config section [{config_section}] not found in configuration")
@@ -396,6 +433,8 @@ class Coach:
         str
             Resolved section name in config.ini.
         """
+        # Try all logical [coach] aliases before any direct INI section fallback.
+        # Within each pass, target is most specific and transport least specific.
         candidates = []
         for key in ("target", "config_section", "transport"):
             val = entity.get(key)
@@ -425,6 +464,8 @@ class Coach:
             try:
                 section = self.resolve_config_section(entity, name)
             except ValueError:
+                # Listing remains useful before installation bindings are complete;
+                # execution still requires a resolvable section and fails explicitly.
                 section = ""
             result[name] = {
                 "name": entity.get("name", name),
@@ -449,6 +490,7 @@ class Coach:
             for name, group in self.command_groups.items()
         }
 
+    # Local execution (coach-exec), not the semantic MQTT authorization/journal path.
     def execute(self, target: str, action: str, **kwargs: Any) -> list[dict[str, Any]]:
         """Execute an action on an entity or a command group.
 
@@ -466,6 +508,8 @@ class Coach:
         list[dict[str, Any]]
             One result dictionary per entity action performed.
         """
+        # Re-enter this dispatcher for group members so nested groups and leaf
+        # entities share the same routing and return one flattened result list.
         if target in self.command_groups:
             return self.execute_group(target, action, **kwargs)
         if target in self.entities:
@@ -500,6 +544,9 @@ class Coach:
         if action_name not in actions:
             raise ValueError(f"Action {action_name!r} not supported by group {group_name!r}")
 
+        # Member-list groups fan out one action; explicit scenes select an action
+        # and parameters per step. Both execute in declaration order, without rollback
+        # or whole-group preflight here (the semantic MQTT service adds that).
         if isinstance(actions, list):
             results: list[dict[str, Any]] = []
             for member in group_def.get("members", []):
@@ -514,6 +561,7 @@ class Coach:
             if not isinstance(step, dict) or "entity" not in step:
                 raise ValueError(f"Group {group_name!r} action {action_name!r} has a step without 'entity'")
             step_params = dict(step.get("params", {}))
+            # Local runtime arguments intentionally override scene defaults.
             step_params.update(kwargs)
             results.extend(self.execute(step["entity"], step.get("action", action_name), **step_params))
         return results
@@ -546,11 +594,16 @@ class Coach:
         frames = entity.get("actions", {}).get(action_name)
         if frames is None:
             raise ValueError(f"Action {action_name!r} not supported by entity {entity_name!r}")
+        # Confirmation controls admission here, not protocol data: remove it before
+        # resolving action placeholders and passing parameters to source adapters.
         confirmed = str(kwargs.pop("confirm", "")).strip().lower() in CONFIRM_VALUES
         if entity.get("confirm") and not confirmed:
             raise PermissionError(f"{entity_name} {action_name} requires confirmation (--confirm)")
         transport = str(entity.get("transport", "")).lower()
         config_section = self.resolve_config_section(entity, entity_name)
+        # Preflight every frame for this entity before obtaining a source or sending.
+        # This prevents a later invalid parameter from leaving a sequence half-sent;
+        # transport failures during the send loop can still produce partial effects.
         built = self.prepare_source_actions(entity_name, action_name, kwargs)
         source = self.get_source(config_section)
         if not isinstance(source, WritableSource):
@@ -563,16 +616,20 @@ class Coach:
             "config_section": config_section,
         }
 
+        # Preserve legacy local handling: handlers may log a transport failure and
+        # return. This result describes the requested dispatch, not physical success.
         for wait, prepared in built:
             if wait:
                 self.sleep(wait)
             source.handle_action(prepared.name, prepared.params)
+        # Keep the existing CLI result shape even though sources now own encoding.
         result["frames"] = [
             {**prepared.payload, "wait": wait} if transport == "rvc" else prepared.payload
             for wait, prepared in built
         ]
         return result
 
+    # Shared hardware-free preflight, also used by the semantic MQTT executor.
     def prepare_action(
         self, entity_name: str, action_name: str, params: dict[str, Any],
     ) -> list[tuple[float, dict[str, Any]]]:
@@ -590,10 +647,14 @@ class Coach:
         frames = entity.get("actions", {}).get(action_name)
         if frames is None:
             raise ValueError(f"Action {action_name!r} not supported by entity {entity_name!r}")
+        # Second substitution pass: entity values were applied at load time;
+        # all remaining runtime placeholders must now resolve or the action fails.
         frames = substitute_placeholders(frames, params, strict=True)
         section = self.resolve_config_section(entity, entity_name)
         if not self.config.has_section(section):
             raise ValueError(f"Config section [{section}] not found in configuration")
+        # Resolve the registered class only. Preparing through class methods avoids
+        # extra CAN/BLE clients and HTTP sessions, especially during MQTT preflight.
         source_type = Source.source_class(self.config[section].get("type", "").strip())
         if not issubclass(source_type, WritableSource):
             raise ValueError(f"Source [{section}] does not support actions")
@@ -601,6 +662,9 @@ class Coach:
             raise ValueError(f"Source [{section}] does not match entity transport")
         prepared: list[tuple[float, SourceAction]] = []
         for frame in frames:
+            # wait is coach scheduling, not an on-wire field. The source translates
+            # the remaining legacy frame, validates its own action contract, encodes
+            # the payload, and applies installation reservations before any dispatch.
             wait = self._frame_wait(frame)
             action, source_params = source_type.translate_frame({
                 key: value for key, value in frame.items() if key != "wait"
@@ -610,6 +674,7 @@ class Coach:
             )))
         return prepared
 
+    # Resolution/safety helpers used during construction and later preparation.
     def _resolve_template(self, template_name: str, chain: tuple[str, ...] = ()) -> dict[str, Any]:
         """Return a template merged with the templates it ``extends``.
 
@@ -633,6 +698,7 @@ class Coach:
         parent = template.get("extends")
         if not parent:
             return copy.deepcopy(template)
+        # Resolve oldest ancestors first, then layer each child's per-action overrides.
         return merge_definitions(self._resolve_template(str(parent), chain + (template_name,)), template)
 
     def _resolve_entity(self, entity_name: str, definition: Any) -> dict[str, Any]:
@@ -656,6 +722,8 @@ class Coach:
         base = self._resolve_template(str(template_name)) if template_name else {}
         base.pop("description", None)
         merged = merge_definitions(base, definition)
+        # Only this entity's scalar declarations supply first-pass placeholders.
+        # Missing runtime values remain literal placeholders until action preparation.
         context = {key: value for key, value in definition.items() if not isinstance(value, (dict, list))}
         context["entity"] = entity_name
 
@@ -663,9 +731,13 @@ class Coach:
         if not isinstance(actions, dict):
             raise ValueError(f"Entity {entity_name!r} actions must be a mapping")
         for action_name, frames in list(actions.items()):
+            # Normalize single-frame shorthand once; downstream execution always
+            # handles an ordered list, including for parameterless actions.
             frames = frames if isinstance(frames, list) else [frames]
             if not all(isinstance(frame, dict) for frame in frames):
                 raise ValueError(f"Entity {entity_name!r} action {action_name!r} frames must be mappings")
+            # Reject statically known reserved targets now. Runtime-dependent targets
+            # receive the same protection in the source encoder during preparation.
             for frame in frames:
                 self._check_static_reserved(entity_name, frame)
             actions[action_name] = frames
@@ -730,6 +802,7 @@ class Coach:
             self._check_reserved(dgn, instance, f"Entity {entity_name!r}")
         payload = frame.get("payload")
         if isinstance(payload, str) and len(payload) >= 2:
+            # Captured raw RV-C frames identify their instance in the first byte.
             self._check_reserved(dgn, int(payload[:2], 16), f"Entity {entity_name!r}")
 
     @staticmethod
