@@ -9,7 +9,7 @@ from click.testing import CliRunner
 
 from rv_control.cli import cli
 from rv_control.runtime import RuntimeContext, RuntimePublisher, VariablesUnavailable
-from rv_control.sources.base import Source
+from rv_control.sources.base import PollingSource, Source
 
 
 @pytest.fixture
@@ -40,6 +40,259 @@ topic = weather
 daemon_mode = true
 """)
     return config
+
+
+def test_constants_and_chained_derivations(runtime_config: ConfigParser) -> None:
+    """Combine constants, telemetry and derived values without weakening scalar types."""
+    runtime_config["variables.location"]["constants"] = '{"offset": 2, "label": "RV", "ready": true}'
+    runtime_config["variables"] = {"constants": '{"count": 4, "zero": 0}'}
+    runtime_config["derived.location"] = {
+        "shifted": "${location.latitude} + ${location.offset}",
+        "combined": "(-${location.shifted} + $count) / 2",
+    }
+    runtime_config.read_string("[derived.location]\nremainder = $count % 3\n")
+    context = RuntimeContext(runtime_config)
+    assert context.resolve({"label": "${location.label}", "ready": "${location.ready}", "n": "$zero"}) == {
+        "label": "RV", "ready": True, "n": 0,
+    }
+    context.update("position/TPV", {"mode": 3, "lat": 10, "lon": 20})
+    assert context.resolve({
+        "a": "${location.shifted}", "b": "${location.combined}", "c": "${location.remainder}",
+    }) == {"a": 12, "b": -4, "c": 1}
+    assert context.dependencies("location.combined") == {"location.latitude"}
+    context.validate_sources(runtime_config)
+
+
+@pytest.mark.parametrize("constants", [
+    "[]", "null", '{"x": null}', '{"x": []}', '{"x": {}}',
+    '{"x": NaN}', '{"x": Infinity}', '{"bad.name": 1}', "broken",
+])
+def test_invalid_constants_rejected(runtime_config: ConfigParser, constants: str) -> None:
+    """Reject malformed/non-scalar constants before opening any source."""
+    runtime_config["variables.fixed"] = {"constants": constants}
+    with pytest.raises(ValueError):
+        RuntimeContext(runtime_config)
+
+
+@pytest.mark.parametrize("expression", [
+    "__import__('os')", "${location.latitude}.real", "${location.latitude}[0]",
+    "abs(${location.latitude})", "${location.latitude} ** 2", "[1, 2]", "True",
+    "1e999", "${unknown.x} + 1", "unbound + 1", "1 +", "1+" * 100 + "1",
+    "9" * 5000,
+])
+def test_invalid_derivations_rejected(runtime_config: ConfigParser, expression: str) -> None:
+    """Accept only bounded arithmetic, rejecting executable or unknown expressions."""
+    runtime_config["derived.example"] = {"result": expression}
+    with pytest.raises(ValueError):
+        RuntimeContext(runtime_config)
+
+
+@pytest.mark.parametrize("definitions", [
+    {"a": "${example.a}"}, {"a": "${example.b}", "b": "${example.a}"},
+])
+def test_derived_cycles_fail_at_startup(runtime_config: ConfigParser, definitions: dict[str, str]) -> None:
+    """Detect cycles even when no enabled consumer uses those variables."""
+    runtime_config["derived.example"] = definitions
+    with pytest.raises(ValueError, match="Cyclic"):
+        RuntimeContext(runtime_config)
+
+
+def test_duplicate_runtime_names_rejected(runtime_config: ConfigParser) -> None:
+    """Prevent constants or expressions from replacing telemetry names."""
+    runtime_config["variables.location"]["constants"] = '{"latitude": 1}'
+    with pytest.raises(ValueError, match="Duplicate"):
+        RuntimeContext(runtime_config)
+    del runtime_config["variables.location"]["constants"]
+    runtime_config["derived.location"] = {"latitude": "1"}
+    with pytest.raises(ValueError, match="Duplicate"):
+        RuntimeContext(runtime_config)
+
+
+def test_derived_freshness_errors_and_recovery(runtime_config: ConfigParser, caplog: Any) -> None:
+    """Inherit the earliest expiry and invalidate on arithmetic/domain failures."""
+    now = [0.0]
+    runtime_config["variables.second"] = {"topic": "other", "fields": "value:value", "max_age": "3"}
+    runtime_config["derived.math"] = {"value": "${location.latitude} / ${second.value}"}
+    context = RuntimeContext(runtime_config, clock=lambda: now[0])
+    context.update("position/TPV", {"mode": 3, "lat": 12, "lon": 20})
+    context.update("other", {"value": 2})
+    assert context.resolve({"v": "${math.value}"}) == {"v": 6}
+    first_status = context.publication_snapshot()["math"]["status"]["value"]
+    now[0] = 2
+    assert context.publication_snapshot()["math"]["status"]["value"] == first_status
+    now[0] = 3
+    with pytest.raises(VariablesUnavailable):
+        context.resolve({"v": "${math.value}"})
+    for value in (0, True, "2", 10**400):
+        context.update("other", {"value": value})
+        with pytest.raises(VariablesUnavailable):
+            context.resolve({"v": "${math.value}"})
+        assert context.publication_snapshot()["math"]["status"]["value"]["reason"] == "calculation_error"
+    assert "Derived variable math.value unavailable" in caplog.text
+    context.update("other", {"value": 4})
+    assert context.resolve({"v": "${math.value}"}) == {"v": 3}
+    now[0] = 10
+    with pytest.raises(VariablesUnavailable):
+        context.resolve({"v": "${math.value}"})
+    assert context.resolve({"literal": "unchanged"}) == {"literal": "unchanged"}
+
+
+def test_source_graph_follows_derived_inputs(runtime_config: ConfigParser) -> None:
+    """Derived variables cannot hide source cycles or absent producers."""
+    runtime_config["variables.feedback"] = {"topic": "weather", "fields": "latitude:latitude"}
+    runtime_config["derived.feedback"] = {"calculated": "${feedback.latitude} + 0"}
+    runtime_config["weather"]["latitude"] = "${feedback.calculated}"
+    with pytest.raises(ValueError, match="Cyclic"):
+        RuntimeContext(runtime_config).validate_sources(runtime_config)
+    runtime_config["variables.feedback"]["topic"] = "missing"
+    with pytest.raises(ValueError, match="no enabled producer"):
+        RuntimeContext(runtime_config).validate_sources(runtime_config)
+
+
+class RecordingDestination:
+    """Record target operations without a broker or hardware."""
+
+    def __init__(self) -> None:
+        """Initialize captured messages and lifecycle counts."""
+        self.messages: list[tuple[str, dict[str, Any]]] = []
+        self.connected = False
+        self.closed = False
+        self.expired = threading.Event()
+
+    def connect(self) -> None:
+        """Record target connection."""
+        self.connected = True
+
+    def publish(self, topic: str, payload: dict[str, Any]) -> None:
+        """Record telemetry and signal a published expiry transition."""
+        self.messages.append((topic, payload))
+        if any(status["reason"] == "stale" for status in payload.get("status", {}).values()):
+            self.expired.set()
+
+    def close(self) -> None:
+        """Record target shutdown."""
+        self.closed = True
+
+
+def test_variable_publication_and_periodic_expiry(runtime_config: ConfigParser) -> None:
+    """Publish independent namespace state while preserving measurement timestamps."""
+    now = [0.0]
+    runtime_config["runtime"] = {
+        "publish_variables": "true", "variables_topic": "state/variables",
+        "variables_republish_seconds": "5",
+    }
+    runtime_config["variables.location"]["constants"] = '{"name": "RV"}'
+    runtime_config["variables"] = {"constants": '{"enabled": true}'}
+    runtime_config["derived.location"] = {"double": "${location.latitude} * 2"}
+    context = RuntimeContext(runtime_config, clock=lambda: now[0])
+    destination = RecordingDestination()
+    publisher = RuntimePublisher(destination, context)
+    publisher.connect()
+    try:
+        assert destination.connected
+        by_topic = dict(destination.messages)
+        assert by_topic["state/variables"]["values"] == {"enabled": True}
+        initial = by_topic["state/variables/location"]
+        assert initial["values"] == {"latitude": None, "longitude": None, "name": "RV", "double": None}
+        assert initial["status"]["latitude"]["reason"] == "missing"
+        assert initial["status"]["name"]["available"]
+        report = {"mode": 3, "lat": 12, "lon": 24}
+        publisher.publish("position/TPV", report)
+        assert ("position/TPV", report) in destination.messages
+        valid = destination.messages[-1][1]
+        assert valid["values"]["double"] == 24
+        assert valid["status"]["double"]["expires_at"] == valid["status"]["latitude"]["expires_at"]
+        count = len(destination.messages)
+        publisher._publish_variables()
+        assert len(destination.messages) == count
+        now[0] = 5
+        publisher._publish_variables()
+        assert len(destination.messages) == count + 2
+        assert dict(destination.messages)["state/variables/location"]["status"] == valid["status"]
+        now[0] = 10
+        publisher._publish_variables()
+        stale = dict(destination.messages)["state/variables/location"]
+        assert stale["values"]["latitude"] is None
+        assert stale["values"]["double"] is None
+        assert stale["values"]["name"] == "RV"
+        assert stale["status"]["latitude"]["reason"] == "stale"
+        assert stale["status"]["latitude"]["expires_at"] == valid["status"]["latitude"]["expires_at"]
+        publisher.publish("position/TPV", report)
+        assert destination.messages[-1][1]["values"]["latitude"] == 12
+        publisher.publish("position/TPV", {"mode": 1})
+        assert destination.messages[-1][1]["status"]["latitude"]["reason"] == "invalid"
+    finally:
+        publisher.close()
+    assert destination.closed
+    assert publisher._thread is not None and not publisher._thread.is_alive()
+
+
+def test_timer_expires_without_incoming_reports(runtime_config: ConfigParser) -> None:
+    """The connected maintenance thread publishes staleness with no source traffic."""
+    now = [0.0]
+    runtime_config["runtime"] = {"publish_variables": "true", "variables_republish_seconds": "0"}
+    context = RuntimeContext(runtime_config, clock=lambda: now[0])
+    destination = RecordingDestination()
+    publisher = RuntimePublisher(destination, context)
+    publisher.connect()
+    try:
+        publisher.publish("position/TPV", {"mode": 3, "lat": 12, "lon": 24})
+        now[0] = 10
+        assert destination.expired.wait(2)
+    finally:
+        publisher.close()
+    count = len(destination.messages)
+    assert publisher._thread is not None and not publisher._thread.is_alive()
+    assert len(destination.messages) == count
+
+
+def test_publication_default_off(runtime_config: ConfigParser) -> None:
+    """Existing targets receive only unchanged source telemetry by default."""
+    destination = RecordingDestination()
+    publisher = RuntimePublisher(destination, RuntimeContext(runtime_config))
+    publisher.connect()
+    publisher.publish("position/TPV", {"mode": 3, "lat": 12, "lon": 24})
+    publisher.close()
+    assert len(destination.messages) == 1
+    assert publisher._thread is None
+
+
+@pytest.mark.parametrize(("key", "value"), [
+    ("variables_topic", ""), ("variables_topic", "bad/+"),
+    ("variables_topic", "position"), ("variables_republish_seconds", "-1"),
+    ("variables_republish_seconds", "nan"), ("publish_variables", "invalid"),
+])
+def test_publication_validation(runtime_config: ConfigParser, key: str, value: str) -> None:
+    """Reject invalid schedules and telemetry/output collisions before startup."""
+    runtime_config["runtime"] = {"publish_variables": "true", key: value}
+    with pytest.raises(ValueError):
+        RuntimeContext(runtime_config).validate_sources(runtime_config)
+
+
+def test_shared_polling_receives_literals_constants_and_live_values(runtime_config: ConfigParser) -> None:
+    """Any polling adapter receives typed settings without importing runtime machinery."""
+    runtime_config["variables.fixed"] = {"constants": '{"count": 7}'}
+
+    class Consumer(PollingSource):
+        """Model a protocol adapter that only understands resolved settings."""
+
+        runtime_options = ("latitude", "literal", "constant")
+
+        def collect(self, settings: dict[str, Any]) -> dict[str, Any]:
+            """Return supplied domain settings with no binding logic."""
+            return settings
+
+    runtime_config["weather"]["literal"] = "plain"
+    runtime_config["weather"]["constant"] = "${fixed.count}"
+    context = RuntimeContext(runtime_config)
+    publisher = RuntimePublisher(RecordingDestination(), context)
+    source = Consumer(runtime_config, publisher, threading.Event(), "weather")
+    with pytest.raises(VariablesUnavailable):
+        source.interrogate()
+    for latitude in (12, 18):
+        context.update("position/TPV", {"mode": 3, "lat": latitude, "lon": 24})
+        assert source.interrogate() == {"latitude": latitude, "literal": "plain", "constant": 7}
+    assert source.comms_check()["ok"]
 
 
 def test_atomic_freshness_and_invalidation(runtime_config: ConfigParser) -> None:

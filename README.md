@@ -39,7 +39,46 @@ pip install -e .
 
 The editable install provides both `rv-control` and `rvcontrol` commands. The equivalent module form is `python -m rv_control`.
 
+## Optional configuration reload
+
+Automatic reload is **disabled by default**. Opt in for the daemon with:
+
+```sh
+rvcontrol --config config.ini --reload-config run
+```
+
+The supervisor checks the selected INI file about once per second. It reads the
+file only after its modification timestamp changes, and restarts only if the
+bytes also changed. A timestamp-only touch does nothing; comment/whitespace edits
+count as content changes. Editor save-by-rename works when the timestamp changes.
+
+Changed snapshots are parsed and preflighted (runtime/source-declared validation,
+target construction, coach mappings and command policy) before stopping the active
+session. Invalid or temporarily missing files are logged without stopping it.
+Rejected contents are not repeatedly retried until another edit. Logs omit
+rejected configuration contents; use `rvcontrol --config config.ini check` for
+runtime configuration diagnostics.
+
+A valid change triggers a **full graceful restart**, not live object mutation:
+command admission closes, sources stop, and targets/timers close before the new
+configuration starts. Sources have up to 30 seconds each to stop during reload;
+if any remain alive, reload aborts rather than starting overlapping hardware
+users. Runtime telemetry bindings and coach observations start fresh, while
+durable command journals retain their existing behavior. Configured log level is
+updated unless `--verbose` was supplied.
+
+Preflight cannot guarantee hardware/broker availability or validate options that
+an adapter only checks during I/O. If replacement startup fails after shutdown,
+the daemon reports/exits with the error; there is no automatic rollback.
+Only the selected INI is watched, not coach YAML, overlays or policy files.
+Referenced files are reread when an INI content change triggers restart; otherwise
+restart manually after editing those files. One-shot commands do not watch files.
+
 ## Runtime variables and Open-Meteo weather
+
+See [Runtime variables: configuration and implementation](docs/RUNTIME-VARIABLES.md)
+for a configuration-first guide, binding/publication timing, source implementation
+flow and the contract for adding producers or consumers.
 
 The supplied example enables `gpsd, weather` in `[source] enabled-sources`
 alongside the other sources. For an existing configuration, add those entries
@@ -102,6 +141,97 @@ failed predicate invalidates the entire group, including the previous good fix.
 clock (default 300); GPSD's report time is not used. Inputs are resolved from one
 atomic snapshot per request. There is no startup ordering requirement, persisted
 variable cache, or automatic fallback to stale coordinates or `0,0`.
+
+### Constants and derived values
+
+Constants use a JSON object in a variables section. They may accompany telemetry
+fields, or stand alone without a `topic`, `fields`, `require`, or `max_age`:
+
+```ini
+[variables.fixed]
+constants = {"latitude": 12.5, "longitude": -45.5, "label": "RV", "enabled": true}
+
+[variables.temperature]
+topic = weather
+fields = celsius:current.temperature_2m
+max_age = 1800
+
+[derived.temperature]
+fahrenheit = ${temperature.celsius} * 9 / 5 + 32
+```
+
+Use `${fixed.latitude}` just like a telemetry reference, or continue configuring
+literal coordinates directly. Constants retain their JSON types and do not expire.
+Nulls, arrays, objects and non-finite numbers are rejected. Constants are not
+recursively expanded. A name cannot be defined more than once.
+
+`[derived.NAME]` defines named arithmetic expressions; `[derived]` defines
+unnamespaced ones. Expressions support numeric literals, references, parentheses,
+unary `+`/`-`, and `+`, `-`, `*`, `/`, `%`. Calls, attributes, indexing, powers,
+shell execution and arbitrary Python are forbidden. Expressions are bounded to
+4096 characters and 64 syntax nodes. Inputs/results must be finite numbers, not
+booleans or numeric strings. Division by zero or other invalid calculations log a
+warning and make the result unavailable, never silently reuse a previous result.
+Derived values may reference other derived values. Unknown references and cycles
+fail at startup, including derived chains that introduce source dependencies.
+Each calculation uses one atomic snapshot and inherits its earliest input expiry;
+reading, calculating or republishing never refreshes measurements.
+
+All producer types feed this same runtime through the shared publisher; no
+producer contains variable-binding logic. The `Source` base owns configuration
+resolution and static-versus-dynamic validation. `PollingSource` additionally
+owns per-operation resolution, dependency waiting and capped retry scheduling;
+Open-Meteo only validates the supplied coordinates and performs HTTP reads.
+Other hardware sources keep their established connection/reconnect lifecycles.
+Only explicitly supported settings accept references: this does **not** make CAN
+interfaces, BLE addresses or arbitrary connection settings dynamic.
+
+### Optional variable publication
+
+```ini
+[runtime]
+publish_variables = true
+variables_topic = variables
+variables_republish_seconds = 60
+```
+
+Publication defaults to **off**. When enabled, snapshots pass through the existing
+MQTT/store/log target pipeline. MQTT prepends its normal base topic: namespace
+`temperature` is published at `rv/variables/temperature` with the defaults.
+Nested namespaces become topic paths; unnamespaced variables use `rv/variables`.
+`variables_topic` is configurable and must not overlap telemetry topic roots.
+Enabling publication exposes **all** configured variables, potentially including
+location; use only trusted local targets and subscribers.
+
+Each namespace has this shape (timestamps are UTC):
+
+```json
+{
+  "namespace": "temperature",
+  "values": {"celsius": 20, "fahrenheit": 68},
+  "status": {
+    "celsius": {"available": true, "reason": null, "updated_at": "2026-01-01T12:00:00+00:00", "expires_at": "2026-01-01T12:30:00+00:00"},
+    "fahrenheit": {"available": true, "reason": null, "updated_at": "2026-01-01T12:00:00+00:00", "expires_at": "2026-01-01T12:30:00+00:00"}
+  },
+  "published_at": "2026-01-01T12:00:00+00:00"
+}
+```
+
+Startup publishes constants and explicit unavailable states. Subsequent
+measurement/validity changes publish immediately; expiry is checked independently
+of source traffic every half-second. Periodic republishes preserve measurement
+timestamps; `variables_republish_seconds = 0` disables repeats, not updates or
+expiry checks. Unavailable values become `null` with a per-variable reason:
+`missing`, `invalid`, `stale`, `dependency_unavailable` or `calculation_error`.
+Constants have null measurement/expiry timestamps. Mixed namespaces retain
+independent per-variable validity. Generated messages never feed bindings.
+
+MQTT QoS and retention follow the existing target configuration. Subscribers
+**must check `expires_at` themselves**, as retained snapshots cannot announce a
+later expiry while the daemon is offline. `published_at` is not measurement time.
+There is no disk/MQTT restoration of runtime inputs after restart. One-shot
+`comms-check` and `interrogate` still fail promptly for unavailable inputs; only
+the daemon waits for producers.
 
 `check` and daemon startup validate bindings, references, enabled producers,
 source dependency cycles, and weather's static options without network access.

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 import math
 import threading
 from configparser import ConfigParser
@@ -11,19 +10,20 @@ from typing import Any
 
 import requests
 
-from ..runtime import Reference, VariablesUnavailable, parse_template
-from .base import Source
+from .base import PollingSource
 
-LOGGER = logging.getLogger(__name__)
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 DEFAULT_CURRENT = "temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m"
 
 
-class OpenMeteoSource(Source, source_name="open_meteo"):
+class OpenMeteoSource(PollingSource, source_name="open_meteo"):
     """Poll Open-Meteo without knowing which source supplies the coordinates."""
 
     config_section = "open_meteo"
     runtime_options = ("latitude", "longitude")
+    polling_errors = (requests.RequestException, ValueError)
+    check_name = "Open-Meteo"
+    check_success = "Open-Meteo forecast API is available"
 
     def __init__(
         self, config: ConfigParser, publisher: Any, stop_event: threading.Event,
@@ -31,22 +31,11 @@ class OpenMeteoSource(Source, source_name="open_meteo"):
     ) -> None:
         """Compile static HTTP settings without opening a network connection."""
         super().__init__(config, publisher, stop_event, section_name)
-        self.timeout = self._positive("timeout", 10)
-        self.poll_interval = self._positive("poll_interval", 900)
-        self.retry_delay = self._positive("retry_delay", 30)
-        self.max_retry_delay = self._positive("max_retry_delay", 900)
-        if self.max_retry_delay < self.retry_delay:
-            raise ValueError(f"[{self.section_name}] max_retry_delay must be >= retry_delay")
+        self.timeout = self.positive_setting("timeout", 10)
         self.topic = self.section.get("topic", self.section_name).strip().strip("/")
         if not self.topic or any(char in self.topic for char in ("$", "+", "#")):
             raise ValueError(f"[{self.section_name}] topic must be a literal telemetry topic")
-        self.coordinates = {key: self.section.get(key, "").strip() for key in self.runtime_options}
-        if not all(self.coordinates.values()):
-            raise ValueError(f"[{self.section_name}] latitude and longitude are required")
-        for key, value in self.coordinates.items():
-            parts = parse_template(value)
-            if not any(isinstance(part, Reference) for part in parts):
-                self._coordinate("".join(part for part in parts if isinstance(part, str)), key)
+        self.validate_literal_settings(self._coordinate)
         self.current = ",".join(
             field.strip() for field in self.section.get("current", DEFAULT_CURRENT).split(",")
             if field.strip()
@@ -63,13 +52,6 @@ class OpenMeteoSource(Source, source_name="open_meteo"):
         """Check static options and literal coordinates without HTTP or telemetry."""
         cls(config, None, threading.Event(), section_name)
 
-    def _positive(self, key: str, default: float) -> float:
-        """Read one positive finite duration and identify invalid configuration."""
-        value = self.section.getfloat(key, fallback=default)
-        if not math.isfinite(value) or value <= 0:
-            raise ValueError(f"[{self.section_name}] {key} must be positive and finite")
-        return value
-
     @staticmethod
     def _coordinate(value: Any, key: str) -> float:
         """Reject boolean, non-finite, and out-of-range coordinates before HTTP."""
@@ -84,10 +66,9 @@ class OpenMeteoSource(Source, source_name="open_meteo"):
             raise ValueError(f"Open-Meteo {key} must be between {-limit} and {limit}")
         return number
 
-    def interrogate(self) -> dict[str, Any]:
-        """Fetch one forecast or fail immediately if required variables are unavailable."""
-        resolved = self.resolve_settings(self.coordinates)
-        coordinates = {key: self._coordinate(resolved[key], key) for key in self.runtime_options}
+    def collect(self, settings: dict[str, Any]) -> dict[str, Any]:
+        """Fetch one forecast after validating the supplied resolved coordinates."""
+        coordinates = {key: self._coordinate(settings[key], key) for key in ("latitude", "longitude")}
         params = {**coordinates, "current": self.current}
         if self.daily:
             params.update(daily=self.daily, timezone="auto", forecast_days=7)
@@ -118,35 +99,3 @@ class OpenMeteoSource(Source, source_name="open_meteo"):
             **data, "requested_location": coordinates,
             "fetched_at": datetime.now(timezone.utc).isoformat(),
         }
-
-    def comms_check(self) -> dict[str, Any]:
-        """Perform one bounded API read, never waiting for another source to start."""
-        try:
-            self.interrogate()
-            return {"ok": True, "message": "Open-Meteo forecast API is available"}
-        except (requests.RequestException, ValueError) as error:
-            waiting = False
-            return {"ok": False, "message": f"Open-Meteo check failed: {error}"}
-
-    def run(self) -> None:
-        """Poll on schedule, waiting for inputs and backing off boundedly on failures."""
-        retry = self.retry_delay
-        waiting = False
-        while not self.stop_event.is_set():
-            try:
-                payload = self.interrogate()
-            except VariablesUnavailable as error:
-                if not waiting:
-                    LOGGER.warning("%s waiting for telemetry: %s", self.section_name, error)
-                waiting = True
-                delay = min(5.0, self.poll_interval)
-            except (requests.RequestException, ValueError) as error:
-                LOGGER.warning("%s forecast failed; retry in %.1fs: %s", self.section_name, retry, error)
-                delay = retry
-                retry = min(self.max_retry_delay, retry * 2)
-            else:
-                self.publisher.publish(self.topic, payload)
-                retry = self.retry_delay
-                waiting = False
-                delay = self.poll_interval
-            self.stop_event.wait(delay)

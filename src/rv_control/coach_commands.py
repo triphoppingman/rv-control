@@ -411,23 +411,8 @@ class CoachCommandService:
         section = config["coach_commands"]
         self.enabled = section.getboolean("enabled", fallback=False)
         self.queries_enabled = section.getboolean("queries_enabled", fallback=False)
-        from .targets.base import Target
-
-        mqtt_sections = [name for name, target in Target.enabled_targets(config) if target.target_name == "mqtt"]
-        if len(mqtt_sections) != 1:
-            raise ValueError("Coach API requires exactly one enabled MQTT target")
-        self.mqtt_section = mqtt_sections[0]
-        if self.enabled and not config[self.mqtt_section].getboolean("write_enabled", fallback=False):
-            raise ValueError("Enabled coach commands require MQTT write_enabled")
-        config_dir = Path(config.get("_meta", "path", fallback="config.ini")).resolve().parent
-        policy_path = section.get("controllers_file", "").strip()
-        if not policy_path:
-            raise ValueError("Coach API requires controllers_file")
-        self.policy = ControllerPolicy(coach, config_dir / policy_path, self.queries.entities())
-        limit = section.getint("journal_max_entries", fallback=1024)
-        if not 1 <= limit <= 10000:
-            raise ValueError("journal_max_entries must be between 1 and 10000")
-        self.journal = RequestJournal(config_dir / section.get("journal_file", "data/coach-commands.sqlite3"), limit, clock())
+        self.mqtt_section, self.policy, journal_path, limit = self.validate_config(config, coach, tracker)
+        self.journal = RequestJournal(journal_path, limit, clock())
         self._admission = threading.Lock()
         self._busy = threading.Lock()
         self._closing = False
@@ -435,6 +420,32 @@ class CoachCommandService:
         self._last_refresh: dict[str, float] = {}
         self._last_source_refresh: dict[str, float] = {}
         self.started = time.monotonic()
+
+    @staticmethod
+    def validate_config(
+        config: ConfigParser, coach: Coach, tracker: EntityStateTracker,
+    ) -> tuple[str, ControllerPolicy, Path, int]:
+        """Validate command configuration and policy without opening the durable journal."""
+        from .targets.base import Target
+
+        section = config["coach_commands"]
+        enabled = section.getboolean("enabled", fallback=False)
+        section.getboolean("queries_enabled", fallback=False)
+        mqtt_sections = [name for name, target in Target.enabled_targets(config) if target.target_name == "mqtt"]
+        if len(mqtt_sections) != 1:
+            raise ValueError("Coach API requires exactly one enabled MQTT target")
+        mqtt_section = mqtt_sections[0]
+        if enabled and not config[mqtt_section].getboolean("write_enabled", fallback=False):
+            raise ValueError("Enabled coach commands require MQTT write_enabled")
+        config_dir = Path(config.get("_meta", "path", fallback="config.ini")).resolve().parent
+        policy_path = section.get("controllers_file", "").strip()
+        if not policy_path:
+            raise ValueError("Coach API requires controllers_file")
+        policy = ControllerPolicy(coach, config_dir / policy_path, CoachQueries(coach, tracker, {}).entities())
+        limit = section.getint("journal_max_entries", fallback=1024)
+        if not 1 <= limit <= 10000:
+            raise ValueError("journal_max_entries must be between 1 and 10000")
+        return mqtt_section, policy, config_dir / section.get("journal_file", "data/coach-commands.sqlite3"), limit
 
     def result(self, request: dict[str, Any], status: str, code: str, message: str) -> dict[str, Any]:
         """Build a sanitized, consistently correlated result envelope."""

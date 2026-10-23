@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -129,9 +130,17 @@ class Source(threading.Thread, ABC):
         return sources, source_map
 
     @classmethod
-    def run_until_stopped(cls, config: ConfigParser, publisher: Any, stop_event: threading.Event, sources: list[Source], source_map: dict[str, Source]) -> None:
+    def run_until_stopped(
+        cls, config: ConfigParser, publisher: Any, stop_event: threading.Event,
+        sources: list[Source], source_map: dict[str, Source],
+        on_tick: Callable[[], None] | None = None,
+    ) -> None:
         """Supervise source threads and restart failed sources."""
         while not stop_event.is_set():
+            if on_tick is not None:
+                on_tick()
+                if stop_event.is_set():
+                    break
             for index, source in enumerate(tuple(sources)):
                 if source.is_alive() or stop_event.is_set():
                     continue
@@ -175,6 +184,21 @@ class Source(threading.Thread, ABC):
             context = RuntimeContext(self.config)
         return context.resolve(settings)
 
+    def configured_settings(self) -> dict[str, str]:
+        """Return only settings explicitly opted into shared runtime resolution."""
+        return {key: self.section.get(key, "").strip() for key in self.runtime_options}
+
+    def validate_literal_settings(self, validator: Callable[[Any, str], Any]) -> None:
+        """Validate static values at startup while deferring dynamic domain checks."""
+        from ..runtime import Reference, parse_template
+
+        for key, value in self.configured_settings().items():
+            if not value:
+                raise ValueError(f"[{self.section_name}] {key} is required")
+            parts = parse_template(value)
+            if not any(isinstance(part, Reference) for part in parts):
+                validator("".join(part for part in parts if isinstance(part, str)), key)
+
     @abstractmethod
     def run(self) -> None:
         """Collect readings until the source stops or fails."""
@@ -198,3 +222,72 @@ class Source(threading.Thread, ABC):
     def interrogate(self) -> dict[str, Any]:
         """Return a current source snapshot, when supported."""
         raise NotImplementedError(f"{self.source_name} does not support interrogation")
+
+
+class PollingSource(Source):
+    """Share per-operation settings, dependency waits and bounded polling retries."""
+
+    polling_errors: tuple[type[Exception], ...] = (ValueError,)
+    check_name = "Source"
+    check_success = "Source is available"
+
+    def __init__(
+        self, config: ConfigParser, publisher: Any, stop_event: threading.Event,
+        section_name: str | None = None,
+    ) -> None:
+        """Compile polling schedules without resolving live inputs or opening hardware."""
+        super().__init__(config, publisher, stop_event, section_name)
+        self.poll_interval = self.positive_setting("poll_interval", 900)
+        self.retry_delay = self.positive_setting("retry_delay", 30)
+        self.max_retry_delay = self.positive_setting("max_retry_delay", 900)
+        if self.max_retry_delay < self.retry_delay:
+            raise ValueError(f"[{self.section_name}] max_retry_delay must be >= retry_delay")
+
+    def positive_setting(self, key: str, default: float) -> float:
+        """Read a positive finite duration with a source-specific error location."""
+        value = self.section.getfloat(key, fallback=default)
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"[{self.section_name}] {key} must be positive and finite")
+        return value
+
+    @abstractmethod
+    def collect(self, settings: dict[str, Any]) -> dict[str, Any]:
+        """Read one payload using resolved settings, with protocol/domain validation."""
+
+    def interrogate(self) -> dict[str, Any]:
+        """Resolve fresh settings for exactly one operation, without waiting."""
+        return self.collect(self.resolve_settings(self.configured_settings()))
+
+    def comms_check(self) -> dict[str, Any]:
+        """Perform one bounded read, reporting missing inputs without starting producers."""
+        try:
+            self.interrogate()
+        except self.polling_errors as error:
+            return {"ok": False, "message": f"{self.check_name} check failed: {error}"}
+        return {"ok": True, "message": self.check_success}
+
+    def run(self) -> None:
+        """Wait for dependencies and retry failures with interruptible capped backoff."""
+        from ..runtime import VariablesUnavailable
+
+        retry = self.retry_delay
+        waiting = False
+        while not self.stop_event.is_set():
+            try:
+                payload = self.interrogate()
+            except VariablesUnavailable as error:
+                if not waiting:
+                    LOGGER.warning("%s waiting for telemetry: %s", self.section_name, error)
+                waiting = True
+                delay = min(5.0, self.poll_interval)
+            except self.polling_errors as error:
+                LOGGER.warning("%s read failed; retry in %.1fs: %s", self.section_name, retry, error)
+                waiting = False
+                delay = retry
+                retry = min(self.max_retry_delay, retry * 2)
+            else:
+                self.publisher.publish(self.topic, payload)
+                retry = self.retry_delay
+                waiting = False
+                delay = self.poll_interval
+            self.stop_event.wait(delay)

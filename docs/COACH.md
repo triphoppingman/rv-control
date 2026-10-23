@@ -139,9 +139,15 @@ Neither the overlay nor its loading enables writes or grants controller access.
 Keep MQTT grants in the separate controller policy, and restart after changes.
 Source discovery and raw state operations do not depend on an overlay.
 
-There is no automatic live reload: restart the daemon after YAML, INI, or policy
-changes. Explicit selection is recommended so a new installation does not
-accidentally use the default Thor mappings.
+Automatic reload is off by default. `rvcontrol --config config.ini --reload-config run`
+watches that INI's modification timestamp and bytes; a validated content change
+gracefully restarts the full daemon session, rereading coach files and policy.
+It does not watch YAML or policy files independently: restart manually after
+those edits unless an INI content change also triggers reload. This is a restart,
+not live mutation of coach mappings; observations are rebuilt and write gates
+remain in force. See [configuration reload](../README.md#optional-configuration-reload)
+for validation, cleanup and failure behavior. Explicit coach selection is
+recommended so a new installation does not accidentally use the default Thor mappings.
 
 ### Transport bindings
 

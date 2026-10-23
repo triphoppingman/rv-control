@@ -4,15 +4,17 @@ import logging
 import json
 import sqlite3
 import threading
+from configparser import ConfigParser
 from typing import Any
 
 import click
+from ruamel.yaml.error import YAMLError
 
 from .coach import Coach
 from .coach_commands import CoachCommandService, api_enabled
 from .coach_mqtt_client import mqtt_command, mqtt_query
 from .coach_state import CoachStatePublisher, wrap_publisher
-from .config import load_config
+from .config import ConfigReloader, load_config
 from .runtime import RuntimeContext, RuntimePublisher
 from .sources.base import Source
 from .sources.hughes import HughesSource
@@ -29,8 +31,9 @@ from .targets.mqtt import MqttTarget
 @click.group()
 @click.option("--config", "config_path", default="config.ini", type=click.Path(exists=True, dir_okay=False))
 @click.option("--verbose", is_flag=True)
+@click.option("--reload-config", is_flag=True, help="Reload changed configuration during run (default: disabled).")
 @click.pass_context
-def cli(context: click.Context, config_path: str, verbose: bool) -> None:
+def cli(context: click.Context, config_path: str, verbose: bool, reload_config: bool) -> None:
     """Collect RV telemetry and publish it to MQTT."""
     config = load_config(config_path)
     configured_level = config["service"].get("log_level", "INFO").upper()
@@ -45,6 +48,8 @@ def cli(context: click.Context, config_path: str, verbose: bool) -> None:
         format="%(asctime)s %(levelname)s %(name)s [%(filename)s:%(lineno)d %(funcName)s]: %(message)s",
     )
     context.obj = config
+    context.meta["reload_config"] = reload_config
+    context.meta["verbose"] = verbose
 
 
 @cli.command()
@@ -160,9 +165,50 @@ def coach_exec(
 
 
 @cli.command()
-@click.pass_obj
-def run(config: Any) -> None:
+@click.pass_context
+def run(context: click.Context) -> None:
     """Run collectors until interrupted."""
+    config = context.obj
+    reloader = (
+        ConfigReloader(config["_meta"]["path"], _validate_reload)
+        if context.meta["reload_config"] else None
+    )
+    if reloader is not None:
+        config = reloader.initial_config
+    while True:
+        candidate = _run_session(config, reloader)
+        if candidate is None:
+            return
+        config = candidate
+        if not context.meta["verbose"]:
+            logging.getLogger().setLevel(config["service"].get("log_level", "INFO").upper())
+
+
+def _validate_reload(config: ConfigParser) -> None:
+    """Preflight runtime, target construction and coach mapping without connecting."""
+    level = logging.getLevelName(config["service"].get("log_level", "INFO").upper())
+    if not isinstance(level, int):
+        raise ValueError("Invalid [service] log_level")
+    runtime = RuntimeContext(config)
+    runtime.validate_sources(config)
+    if not Source.enabled_sources(config):
+        raise ValueError("No sources are enabled")
+    publisher = Target.build(config)
+    try:
+        publisher = wrap_publisher(config, publisher)
+        if api_enabled(config):
+            if not isinstance(publisher, CoachStatePublisher):
+                raise ValueError("Coach MQTT API requires a configured coach tracker")
+            CoachCommandService.validate_config(config, publisher.tracker.coach, publisher.tracker)
+    except YAMLError as error:
+        raise ValueError("Invalid YAML referenced by configuration") from error
+    finally:
+        publisher.close()
+
+
+def _run_session(config: ConfigParser, reloader: ConfigReloader | None = None) -> ConfigParser | None:
+    """Run one configuration generation and close it before returning a replacement."""
+    candidate = None
     try:
         runtime = RuntimeContext(config)
         runtime.validate_sources(config)
@@ -201,7 +247,19 @@ def run(config: Any) -> None:
             raise click.ClickException("No sources are enabled")
         if coach_publisher is not None:
             coach_publisher.request_initial_status(source_map)
-        Source.run_until_stopped(config, publisher, stop_event, sources, source_map)
+        if reloader is None:
+            Source.run_until_stopped(config, publisher, stop_event, sources, source_map)
+        else:
+            def check_reload() -> None:
+                """Request shutdown only after the changed configuration passes validation."""
+                nonlocal candidate
+                candidate = reloader.poll()
+                if candidate is not None:
+                    stop_event.set()
+
+            Source.run_until_stopped(
+                config, publisher, stop_event, sources, source_map, on_tick=check_reload,
+            )
     except OSError as error:
         raise click.ClickException(f"Unable to connect to target: {error}") from error
     except KeyboardInterrupt:
@@ -213,8 +271,11 @@ def run(config: Any) -> None:
         finally:
             stop_event.set()
             for source in sources:
-                source.join(timeout=3)
+                source.join(timeout=30 if candidate is not None else 3)
             publisher.close()
+    if candidate is not None and any(source.is_alive() for source in sources):
+        raise click.ClickException("Configuration reload aborted: source threads have not stopped")
+    return candidate
 
 
 def _handle_command(config: Any, source_map: dict[str, Any], topic: str, payload: dict[str, Any]) -> None:
