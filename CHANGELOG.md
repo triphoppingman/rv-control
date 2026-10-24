@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- The factory Thor Magnitude BH35 2020 definition no longer includes a WLED template. The local `coach-overlay.yml` and shareable WLED overlay example now own the complete `wled_light` template and custom lights, preserving on/off/brightness and advanced actions when `[coach] overlay` is configured.
+
 ### Fixed
 
 - Coach MQTT startup errors now identify unknown controller-policy targets and point to `[coach] specfile` / `overlay` or stale action grants, making missing installation overlays diagnosable without weakening policy validation.

@@ -133,7 +133,9 @@ semantics, or controller-specific WLED ID availability. Normal transport checks
 and semantic command preflight still apply at execution.
 
 Copy [wled-overlay-example.yml](../src/rv_control/coaches/wled-overlay-example.yml)
-to a local `coach-overlay.yml` beside your INI to add advanced WLED actions.
+to a local `coach-overlay.yml` beside your INI to add the complete WLED template,
+custom light, and scene. WLED templates and lights are installation customizations,
+not part of the factory Thor definition.
 That local filename is Git-ignored; the packaged example is shareable.
 Neither the overlay nor its loading enables writes or grants controller access.
 Keep MQTT grants in the separate controller policy, and restart after changes.
@@ -353,7 +355,8 @@ does not claim or negotiate a free source address on your behalf.
 
 For `wled`, a frame is a WLED JSON state object, optionally with `wait` removed
 before dispatch. Brightness uses WLED's `bri` range 0-255, not RV-C percent.
-See the supplied `wled_light` template.
+See the `wled_light` template in the
+[WLED example overlay](../src/rv_control/coaches/wled-overlay-example.yml).
 
 ### Source-owned action interface
 
@@ -440,9 +443,10 @@ write flag. Available effects, palettes, and segments depend on firmware and
 hardware; numeric schema bounds are not proof that an ID exists on a device.
 Special/custom palette IDs may not appear in the returned name catalog.
 
-The factory `wled_light` template provides on/off/brightness. Loading the
-[WLED example overlay](../src/rv_control/coaches/wled-overlay-example.yml) adds
-the remaining actions below to that template and its inheriting entities:
+The [WLED example overlay](../src/rv_control/coaches/wled-overlay-example.yml)
+defines the complete `wled_light` template and its custom light entity.
+All actions below belong to the overlay; the factory Thor definition has no WLED
+template or lights:
 
 | Action | Required parameters | State update |
 | --- | --- | --- |

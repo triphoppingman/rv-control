@@ -30,11 +30,14 @@ def test_overlay_optional_preserves_factory(config_file: Path) -> None:
     assert Coach.load(config).data == original.data
     assert "patio_light" not in original.entities
     assert "evening_scene" not in original.command_groups
+    assert "wled_light" not in original.templates
+    assert all(item.get("transport") != "wled" for item in original.templates.values())
+    assert all(item.get("transport") != "wled" for item in original.entities.values())
     original._validate_overlay()
 
 
 def test_overlay_adds_wled_actions_without_mutating_factory(config_file: Path) -> None:
-    """The shareable example adds inherited actions with unchanged base payloads."""
+    """The overlay owns the complete WLED template without changing factory data."""
     path = Path(__file__).parents[1] / "src/rv_control/coaches/wled-overlay-example.yml"
     config = load_config(str(config_file))
     factory = Coach.load(config)
@@ -45,8 +48,17 @@ def test_overlay_adds_wled_actions_without_mutating_factory(config_file: Path) -
     assert merged.prepare_action("patio_light", "color", {
         "segment": 0, "red": 1, "green": 2, "blue": 3,
     }) == [(0.0, {"seg": [{"id": 0, "col": [[1, 2, 3]]}]})]
-    for action in ("on", "off", "brightness"):
-        assert merged.entities["patio_light"]["actions"][action] == factory.templates["wled_light"]["actions"][action]
+    assert [name for name, item in merged.templates.items() if item.get("transport") == "wled"] == ["wled_light"]
+    assert merged.entities["patio_light"]["transport"] == "wled"
+    assert set(merged.templates["wled_light"]["actions"]) == {
+        "on", "off", "brightness", "color", "effect", "palette", "transition", "preset",
+    }
+    assert merged.prepare_action("patio_light", "on", {}) == [(0.0, {"on": True})]
+    assert merged.prepare_action("patio_light", "off", {}) == [(0.0, {"on": False})]
+    for bri in (0, 255):
+        assert merged.prepare_action("patio_light", "brightness", {"bri": bri}) == [
+            (0.0, {"on": True, "bri": bri}),
+        ]
     assert "evening_scene" in merged.command_groups
     assert factory.data == before
 
@@ -55,6 +67,7 @@ def test_overlay_adds_entities_groups_and_reservations(config_file: Path) -> Non
     """New entities, scenes, metadata and safety exclusions are additive."""
     coach = load_overlay(config_file, {
         "coach": {"installation": "custom"},
+        "templates": {"wled_light": {"transport": "wled", "actions": {"off": [{"on": False}]}}},
         "entities": {"custom_strip": {"template": "wled_light", "target": "custom_strip"}},
         "command_groups": {"custom_scene": {"members": ["custom_strip"], "actions": ["off"]}},
         "reserved": [{"dgn": 0x1FEDB, "instances": [100]}],
@@ -69,9 +82,9 @@ def test_overlay_adds_entities_groups_and_reservations(config_file: Path) -> Non
     {"entities": {"kitchen_fan": {"template": "replacement"}}},
     {"entities": {"kitchen_fan": {"transport": "wled"}}},
     {"entities": {"kitchen_fan": {"actions": {"on": [{"on": False}]}}}},
-    {"templates": {"wled_light": {"actions": {"on": [{"on": False}]}}}},
-    {"templates": {"wled_light": {"action_schemas": {"brightness": {"bri": {"max": 999}}}}}},
-    {"templates": {"wled_light": {"action_schemas": {"brightness": {"bri": {"enum": [1]}}}}}},
+    {"templates": {"dimmer_switch": {"actions": {"on": [{"on": False}]}}}},
+    {"templates": {"dimmable_light": {"action_schemas": {"brightness": {"level": {"max": 999}}}}}},
+    {"templates": {"dimmable_light": {"action_schemas": {"brightness": {"level": {"enum": [1]}}}}}},
     {"entities": {"living_ceiling_light": {"action_schemas": {"brightness": {"level": {"enum": [1]}}}}}},
     {"command_groups": {"all_fans": {"members": ["kitchen_fan"]}}},
     {"entities": {"fresh_tank": {"state": {"fields": {"level": "other"}}}}},

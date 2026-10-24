@@ -1,5 +1,5 @@
 # Coach-specific semantic mappings for a 2020 Thor Motor Coach Magnitude BH35.
-# Entities select a transport (e.g. rvc, wled); the [coach] section in config.ini
+# Entities select the rvc transport; the [coach] section in config.ini
 # maps transport names to actual installation configuration sections (e.g. rvc = rv_c_bus).
 #
 # Sections
@@ -154,22 +154,6 @@ templates:
         match: {instance: "{sensor}"}
         fields:
           ambient_c: {field: ambienttemp, invalid: [65535], scale: 0.03125, offset: -273, round: 1}
-
-  wled_light:
-    description: WLED strip controlled through its JSON state API
-    transport: wled
-    action_schemas:
-      on: {}
-      off: {}
-      brightness:
-        bri: {type: integer, min: 0, max: 255}
-    actions:
-      on:
-        - {on: true}
-      off:
-        - {on: false}
-      brightness:
-        - {on: true, bri: "{bri}"}   # bri 0-255
 
   tank:
     description: Read-only tank level

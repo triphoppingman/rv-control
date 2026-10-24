@@ -13,7 +13,13 @@ command_groups:
 
 templates:
   wled_light:
+    description: WLED strip controlled through its JSON state API
+    transport: wled
     action_schemas:
+      on: {}
+      off: {}
+      brightness:
+        bri: {type: integer, min: 0, max: 255}
       color:
         segment: {type: integer, min: 0, max: 255}
         red: {type: integer, min: 0, max: 255}
@@ -30,6 +36,12 @@ templates:
       preset:
         preset_id: {type: integer, min: 1, max: 250}
     actions:
+      on:
+        - {on: true}
+      off:
+        - {on: false}
+      brightness:
+        - {on: true, bri: "{bri}"}
       color:
         - {seg: [{id: "{segment}", col: [["{red}", "{green}", "{blue}"]]}]}
       effect:
