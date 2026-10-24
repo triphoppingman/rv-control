@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- The local `rv-control-web` controller policy now grants all eight `patio_strip` WLED actions, adding `color`, `effect`, `palette`, `transition`, and `preset` while retaining overlay-defined parameter validation.
 - The factory Thor Magnitude BH35 2020 definition no longer includes a WLED template. The local `coach-overlay.yml` and shareable WLED overlay example now own the complete `wled_light` template and custom lights, preserving on/off/brightness and advanced actions when `[coach] overlay` is configured.
 
 ### Fixed
