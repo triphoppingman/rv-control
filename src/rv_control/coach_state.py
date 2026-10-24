@@ -1,4 +1,4 @@
-"""Track coach entity state from decoded RV-C messages and publish it per entity."""
+"""Track coach entity state from source telemetry and publish it per entity."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .coach import Coach, PLACEHOLDER_PATTERN
+from .sources.base import Source
 
 LOGGER = logging.getLogger(__name__)
 ENTITY_TOPIC_PREFIX = "coach/entity"
@@ -71,12 +72,17 @@ class StateBlock:
         definition : dict[str, Any]
             Block with ``dgn``, optional ``match`` and ``fields``.
         """
-        if not isinstance(definition, dict) or "dgn" not in definition:
-            raise ValueError(f"Entity {entity_name!r} state block needs a 'dgn'")
+        if not isinstance(definition, dict):
+            raise ValueError(f"Entity {entity_name!r} state block must be a mapping")
         if _contains_placeholder(definition):
             raise ValueError(f"Entity {entity_name!r} state block has unresolved placeholders: {definition}")
         self.entity_name = entity_name
-        self.dgn = _parse_dgn(definition["dgn"])
+        self.dgn = _parse_dgn(definition["dgn"]) if "dgn" in definition else None
+        self.topic_suffix = definition.get("topic_suffix", "")
+        if not isinstance(self.topic_suffix, str):
+            raise ValueError(f"Entity {entity_name!r} state topic_suffix must be a string")
+        if self.dgn is not None and "topic_suffix" in definition:
+            raise ValueError(f"Entity {entity_name!r} state cannot combine dgn and topic_suffix")
         self.match: dict[str, set[Any]] = {}
         for key, expected in (definition.get("match") or {}).items():
             values = expected if isinstance(expected, list) else [expected]
@@ -224,12 +230,26 @@ class EntityStateTracker:
         self._payloads: dict[str, dict[str, Any]] = {}
         self._by_instance: dict[tuple[int, Any], list[StateBlock]] = {}
         self._by_dgn: dict[int, list[StateBlock]] = {}
+        self._by_topic: dict[str, list[StateBlock]] = {}
         for entity_name, entity in coach.entities.items():
             blocks = entity.get("state")
             if not blocks:
                 continue
             for definition in blocks if isinstance(blocks, list) else [blocks]:
                 block = StateBlock(entity_name, definition)
+                if block.dgn is None:
+                    section = coach.resolve_config_section(entity, entity_name)
+                    if not coach.config.has_section(section):
+                        raise ValueError(f"Config section [{section}] not found for entity {entity_name!r} state")
+                    source_type = Source.source_class(
+                        coach.config[section].get("type", str(entity.get("transport", "")))
+                    )
+                    root = source_type.published_topic_root(coach.config, section)
+                    topic = "/".join(part for part in (root, block.topic_suffix.strip("/")) if part)
+                    if not topic or topic.startswith(f"{ENTITY_TOPIC_PREFIX}/"):
+                        raise ValueError(f"Entity {entity_name!r} state needs a non-entity source topic")
+                    self._by_topic.setdefault(topic, []).append(block)
+                    continue
                 instances = block.instances
                 if instances is None:
                     self._by_dgn.setdefault(block.dgn, []).append(block)
@@ -242,24 +262,29 @@ class EntityStateTracker:
         """Return the names of entities that have at least one state block."""
         names = {block.entity_name for blocks in self._by_instance.values() for block in blocks}
         names.update(block.entity_name for blocks in self._by_dgn.values() for block in blocks)
+        names.update(block.entity_name for blocks in self._by_topic.values() for block in blocks)
         return sorted(names)
 
     def monitored_fields(self) -> dict[str, list[str]]:
         """Return sorted state attribute names for every monitored entity."""
         fields: dict[str, set[str]] = {}
-        for blocks in (*self._by_instance.values(), *self._by_dgn.values()):
+        for blocks in (*self._by_instance.values(), *self._by_dgn.values(), *self._by_topic.values()):
             for block in blocks:
                 fields.setdefault(block.entity_name, set()).update(block.fields)
         return {entity: sorted(names) for entity, names in sorted(fields.items())}
 
     def entity_status_requests(self, entity_names: list[str] | None = None) -> dict[str, dict[str, list[int]]]:
-        """Return status DGNs per selected entity and mapped source section."""
+        """Return source-defined status identifiers per entity and source section."""
         selected = set(entity_names) if entity_names is not None else set(self.tracked_entities)
         unknown = selected.difference(self.tracked_entities)
         if unknown:
             raise ValueError(f"Unknown monitored entities: {', '.join(sorted(unknown))}")
         requests: dict[str, dict[str, set[int]]] = {name: {} for name in selected}
-        blocks = [block for group in (*self._by_instance.values(), *self._by_dgn.values()) for block in group]
+        blocks = [
+            block for group in (
+                *self._by_instance.values(), *self._by_dgn.values(), *self._by_topic.values()
+            ) for block in group
+        ]
         for block in blocks:
             if block.entity_name not in selected:
                 continue
@@ -269,14 +294,16 @@ class EntityStateTracker:
             except ValueError as error:
                 LOGGER.warning("No status request for entity %s: %s", block.entity_name, error)
                 continue
-            requests[block.entity_name].setdefault(section, set()).add(block.dgn)
+            status_ids = requests[block.entity_name].setdefault(section, set())
+            if block.dgn is not None:
+                status_ids.add(block.dgn)
         return {
-            entity: {section: sorted(dgns) for section, dgns in sections.items()}
+            entity: {section: sorted(status_ids) for section, status_ids in sections.items()}
             for entity, sections in requests.items()
         }
 
     def status_requests(self, entity_names: list[str] | None = None) -> dict[str, list[int]]:
-        """Return the status DGNs each config section must report, for startup status requests.
+        """Return the source-defined status identifiers required per config section.
 
         Parameters
         ----------
@@ -286,13 +313,13 @@ class EntityStateTracker:
         Returns
         -------
         dict[str, list[int]]
-            Sorted DGNs keyed by the config.ini source section serving the entities.
+            Sorted status identifiers keyed by source section; empty for whole-source reads.
         """
         requests: dict[str, set[int]] = {}
         for sections in self.entity_status_requests(entity_names).values():
-            for section, dgns in sections.items():
-                requests.setdefault(section, set()).update(dgns)
-        return {section: sorted(dgns) for section, dgns in requests.items()}
+            for section, status_ids in sections.items():
+                requests.setdefault(section, set()).update(status_ids)
+        return {section: sorted(status_ids) for section, status_ids in requests.items()}
 
     def state(self, entity_name: str) -> dict[str, Any]:
         """Return a copy of the latest known attributes of one entity.
@@ -442,6 +469,16 @@ class EntityStateTracker:
             if values:
                 self._apply(entity_name, values)
 
+    def handle_topic(self, topic: str, payload: dict[str, Any]) -> None:
+        """Update mapped entities from a source's existing periodic publications."""
+        updates: dict[str, dict[str, Any]] = {}
+        for block in self._by_topic.get(topic.strip("/"), []):
+            if block.matches(payload):
+                updates.setdefault(block.entity_name, {}).update(block.extract(payload))
+        for entity_name, values in updates.items():
+            if values:
+                self._apply(entity_name, values)
+
     def _apply(self, entity_name: str, values: dict[str, Any]) -> None:
         """Merge new attributes into an entity and publish when changed or due for republish.
 
@@ -505,11 +542,10 @@ class EntityStateTracker:
 
 
 class CoachStatePublisher:
-    """Publisher wrapper that forwards everything and feeds decoded RV-C messages to a tracker.
+    """Forward raw telemetry and feed source snapshots and RV-C messages to a tracker.
 
-    Sources keep publishing their raw topics unchanged; any payload that looks
-    like a decoded RV-C message (it has a ``dgn``) also updates coach entity
-    state, which is published through the same wrapped publisher.
+    Sources keep publishing their raw topics unchanged; mapped source topics
+    and decoded RV-C messages also update semantic entity state.
     """
 
     def __init__(
@@ -538,7 +574,7 @@ class CoachStatePublisher:
         self.publisher.connect()
 
     def publish(self, topic: str, payload: dict[str, Any]) -> None:
-        """Forward a publish, then update coach entity state from RV-C payloads.
+        """Forward a publish, then update coach entity state from source telemetry.
 
         Tracker failures are logged and never stop the raw publish path.
 
@@ -550,14 +586,16 @@ class CoachStatePublisher:
             JSON payload.
         """
         self.publisher.publish(topic, payload)
-        if isinstance(payload, dict) and "dgn" in payload:
+        if isinstance(payload, dict):
             try:
-                self.tracker.handle(payload)
+                if "dgn" in payload:
+                    self.tracker.handle(payload)
+                self.tracker.handle_topic(topic, payload)
             except Exception:
                 LOGGER.exception("Coach entity state update failed for %s", topic)
 
     def request_initial_status(self, source_map: dict[str, Any]) -> None:
-        """Ask running sources once for the status DGNs coach entities need.
+        """Ask running sources once for the mapped telemetry coach entities need.
 
         Loads that are off are only reported when they change, so without this
         request they stay unknown until toggled. Sources without
@@ -570,14 +608,14 @@ class CoachStatePublisher:
         """
         if not self.request_status_on_start:
             return
-        for section, dgns in self.tracker.status_requests().items():
+        for section, status_ids in self.tracker.status_requests().items():
             source = source_map.get(section)
             request = getattr(source, "request_status", None)
-            if request is None:
+            if getattr(source, "supports_status_requests", False) is not True or not callable(request):
                 LOGGER.debug("Source [%s] cannot request status; skipping", section)
                 continue
             try:
-                request(dgns)
+                request(status_ids)
             except (ValueError, OSError) as error:
                 LOGGER.warning("Coach status request to [%s] failed: %s", section, error)
 

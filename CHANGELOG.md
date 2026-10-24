@@ -8,11 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- The shared source monitoring interface names its selection `status_ids` rather than RV-C-specific `dgns`; RV-C continues interpreting those identifiers as DGNs, while WLED reads a whole-controller snapshot.
 - The local `rv-control-web` controller policy now grants all eight `patio_strip` WLED actions, adding `color`, `effect`, `palette`, `transition`, and `preset` while retaining overlay-defined parameter validation.
 - The factory Thor Magnitude BH35 2020 definition no longer includes a WLED template. The local `coach-overlay.yml` and shareable WLED overlay example now own the complete `wled_light` template and custom lights, preserving on/off/brightness and advanced actions when `[coach] overlay` is configured.
 
 ### Fixed
 
+- WLED coach entities now receive actual polled brightness and power state, including changes made outside the dashboard, through `<base_topic>/coach/entity/<entity>`. The WLED overlay example maps `on`, raw `bri` and percent `level`; existing local templates must add its `state` block. Temporary HTTP failures retry at the next `poll_interval`, and safe `refresh_states` queries now read WLED state. Coach state blocks without `dgn` consume the bound source's telemetry topic for any source (optional `topic_suffix` for subtopics); BLE polling/notification schedules and write gates are unchanged.
 - Coach MQTT startup errors now identify unknown controller-policy targets and point to `[coach] specfile` / `overlay` or stale action grants, making missing installation overlays diagnosable without weakening policy validation.
 
 ### Added

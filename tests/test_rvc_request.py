@@ -45,7 +45,7 @@ def test_source_sends_queued_requests_once() -> None:
     config = configparser.ConfigParser()
     config.read_dict({"rv_c": {"type": "rvc", "write_enabled": "false"}})
     source = RvcSource(config, None, threading.Event(), "rv_c")
-    source.request_status([0x1FEDA, 0x1FFB7, 0x1FEDA])
+    source.request_status(status_ids=[0x1FEDA, 0x1FFB7, 0x1FEDA])
     bus = FakeBus()
     source._send_pending_requests(bus)
     source._send_pending_requests(bus)

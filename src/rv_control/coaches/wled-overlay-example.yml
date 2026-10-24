@@ -15,6 +15,11 @@ templates:
   wled_light:
     description: WLED strip controlled through its JSON state API
     transport: wled
+    state:
+      fields:
+        on: "on"
+        bri: bri
+        level: {field: bri, divide_by: 255, scale: 100, round: 1}
     action_schemas:
       on: {}
       off: {}

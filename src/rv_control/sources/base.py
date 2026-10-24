@@ -215,8 +215,13 @@ class Source(threading.Thread, ABC):
         """Dispatch a command or raise; never infer success from a legacy handler."""
         raise NotImplementedError(f"{self.source_name} has no reliable command interface")
 
-    def request_status(self, dgns: list[int]) -> None:
-        """Request mapped telemetry only on sources explicitly supporting safe reads."""
+    def request_status(self, status_ids: list[int]) -> None:
+        """Request safe telemetry for source-defined status identifiers.
+
+        Identifiers belong to the source protocol, not the coach entity namespace.
+        Sources that read a complete snapshot may ignore the selection, including
+        an empty list. Implementations must not require actuator write enablement.
+        """
         raise NotImplementedError(f"{self.source_name} has no safe status request interface")
 
     def interrogate(self) -> dict[str, Any]:

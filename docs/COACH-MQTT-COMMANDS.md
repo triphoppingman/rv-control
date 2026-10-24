@@ -244,6 +244,10 @@ per 10 seconds and one per source per five seconds. Reject excess with
 `rate_limited`; do not queue refreshes for later. Serialize source access with
 physical actions and return `busy` on conflicts. Do not stop live collectors.
 Sources without a safe monitoring interface are explicitly unsupported.
+WLED supports safe refresh by reading `/json/state` and publishing the actual
+snapshot through the same mapped entity-state pipeline as periodic polls.
+Topic-based state mappings also consume existing telemetry from other sources,
+including BLE, without forcing additional reads or reconnects.
 
 Record a per-entity/per-field observation baseline before dispatch. Count
 unchanged post-query telemetry as a new observation even when normal change

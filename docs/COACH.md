@@ -37,7 +37,7 @@ flowchart TD
     Source --> Hardware[RV-C or WLED]
     Hardware --> Raw[Source telemetry]
     Raw --> Targets[Configured targets: MQTT / store / log]
-    Raw --> Tracker[EntityStateTracker: RV-C state mappings]
+    Raw --> Tracker[EntityStateTracker: source state mappings]
     Coach --> Tracker
     Tracker --> Targets
     Tracker --> MQTT
@@ -60,7 +60,8 @@ flowchart TD
 The coach is **not** a registered `type = coach` source or a separate hardware
 thread. Do not add it to `[source] enabled-sources`. It is a layer over sources.
 Current action builders support `rvc` and `wled`; the entity state tracker consumes
-decoded RV-C messages, not arbitrary BLE or WLED snapshots.
+decoded RV-C messages and mapped source snapshots from any transport. BLE sources
+keep their existing polling/notification schedules, without additional reads.
 
 ## Selecting and binding a coach
 
@@ -231,9 +232,10 @@ Groups/scenes may include entities on either controller without a new transport
 or group format. Semantic MQTT grants remain entity/action-based, and each
 resolved source must independently be enabled, running, and write-enabled.
 Use distinct source telemetry topics to keep their snapshots distinguishable.
-WLED snapshots still do not populate the RV-C-only entity state tracker:
-adding a second controller does not add WLED entity snapshots or state refresh
-support to the semantic query API.
+The example's `state` mapping converts WLED snapshots into coach entity state.
+Each entity follows the telemetry topic of its resolved source section, so
+controllers with distinct topics remain isolated. Explicit `refresh_states`
+also supports bounded WLED state reads without enabling writes.
 
 ## Coach YAML reference
 
@@ -523,13 +525,37 @@ It also does not govern standalone send tools or legacy raw source MQTT commands
 
 ## State mappings and freshness
 
-`state` is one block or a list. Each block has a status `dgn`, optional `match`
+`state` is one block or a list. RV-C blocks have a status `dgn`, optional `match`
 fields, and a `fields` mapping from entity attributes to decoded fields.
 Use numeric YAML DGNs (for example `0x1FEDA`) and exact canonical decoder names.
 Each match value may be a scalar or a list of accepted values; all match fields
 must agree. Include `source` when observations justify filtering a sender.
 Current matching is by decoded content, not the originating INI section; do not
 assume two buses with identical DGNs/instances are automatically isolated.
+
+For other sources, omit `dgn` to consume snapshots at the telemetry topic of
+the entity's resolved INI section. This supports every registered source,
+including Renogy and Hughes, using their existing periodic reports rather than
+adding BLE interrogations or changing their cadence. An optional `topic_suffix`
+selects a subtopic such as gpsd's `TPV`; it cannot be combined with `dgn`.
+Matching and field conversions work as for RV-C. Only explicitly mapped fields
+are exposed; source commands are never treated as observed state.
+
+For example, add this to an existing WLED template in the local overlay:
+
+```yaml
+state:
+  fields:
+    on: "on"
+    bri: bri
+    level: {field: bri, divide_by: 255, scale: 100, round: 1}
+```
+
+The daemon polls WLED at its source's `poll_interval` (default 60 seconds).
+Brightness readback includes the raw 0-255 `bri` and percent `level`; updates from
+other controllers or the WLED app follow the same path. Temporary HTTP failures
+are logged and retried on the next poll. Sources must still be enabled under
+`[source] enabled-sources`; a coach binding does not start hardware collectors.
 
 A field can be a decoded field name or a mapping containing:
 
@@ -569,7 +595,12 @@ attribute. Queries expose observation/freshness details; republishing cached
 state does not read hardware.
 
 `request_status_on_start = true` asks running sources once for the mapped status
-DGNs. RV-C broadcasts status requests without requiring actuator write flags.
+DGNs or a safe source snapshot. RV-C broadcasts status requests and WLED reads
+`/json/state`, without requiring actuator write flags. Sources without a safe
+status-request interface continue reporting on their existing schedule.
+The shared `Source.request_status(status_ids)` interface accepts source-defined
+status identifiers, not coach entity IDs. Only RV-C interprets those identifiers
+as DGNs; whole-snapshot sources such as WLED do not need individual identifiers.
 Some controllers may not respond; request transmission is not proof of fresh
 state. `publish_state = false` suppresses entity publications, but a tracker
 still exists if the MQTT API needs it.

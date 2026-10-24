@@ -58,6 +58,7 @@ class WledSource(WritableSource, source_name="wled"):
 
     source_name = "wled"
     config_section = "wled"
+    supports_status_requests = True
 
     @classmethod
     def supported_actions(cls) -> dict[str, ActionDefinition]:
@@ -217,16 +218,22 @@ class WledSource(WritableSource, source_name="wled"):
         """Dispatch state without the legacy handler's log-and-return failure behavior."""
         self.set_state(payload)
 
+    def request_status(self, status_ids: list[int]) -> None:
+        """Read actual controller state and publish it without any device writes."""
+        topic = self.published_topic_root(self.config, self.section_name)
+        self.publisher.publish(topic, self.interrogate())
+
     def run(self) -> None:
         """Poll WLED state and publish snapshots until the source is stopped."""
         try:
             interval = self.section.getfloat("poll_interval", fallback=60.0)
-            if interval <= 0:
-                raise ValueError("poll_interval must be greater than zero")
-            topic = self.section.get("topic", self.section_name).strip("/")
+            if not math.isfinite(interval) or interval <= 0:
+                raise ValueError("poll_interval must be positive and finite")
             while not self.stop_event.is_set():
-                state = self.interrogate()
-                self.publisher.publish(topic, state)
+                try:
+                    self.request_status([])
+                except (OSError, requests.RequestException, ValueError) as error:
+                    LOGGER.warning("WLED poll failed for %s: %s", self.section_name, error)
                 self.stop_event.wait(interval)
         except Exception:
             LOGGER.exception("WLED source instance %s stopped", self.section_name)

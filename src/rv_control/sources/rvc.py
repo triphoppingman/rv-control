@@ -152,7 +152,7 @@ class RvcSource(WritableSource, source_name="rvc"):
         self._pending_requests: list[int] = []
         self._requests_lock = threading.Lock()
 
-    def request_status(self, dgns: Iterable[int]) -> None:
+    def request_status(self, status_ids: Iterable[int]) -> None:
         """Queue RV-C Requests asking every node to send the given DGNs.
 
         The requests are broadcast from the daemon thread as soon as its CAN bus
@@ -162,11 +162,11 @@ class RvcSource(WritableSource, source_name="rvc"):
 
         Parameters
         ----------
-        dgns : Iterable[int]
-            DGNs to request, such as ``0x1FEDA`` for DC dimmer status.
+        status_ids : Iterable[int]
+            RV-C DGNs to request, such as ``0x1FEDA`` for DC dimmer status.
         """
         validated = []
-        for dgn in dgns:
+        for dgn in status_ids:
             if not 0 <= int(dgn) <= 0x1FFFF:
                 raise ValueError(f"RV-C DGN must fit 17 bits: {dgn}")
             validated.append(int(dgn))

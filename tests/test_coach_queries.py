@@ -24,13 +24,13 @@ class FakeSource:
         self.alive = True
         self.error: Exception | None = None
 
-    def request_status(self, dgns: list[int]) -> None:
-        """Record a deduplicated DGN batch and run the configured callback."""
+    def request_status(self, status_ids: list[int]) -> None:
+        """Record deduplicated source status identifiers and invoke the callback."""
         if self.error is not None:
             raise self.error
-        self.requests.append(list(dgns))
+        self.requests.append(list(status_ids))
         if self.callback is not None:
-            self.callback(dgns)
+            self.callback(status_ids)
 
     def is_alive(self) -> bool:
         """Return whether the source is available to service monitoring requests."""

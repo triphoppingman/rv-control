@@ -122,11 +122,11 @@ class CoachQueries:
         entity_requests = self.tracker.entity_status_requests(entities)
         request_map: dict[str, set[int]] = {}
         for sections in entity_requests.values():
-            for section, dgns in sections.items():
-                request_map.setdefault(section, set()).update(dgns)
+            for section, status_ids in sections.items():
+                request_map.setdefault(section, set()).update(status_ids)
 
         section_status: dict[str, str] = {}
-        for section, dgns in request_map.items():
+        for section, status_ids in request_map.items():
             source = self.sources.get(section)
             if source is None:
                 section_status[section] = "source_unavailable"
@@ -140,7 +140,7 @@ class CoachQueries:
                 section_status[section] = "source_unavailable"
                 continue
             try:
-                request(sorted(dgns))
+                request(sorted(status_ids))
             except Exception:
                 LOGGER.exception("Status request failed for source [%s]", section)
                 section_status[section] = "source_unavailable"

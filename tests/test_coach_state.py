@@ -227,13 +227,15 @@ def test_all_entity_state_blocks_compile(coach: Coach) -> None:
 class FakeRvcSource:
     """Source double recording status requests."""
 
+    supports_status_requests = True
+
     def __init__(self) -> None:
         """Create an empty request record."""
         self.requested: list[int] = []
 
-    def request_status(self, dgns: list[int]) -> None:
-        """Record requested DGNs."""
-        self.requested.extend(dgns)
+    def request_status(self, status_ids: list[int]) -> None:
+        """Record source-defined status identifiers."""
+        self.requested.extend(status_ids)
 
 
 def test_status_requests_grouped_by_section() -> None:
@@ -256,6 +258,77 @@ def test_wrapper_requests_initial_status_once() -> None:
     disabled = wrap_publisher(coach_config(rvc="rv_c", request_status_on_start="false"), RecordingTarget())
     disabled.request_initial_status({"rv_c": disabled_source})
     assert disabled_source.requested == []
+
+
+@pytest.mark.parametrize("transport,default_topic,suffix", [
+    ("renogy", "renogy", ""),
+    ("hughes", "hughes", ""),
+    ("wled", "first_source", ""),
+    ("gpsd", "first_source", "TPV"),
+    ("obd", "first_source", ""),
+    ("open_meteo", "first_source", ""),
+])
+def test_source_snapshots_update_only_bound_entities(
+    transport: str, default_topic: str, suffix: str,
+) -> None:
+    """Every transport can feed coach state using its existing telemetry cadence."""
+    config = configparser.ConfigParser()
+    config.read_dict({
+        "coach": {"first": "first_source", "second": "second_source"},
+        "first_source": {"type": transport},
+        "second_source": {"type": transport, "topic": "other/controller"},
+    })
+    data = {"entities": {
+        name: {
+            "transport": transport, "target": name,
+            "state": {
+                "topic_suffix": suffix,
+                "match": {"valid": True},
+                "fields": {"level": {"field": "value", "scale": 2}},
+            },
+        }
+        for name in ("first", "second")
+    }}
+    coach = Coach(config, data)
+    target = RecordingTarget()
+    wrapped = CoachStatePublisher(target, lambda publish: EntityStateTracker(coach, publish))
+    topic = "/".join(part for part in (default_topic, suffix) if part)
+    baseline = wrapped.tracker.observation_baseline(["first"])
+    wrapped.publish(topic, {"value": 25, "valid": False})
+    assert wrapped.tracker.state("first") == {}
+    wrapped.publish(topic, {"value": 25, "valid": True})
+    wrapped.publish(topic, {"value": 50, "valid": True})
+    assert wrapped.tracker.state("first") == {"level": 100}
+    assert wrapped.tracker.state("second") == {}
+    assert wrapped.tracker.monitored_fields() == {"first": ["level"], "second": ["level"]}
+    assert wrapped.tracker.observed_fields_since(baseline) == {"first": ["level"]}
+    assert wrapped.tracker.status_requests(["first"]) == {"first_source": []}
+    assert [payload["state"] for name, payload in target.published if name == "coach/entity/first"] == [
+        {"level": 50}, {"level": 100},
+    ]
+
+
+def test_startup_does_not_interrogate_periodically_reporting_sources() -> None:
+    """BLE and other passive sources keep their own collection schedule."""
+    config = configparser.ConfigParser()
+    config.read_dict({"coach": {"renogy": "battery"}, "battery": {"type": "renogy"}})
+    coach = Coach(config, {"entities": {
+        "battery": {"transport": "renogy", "state": {"fields": {"voltage": "voltage"}}},
+    }})
+    wrapped = CoachStatePublisher(RecordingTarget(), lambda publish: EntityStateTracker(coach, publish))
+
+    class PassiveSource:
+        """Reject any attempt to force a read or change the collection cadence."""
+
+        supports_status_requests = False
+
+        def request_status(self, status_ids: list[int]) -> None:
+            """Fail the test if startup tries to request passive source telemetry."""
+            pytest.fail("Passive sources must not receive extra status requests")
+
+    wrapped.request_initial_status({"battery": PassiveSource()})
+    wrapped.publish("renogy", {"voltage": 13.2})
+    assert wrapped.tracker.state("battery") == {"voltage": 13.2}
 
 
 def test_field_observations_advance_for_unchanged_telemetry(coach: Coach) -> None:

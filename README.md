@@ -615,8 +615,11 @@ Copy the example to a local `coach-overlay.yml` and set
 `[coach] overlay = coach-overlay.yml` (relative to the INI). Overlays are strictly
 additive: conflicts fail instead of changing factory definitions. See
 [WLED coach actions](docs/COACH.md#wled-controls-and-discovery) for parameters,
-units, and MQTT policy requirements. These commands do not add controller
-power sequencing, readiness waits, or WLED entity-state tracking.
+units, and MQTT policy requirements. The overlay maps polled `on` and `bri`
+to coach entity state, including `level` as a percentage, so dashboards receive
+actual controller changes at the source's `poll_interval` (default 60 seconds).
+Existing local WLED templates need the example's `state` block to enable this.
+These commands do not add controller power sequencing or readiness waits.
 
 ELM327 Bluetooth OBD-II adapters use a named source section. The source connects with a raw Bluetooth RFCOMM socket (no `rfcomm bind`, no serial device node), so pair and trust the adapter once with `bluetoothctl` before first use (see [ELM327 OBD-II adapter (Bluetooth Classic)](#elm327-obd-ii-adapter-bluetooth-classic) for discovery, pairing, and controller selection). `adapter` selects the local controller by `hciN` name or controller MAC address, and the RFCOMM socket is bound to it:
 

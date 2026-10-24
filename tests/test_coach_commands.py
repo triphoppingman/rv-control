@@ -62,7 +62,7 @@ class FakeSource(RvcSource):
         source_type = RvcSource if action in RvcSource.supported_actions() else WledSource
         self.execute_command(source_type.prepare_action(action, params, self.section).payload)
 
-    def request_status(self, dgns: list[int]) -> None:
+    def request_status(self, status_ids: list[int]) -> None:
         """Do not touch a bus from query tests."""
 
 
