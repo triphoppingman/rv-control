@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import configparser
+import logging
 import threading
 from datetime import datetime
 from typing import Any
@@ -279,6 +280,28 @@ def test_wrapper_requests_initial_status_once() -> None:
     disabled = wrap_publisher(coach_config(rvc="rv_c", request_status_on_start="false"), RecordingTarget())
     disabled.request_initial_status({"rv_c": disabled_source})
     assert disabled_source.requested == []
+
+
+def test_initial_status_request_failure_is_info(caplog: pytest.LogCaptureFixture) -> None:
+    """Expected unavailable sources do not produce warning-level startup logs."""
+    caplog.set_level(logging.INFO)
+    config = coach_config(rvc="rv_c")
+    wrapped = wrap_publisher(config, RecordingTarget())
+
+    class UnavailableSource:
+        """Simulate an optional source that cannot answer its initial status request."""
+
+        supports_status_requests = True
+
+        def request_status(self, status_ids: list[int]) -> None:
+            """Raise the expected connection error for an unavailable controller."""
+            raise OSError("controller unavailable")
+
+    wrapped.request_initial_status({"rv_c": UnavailableSource()})
+
+    assert "Coach status request to [rv_c] failed" in caplog.text
+    assert any(record.levelname == "INFO" for record in caplog.records)
+    assert not any(record.levelname == "WARNING" for record in caplog.records)
 
 
 @pytest.mark.parametrize("transport,default_topic,suffix", [

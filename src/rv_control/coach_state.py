@@ -678,7 +678,7 @@ class CoachStatePublisher:
             try:
                 request(status_ids)
             except (ValueError, OSError) as error:
-                LOGGER.warning("Coach status request to [%s] failed: %s", section, error)
+                LOGGER.info("Coach status request to [%s] failed: %s", section, error)
 
     def close(self) -> None:
         """Close the wrapped publisher."""

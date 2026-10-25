@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import logging
 import threading
 from configparser import ConfigParser
 from pathlib import Path
@@ -204,6 +205,7 @@ def test_interrogate_reads_every_pid_and_reports_na() -> None:
 
 def test_initialize_uses_fallback_protocol_when_auto_fails(caplog: pytest.LogCaptureFixture) -> None:
     """Verify the configured fallback protocol is tried when automatic detection fails."""
+    caplog.set_level(logging.INFO)
     responses = {**INIT, "0100": "UNABLE TO CONNECT", "ATSP6": "OK"}
     source, sockets = make_source(responses, fallback_protocol="6")
     sockets_before = len(sockets)
@@ -211,11 +213,13 @@ def test_initialize_uses_fallback_protocol_when_auto_fails(caplog: pytest.LogCap
         assert info["ecu_online"] is False
     assert "ATSP6" in sockets[sockets_before].sent
     assert "automatic protocol failed (UNABLE TO CONNECT); trying protocol 6" in caplog.text
-    assert "WARNING" in caplog.text
+    assert "INFO" in caplog.text
+    assert "WARNING" not in caplog.text
 
 
 def test_initialize_does_not_fallback_from_configured_protocol(caplog: pytest.LogCaptureFixture) -> None:
     """Do not retry a configured fixed protocol as its own fallback."""
+    caplog.set_level(logging.INFO)
     responses = {**INIT, "0100": "CAN ERROR", "ATSP6": "OK"}
     source, sockets = make_source(responses, protocol="6", fallback_protocol="6")
     with source.session() as (_elm, info):
@@ -225,7 +229,21 @@ def test_initialize_does_not_fallback_from_configured_protocol(caplog: pytest.Lo
     commands = sockets[0].sent
     assert commands.count("ATSP6") == 1
     assert "not trying fallback protocol" in caplog.text
-    assert "WARNING" in caplog.text
+    assert "INFO" in caplog.text
+    assert "WARNING" not in caplog.text
+
+
+def test_expected_obd_unavailability_logs_at_info(caplog: pytest.LogCaptureFixture) -> None:
+    """Offline and unsupported PID transitions are informational availability states."""
+    caplog.set_level(logging.INFO)
+    source, _sockets = make_source(INIT)
+
+    source._set_online(False, message="ECU not responding (CAN ERROR)")
+    source._log_pid_transitions({"rpm": "NO DATA"})
+
+    assert any("OBD obd_engine offline" in record.message and record.levelname == "INFO" for record in caplog.records)
+    assert any("OBD obd_engine PID rpm: N/A" in record.message and record.levelname == "INFO" for record in caplog.records)
+    assert not any(record.levelname == "WARNING" for record in caplog.records)
 
 
 def test_comms_check_succeeds_with_engine_off() -> None:

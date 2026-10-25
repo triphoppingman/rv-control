@@ -383,7 +383,7 @@ class ObdSource(Source, source_name="obd"):
         except ObdNoData as error:
             fallback = self._protocol("fallback_protocol", "")
             if protocol != "0":
-                LOGGER.warning(
+                LOGGER.info(
                     "OBD %s: configured protocol %s failed ECU probe (%s); not trying fallback protocol",
                     self.section_name,
                     protocol,
@@ -392,10 +392,10 @@ class ObdSource(Source, source_name="obd"):
                 info["message"] = f"ECU not responding ({error})"
                 return info
             if not fallback:
-                LOGGER.warning("OBD %s: automatic protocol failed ECU probe (%s); no fallback protocol configured", self.section_name, error)
+                LOGGER.info("OBD %s: automatic protocol failed ECU probe (%s); no fallback protocol configured", self.section_name, error)
                 info["message"] = f"ECU not responding ({error})"
                 return info
-            LOGGER.warning("OBD %s: automatic protocol failed (%s); trying protocol %s", self.section_name, error, fallback)
+            LOGGER.info("OBD %s: automatic protocol failed (%s); trying protocol %s", self.section_name, error, fallback)
             if "OK" not in elm.command(f"ATSP{fallback}"):
                 raise ConnectionError(f"ELM327 rejected ATSP{fallback}")
             try:
@@ -496,7 +496,7 @@ class ObdSource(Source, source_name="obd"):
         """Log PIDs when they start or stop returning N/A instead of on every cycle."""
         for name, message in errors.items():
             if name not in self._failing_pids:
-                LOGGER.warning("OBD %s PID %s: N/A (%s)", self.section_name, name, message)
+                LOGGER.info("OBD %s PID %s: N/A (%s)", self.section_name, name, message)
             else:
                 LOGGER.debug("OBD %s PID %s: N/A (%s)", self.section_name, name, message)
         for name in self._failing_pids - set(errors):
@@ -559,7 +559,7 @@ class ObdSource(Source, source_name="obd"):
         if online:
             LOGGER.info("OBD %s online: %s, %s, %s", self.section_name, status.get("adapter"), status.get("protocol"), status.get("voltage"))
         else:
-            LOGGER.warning("OBD %s offline: %s", self.section_name, message)
+            LOGGER.info("OBD %s offline: %s", self.section_name, message)
         self._publish(f"{self._topic()}/status", status)
         if was_online:
             # Clear consumers that only watch the snapshot topic so stale engine values are not displayed.
