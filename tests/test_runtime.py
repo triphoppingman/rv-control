@@ -63,6 +63,54 @@ def test_constants_and_chained_derivations(runtime_config: ConfigParser) -> None
     context.validate_sources(runtime_config)
 
 
+def test_bounded_window_derivations(runtime_config: ConfigParser) -> None:
+    """Aggregate recent direct telemetry samples while preserving ordinary arithmetic."""
+    now = [0.0]
+    runtime_config["derived.location"] = {
+        "average": "avg(${location.latitude}, 10)",
+        "minimum": "min(${location.latitude}, 10)",
+        "maximum": "max(${location.latitude}, 10)",
+        "rate": "rate(${location.latitude}, 10)",
+        "adjusted": "(${location.latitude} + 2) * 2",
+    }
+    context = RuntimeContext(runtime_config, clock=lambda: now[0])
+    context.update("position/TPV", {"mode": 3, "lat": 10, "lon": 20})
+    now[0] = 2
+    context.update("position/TPV", {"mode": 3, "lat": 14, "lon": 20})
+
+    assert context.resolve({
+        "average": "${location.average}",
+        "minimum": "${location.minimum}",
+        "maximum": "${location.maximum}",
+        "rate": "${location.rate}",
+        "adjusted": "${location.adjusted}",
+    }) == {"average": 12, "minimum": 10, "maximum": 14, "rate": 2, "adjusted": 32}
+
+    now[0] = 13
+    context.update("position/TPV", {"mode": 3, "lat": 20, "lon": 20})
+    assert context.resolve({"average": "${location.average}"}) == {"average": 20}
+    with pytest.raises(VariablesUnavailable, match="location.rate"):
+        context.resolve({"rate": "${location.rate}"})
+
+
+@pytest.mark.parametrize("expression", [
+    "avg(${location.latitude}, 0)",
+    "avg(${location.latitude}, 86401)",
+    "avg(${location.longitude} + 1, 10)",
+    "avg(${fixed.value}, 10)",
+    "sum(${location.latitude}, 10)",
+    "avg(${location.latitude}, 10, 20)",
+])
+def test_invalid_window_derivations_rejected(
+    runtime_config: ConfigParser, expression: str,
+) -> None:
+    """Reject unbounded, unsupported, or non-telemetry window operations at startup."""
+    runtime_config["variables.fixed"] = {"constants": '{"value": 3}'}
+    runtime_config["derived.example"] = {"result": expression}
+    with pytest.raises(ValueError):
+        RuntimeContext(runtime_config)
+
+
 @pytest.mark.parametrize("constants", [
     "[]", "null", '{"x": null}', '{"x": []}', '{"x": {}}',
     '{"x": NaN}', '{"x": Infinity}', '{"bad.name": 1}', "broken",
@@ -172,6 +220,81 @@ class RecordingDestination:
     def close(self) -> None:
         """Record target shutdown."""
         self.closed = True
+
+
+def test_read_only_runtime_events_publish_hysteretic_transitions(
+    runtime_config: ConfigParser,
+) -> None:
+    """Publish active and cleared event records without issuing source commands."""
+    runtime_config["events.battery_low"] = {
+        "when": "${location.latitude} < 12",
+        "clear_when": "${location.latitude} > 12.5",
+    }
+    destination = RecordingDestination()
+    publisher = RuntimePublisher(destination, RuntimeContext(runtime_config))
+    publisher.connect()
+    try:
+        publisher.publish("position/TPV", {"mode": 3, "lat": 11, "lon": 20})
+        publisher.publish("position/TPV", {"mode": 3, "lat": 12.2, "lon": 20})
+        assert len([topic for topic, _payload in destination.messages if topic.startswith("events/")]) == 1
+        publisher.publish("position/TPV", {"mode": 3, "lat": 13, "lon": 20})
+    finally:
+        publisher.close()
+
+    transitions = [
+        (topic, payload)
+        for topic, payload in destination.messages
+        if topic == "events/battery_low"
+    ]
+    assert [payload["state"] for _topic, payload in transitions] == ["active", "cleared"]
+    assert [payload["previous_state"] for _topic, payload in transitions] == ["inactive", "active"]
+    assert transitions[0][1]["value"] == 11
+    assert transitions[1][1]["value"] == 13
+    assert destination.closed
+
+
+def test_runtime_event_activation_delay_and_unavailable_input(runtime_config: ConfigParser) -> None:
+    """Debounce activation on the runtime clock and retain state through missing inputs."""
+    now = [0.0]
+    runtime_config["events.battery_low"] = {
+        "when": "${location.latitude} < 12",
+        "for_seconds": "5",
+    }
+    context = RuntimeContext(runtime_config, clock=lambda: now[0])
+    context.update("position/TPV", {"mode": 3, "lat": 11, "lon": 20})
+    assert context.evaluate_events() == []
+    now[0] = 5
+    assert context.evaluate_events()[0]["state"] == "active"
+    context.update("position/TPV", {"mode": 1, "lat": 11, "lon": 20})
+    assert context.evaluate_events() == []
+    context.update("position/TPV", {"mode": 3, "lat": 13, "lon": 20})
+    assert context.evaluate_events()[0]["state"] == "cleared"
+
+
+def test_runtime_event_validation_and_producer_requirement(runtime_config: ConfigParser) -> None:
+    """Validate configured event references and prevent events without telemetry producers."""
+    runtime_config["events.battery_low"] = {"when": "${location.latitude} < 12"}
+    RuntimeContext(runtime_config).validate_sources(runtime_config)
+    runtime_config["source"]["enabled-sources"] = "weather"
+    with pytest.raises(ValueError, match="no enabled producer"):
+        RuntimeContext(runtime_config).validate_sources(runtime_config)
+    runtime_config["source"]["enabled-sources"] = "gps, weather"
+    runtime_config["runtime"] = {"events_topic": "position"}
+    with pytest.raises(ValueError, match="overlaps telemetry"):
+        RuntimeContext(runtime_config).validate_sources(runtime_config)
+
+
+def test_runtime_event_rejects_unsupported_condition_and_options(runtime_config: ConfigParser) -> None:
+    """Keep event evaluation to one declarative comparison and known options."""
+    runtime_config["events.bad"] = {"when": "${location.latitude} + 1 < 12"}
+    with pytest.raises(ValueError, match="Invalid event condition"):
+        RuntimeContext(runtime_config)
+    runtime_config["events.bad"] = {
+        "when": "${location.latitude} < 12",
+        "command": "unsafe",
+    }
+    with pytest.raises(ValueError, match="accept only"):
+        RuntimeContext(runtime_config)
 
 
 def test_variable_publication_and_periodic_expiry(runtime_config: ConfigParser) -> None:

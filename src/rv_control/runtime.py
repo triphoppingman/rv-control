@@ -21,6 +21,8 @@ NAME = r"[A-Za-z_][A-Za-z_0-9]*"
 PATH = rf"{NAME}(?:\.{NAME})*"
 TOKEN = re.compile(rf"\$(?:\{{({PATH})\}}|({NAME})|(\$))")
 PREDICATE = re.compile(rf"^\s*({PATH})\s*(==|!=|>=|<=|>|<)\s*(.+?)\s*$")
+MAX_WINDOW_SECONDS = 86400.0
+MAX_WINDOW_SAMPLES = 1024
 COMPARISONS = {
     "==": operator.eq, "!=": operator.ne, ">=": operator.ge,
     "<=": operator.le, ">": operator.gt, "<": operator.lt,
@@ -33,10 +35,11 @@ class VariablesUnavailable(ValueError):
 
 
 class Expression:
-    """Compile restricted numeric arithmetic over explicit runtime references."""
+    """Compile restricted arithmetic and bounded telemetry-window operations."""
 
     operations = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
                   ast.Div: operator.truediv, ast.Mod: operator.mod}
+    window_operations = {"avg", "min", "max", "rate"}
 
     def __init__(self, text: str) -> None:
         """Reject calls, attributes, indexing and unbounded expression structures."""
@@ -56,24 +59,78 @@ class Expression:
         except SyntaxError as error:
             raise ValueError("Invalid derived arithmetic expression") from error
         nodes = list(ast.walk(self.tree))
-        if len(nodes) > 64 or any(
-            not isinstance(node, (ast.BinOp, ast.UnaryOp, ast.Constant, ast.Name, ast.Load,
-                                  ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod, ast.UAdd, ast.USub))
-            or (isinstance(node, ast.Name) and node.id not in self.names)
-            or (isinstance(node, ast.Constant) and
-                (type(node.value) not in (int, float) or not _finite_number(node.value)))
-            for node in nodes
-        ):
-            raise ValueError("Derived expressions support finite numbers, references and + - * / % only")
+        if len(nodes) > 64:
+            raise ValueError("Derived expression exceeds 64 syntax nodes")
+        for node in nodes:
+            if isinstance(node, ast.Call):
+                if (
+                    not isinstance(node.func, ast.Name)
+                    or node.func.id not in self.window_operations
+                    or len(node.args) != 2
+                    or node.keywords
+                    or not isinstance(node.args[0], ast.Name)
+                    or node.args[0].id not in self.names
+                    or not isinstance(node.args[1], ast.Constant)
+                    or type(node.args[1].value) not in (int, float)
+                    or not _finite_number(node.args[1].value)
+                    or not 0 < node.args[1].value <= MAX_WINDOW_SECONDS
+                ):
+                    raise ValueError(
+                        "Window operations require avg|min|max|rate(${telemetry.variable}, seconds)"
+                    )
+                continue
+            if not isinstance(node, (
+                ast.BinOp, ast.UnaryOp, ast.Constant, ast.Name, ast.Load,
+                ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod, ast.UAdd, ast.USub,
+            )):
+                raise ValueError("Derived expressions support finite numbers, references and + - * / % only")
+            if isinstance(node, ast.Name) and node.id not in self.names and not (
+                isinstance(getattr(node, "ctx", None), ast.Load)
+                and any(isinstance(parent, ast.Call) and parent.func is node for parent in nodes)
+                and node.id in self.window_operations
+            ):
+                raise ValueError(f"Unknown name in derived expression: {node.id}")
+            if isinstance(node, ast.Constant) and (
+                type(node.value) not in (int, float) or not _finite_number(node.value)
+            ):
+                raise ValueError("Derived expressions support finite numbers only")
 
-    def evaluate(self, values: Mapping[str, Scalar]) -> Scalar:
-        """Evaluate numeric nodes explicitly, never using Python eval."""
+    def evaluate(
+        self,
+        values: Mapping[str, Scalar],
+        history: Mapping[str, list[tuple[float, int | float]]],
+        now: float,
+    ) -> Scalar:
+        """Evaluate validated arithmetic using telemetry history without Python eval."""
         def visit(node: ast.AST) -> int | float:
-            """Calculate one validated node with finite, non-boolean operands."""
+            """Calculate one validated node and reject nonnumeric intermediate values."""
             if isinstance(node, ast.Name):
                 value = values[self.names[node.id]]
             elif isinstance(node, ast.Constant):
                 value = node.value
+            elif isinstance(node, ast.Call):
+                variable = self.names[node.args[0].id]
+                window = float(node.args[1].value)
+                samples = [
+                    (sample_time, sample)
+                    for sample_time, sample in history.get(variable, [])
+                    if now - window <= sample_time <= now
+                ]
+                if not samples:
+                    raise ValueError("No numeric telemetry samples in the requested window")
+                operation = node.func.id
+                sample_values = [sample[1] for sample in samples]
+                if operation == "avg":
+                    value = sum(sample_values) / len(sample_values)
+                elif operation == "min":
+                    value = min(sample_values)
+                elif operation == "max":
+                    value = max(sample_values)
+                else:
+                    elapsed = samples[-1][0] - samples[0][0]
+                    if elapsed <= 0:
+                        raise ValueError("Rate requires at least two samples at different times")
+                    value = (samples[-1][1] - samples[0][1]) / elapsed
             elif isinstance(node, ast.UnaryOp):
                 operand = visit(node.operand)
                 value = -operand if isinstance(node.op, ast.USub) else operand
@@ -86,12 +143,125 @@ class Expression:
             return value
         return visit(self.tree)
 
+    @property
+    def window_references(self) -> set[str]:
+        """Return telemetry variables used by temporal aggregation functions."""
+        return {
+            self.names[node.args[0].id]
+            for node in ast.walk(self.tree)
+            if isinstance(node, ast.Call)
+        }
+
 
 @dataclass(frozen=True)
 class Reference:
     """Identify one variable without confusing it with literal template text."""
 
     name: str
+
+
+@dataclass(frozen=True)
+class EventPredicate:
+    """Compare one runtime value with a declared JSON scalar."""
+
+    variable: str
+    comparison: str
+    expected: Scalar
+
+    @classmethod
+    def compile(cls, text: str) -> EventPredicate:
+        """Parse one safe runtime-reference comparison from event configuration."""
+        parts = parse_template(text)
+        references = [part for part in parts if isinstance(part, Reference)]
+        literals = [part for part in parts if isinstance(part, str)]
+        if len(references) != 1 or len(literals) != 1:
+            raise ValueError("Event conditions require one runtime variable and one scalar comparison")
+        match = PREDICATE.fullmatch(f"{references[0].name} {literals[0]}")
+        if not match:
+            raise ValueError("Invalid event condition")
+        try:
+            expected = json.loads(match[3])
+        except json.JSONDecodeError as error:
+            raise ValueError("Event condition must compare with a JSON scalar") from error
+        if not _scalar(expected):
+            raise ValueError("Event condition must compare with a non-null finite JSON scalar")
+        return cls(match[1], match[2], expected)
+
+    def matches(self, actual: Any) -> bool:
+        """Return false for unavailable or incomparable values rather than raising."""
+        if not _scalar(actual):
+            return False
+        numeric = (
+            isinstance(actual, (int, float)) and not isinstance(actual, bool)
+            and isinstance(self.expected, (int, float)) and not isinstance(self.expected, bool)
+        )
+        if not numeric and type(actual) is not type(self.expected):
+            return False
+        return bool(COMPARISONS[self.comparison](actual, self.expected))
+
+
+class RuntimeEvent:
+    """Track one opt-in, read-only condition and its active/cleared transitions."""
+
+    def __init__(self, name: str, section: Mapping[str, str]) -> None:
+        """Validate event conditions and bounded activation delay at startup."""
+        if set(section) - {"when", "clear_when", "for_seconds"}:
+            raise ValueError("Event sections accept only when, clear_when and for_seconds")
+        self.name = name
+        self.when = EventPredicate.compile(section.get("when", ""))
+        clear_when = section.get("clear_when", "").strip()
+        self.clear_when = EventPredicate.compile(clear_when) if clear_when else None
+        self.for_seconds = float(section.get("for_seconds", "0"))
+        if (
+            not math.isfinite(self.for_seconds)
+            or not 0 <= self.for_seconds <= MAX_WINDOW_SECONDS
+        ):
+            raise ValueError("Event for_seconds must be finite and between 0 and 86400")
+        self.active = False
+        self.pending_since: float | None = None
+
+    def evaluate(self, values: Mapping[str, dict[str, Any]], now: float) -> dict[str, Any] | None:
+        """Advance debounce state and return one event only when state changes."""
+        required = (
+            (self.when.variable, self.clear_when.variable)
+            if self.active and self.clear_when else (self.when.variable,)
+        )
+        if any(name is not None and values[name]["reason"] for name in required):
+            self.pending_since = None
+            return None
+
+        when_value = values[self.when.variable]["value"]
+        if self.active:
+            should_clear = (
+                self.clear_when.matches(values[self.clear_when.variable]["value"])
+                if self.clear_when else not self.when.matches(when_value)
+            )
+            if not should_clear:
+                return None
+            previous, state = "active", "cleared"
+            self.active = False
+        else:
+            if not self.when.matches(when_value):
+                self.pending_since = None
+                return None
+            if self.pending_since is None:
+                self.pending_since = now
+            if now - self.pending_since < self.for_seconds:
+                return None
+            previous, state = "inactive", "active"
+            self.active = True
+            self.pending_since = None
+
+        observed = values[self.when.variable]
+        return {
+            "event": self.name,
+            "state": state,
+            "previous_state": previous,
+            "variable": self.when.variable,
+            "value": observed["value"],
+            "updated_at": observed["updated_at"],
+            "occurred_at": datetime.now(timezone.utc).isoformat(),
+        }
 
 
 def parse_template(text: str) -> tuple[str | Reference, ...]:
@@ -200,11 +370,13 @@ class RuntimeContext:
         self._names: dict[str, Binding] = {}
         self._values: dict[str, tuple[float, dict[str, Scalar]]] = {}
         self._invalid: set[str] = set()
+        self._history: dict[str, list[tuple[float, int | float]]] = {}
         self._lock = threading.Lock()
         self._clock = clock
         self.config = config
         self.constants: dict[str, Scalar] = {}
         self.derived: dict[str, Expression] = {}
+        self.events: dict[str, RuntimeEvent] = {}
         self._timestamps: dict[str, str] = {}
         self._calculation_errors: set[str] = set()
         for section_name in config.sections():
@@ -245,18 +417,47 @@ class RuntimeContext:
                         raise ValueError(f"Invalid derived name: {key}")
                     name = f"{namespace}.{key}" if namespace else key
                     self.derived[name] = Expression(text)
+        for name, expression in self.derived.items():
+            for variable in expression.window_references:
+                    if variable not in self._names:
+                        raise ValueError(
+                            f"Window operations require a directly bound telemetry variable: {variable}"
+                        )
         all_names = [*self._names, *self.constants, *self.derived]
         if len(set(all_names)) != len(all_names):
             raise ValueError("Duplicate runtime variable")
         for name in self.derived:
             self.dependencies(name)
+        for section_name in config.sections():
+            if not section_name.startswith("events."):
+                continue
+            name = section_name[len("events."):]
+            if not re.fullmatch(PATH, name):
+                raise ValueError(f"Invalid runtime event name: [{section_name}]")
+            try:
+                event = RuntimeEvent(name, config[section_name])
+            except ValueError as error:
+                raise ValueError(f"[{section_name}] {error}") from error
+            for variable in (event.when.variable, event.clear_when.variable if event.clear_when else None):
+                if variable is not None:
+                    self.dependencies(variable)
+            self.events[name] = event
         self.publish_variables = config.getboolean("runtime", "publish_variables", fallback=False)
         self.variables_topic = config.get("runtime", "variables_topic", fallback="variables").strip("/")
+        self.events_topic = config.get("runtime", "events_topic", fallback="events").strip("/")
         self.republish_seconds = config.getfloat("runtime", "variables_republish_seconds", fallback=60)
         if not self.variables_topic or any(char in self.variables_topic for char in ("$", "+", "#")):
             raise ValueError("variables_topic must be a literal topic")
         if not math.isfinite(self.republish_seconds) or self.republish_seconds < 0:
             raise ValueError("variables_republish_seconds must be finite and non-negative")
+        if self.events and (
+            not self.events_topic
+            or any(char in self.events_topic for char in ("$", "+", "#"))
+            or self.events_topic == self.variables_topic
+            or self.events_topic.startswith(self.variables_topic + "/")
+            or self.variables_topic.startswith(self.events_topic + "/")
+        ):
+            raise ValueError("events_topic must be literal and separate from variables_topic")
         if self.publish_variables:
             for binding in self.bindings:
                 self.validate_publication_topic(binding.topic)
@@ -297,13 +498,23 @@ class RuntimeContext:
                 values = binding.extract(payload)
                 if values is None:
                     self._values.pop(binding.namespace, None)
+                    for name in binding.fields:
+                        self._history.pop(name, None)
                     if binding.namespace not in self._invalid:
                         LOGGER.warning("Runtime binding %s invalidated by incomplete or rejected telemetry", binding.topic)
                     self._invalid.add(binding.namespace)
                 else:
-                    self._values[binding.namespace] = (self._clock(), values)
+                    received = self._clock()
+                    self._values[binding.namespace] = (received, values)
                     self._timestamps[binding.namespace] = datetime.now(timezone.utc).isoformat()
                     self._invalid.discard(binding.namespace)
+                    for name, value in values.items():
+                        if isinstance(value, (int, float)) and not isinstance(value, bool):
+                            samples = self._history.setdefault(name, [])
+                            samples.append((received, value))
+                            del samples[:-MAX_WINDOW_SAMPLES]
+                        else:
+                            self._history.pop(name, None)
 
     def _snapshot(self) -> dict[str, dict[str, Any]]:
         """Evaluate all values under the caller's lock, inheriting input expiry."""
@@ -327,7 +538,11 @@ class RuntimeContext:
                     reason = "dependency_unavailable"
                 else:
                     try:
-                        value = self.derived[name].evaluate({key: item["value"] for key, item in inputs.items()})
+                        value = self.derived[name].evaluate(
+                            {key: item["value"] for key, item in inputs.items()},
+                            self._history,
+                            now,
+                        )
                     except (ValueError, ArithmeticError) as error:
                         reason = "calculation_error"
                         if name not in self._calculation_errors:
@@ -404,6 +619,18 @@ class RuntimeContext:
                 }
             return groups
 
+    def evaluate_events(self) -> list[dict[str, Any]]:
+        """Return read-only transition records for currently evaluable event rules."""
+        with self._lock:
+            values = self._snapshot()
+            now = self._clock()
+            transitions = []
+            for event in self.events.values():
+                transition = event.evaluate(values, now)
+                if transition is not None:
+                    transitions.append(transition)
+            return transitions
+
     def validate_sources(self, config: ConfigParser) -> None:
         """Reject unknown producers and cyclic source dependencies before startup."""
         from .sources.base import Source
@@ -413,6 +640,15 @@ class RuntimeContext:
         for name, source_type in sources.items():
             if self.publish_variables:
                 self.validate_publication_topic(source_type.published_topic_root(config, name))
+            if self.events:
+                topic_root = source_type.published_topic_root(config, name)
+                if (
+                    topic_root
+                    and (self.events_topic == topic_root
+                         or self.events_topic.startswith(topic_root + "/")
+                         or topic_root.startswith(self.events_topic + "/"))
+                ):
+                    raise ValueError(f"Runtime event topic overlaps telemetry topic: {topic_root}")
             source_type.validate_config(config, name)
             for key in source_type.runtime_options:
                 references = self.references(config[name].get(key, ""))
@@ -430,6 +666,30 @@ class RuntimeContext:
                     if len(matches) != 1:
                         raise ValueError(f"Ambiguous producers for runtime variable {variable}")
                     graph[name].add(matches[0])
+        for event_name, event in self.events.items():
+            event_variables = {
+                event.when.variable,
+                *([event.clear_when.variable] if event.clear_when else []),
+            }
+            for variable in event_variables:
+                for telemetry_variable in self.dependencies(variable):
+                    topic = self._names[telemetry_variable].topic
+                    producers = []
+                    for candidate, candidate_type in sources.items():
+                        root = candidate_type.published_topic_root(config, candidate)
+                        if root and (topic == root or topic.startswith(root + "/")):
+                            producers.append((len(root), candidate))
+                    if not producers:
+                        raise ValueError(
+                            f"Runtime event {event_name} depends on {telemetry_variable} "
+                            f"with no enabled producer for {topic}"
+                        )
+                    longest = max(producer[0] for producer in producers)
+                    if len([candidate for length, candidate in producers if length == longest]) != 1:
+                        raise ValueError(
+                            f"Runtime event {event_name} has ambiguous producers for "
+                            f"{telemetry_variable}"
+                        )
         visiting: set[str] = set()
         visited: set[str] = set()
 
@@ -462,11 +722,12 @@ class RuntimePublisher:
         self._published: dict[str, tuple[str, float]] = {}
 
     def connect(self) -> None:
-        """Connect the wrapped destinations."""
+        """Connect destinations and start maintenance for configured publications."""
         self.publisher.connect()
         if self.runtime_context.publish_variables:
             with self._lock:
                 self._publish_variables()
+        if self.runtime_context.publish_variables or self.runtime_context.events:
             self._thread = threading.Thread(target=self._maintain, name="runtime-variables", daemon=True)
             self._thread.start()
 
@@ -487,6 +748,7 @@ class RuntimePublisher:
                 self.publisher.publish(topic, payload)
             if self.runtime_context.publish_variables:
                 self._publish_variables()
+            self._publish_events()
 
     def _publish_variables(self) -> None:
         """Emit changed/expired groups or periodic snapshots without rebinding them."""
@@ -504,12 +766,21 @@ class RuntimePublisher:
             })
             self._published[namespace] = (signature, now)
 
+    def _publish_events(self) -> None:
+        """Publish only configured read-only state transitions through existing targets."""
+        context = self.runtime_context
+        for event in context.evaluate_events():
+            name = event["event"].replace(".", "/")
+            self.publisher.publish(f"{context.events_topic}/{name}", event)
+
     def _maintain(self) -> None:
-        """Check expiry independently of incoming reports until the wrapper is closed."""
+        """Check variable expiry and event debounce timers without source traffic."""
         while not self._stop.wait(0.5):
             try:
                 with self._lock:
-                    self._publish_variables()
+                    if self.runtime_context.publish_variables:
+                        self._publish_variables()
+                    self._publish_events()
             except (OSError, ValueError, RuntimeError):
                 LOGGER.exception("Runtime variable publication failed; retrying")
 

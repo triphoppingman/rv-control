@@ -13,12 +13,14 @@ The shared runtime supports three kinds of values:
 | --- | --- | --- | --- |
 | Telemetry binding | `topic`, `fields`, optional `require` and `max_age` | A complete, acceptable report arrives | Yes |
 | Constant | `constants` JSON object | Configuration is loaded | No |
-| Derived value | Arithmetic in a `[derived]` section | Every dependency is valid and calculation succeeds | With its earliest expiring input |
+| Derived value | Arithmetic or optional telemetry-window functions in a `[derived]` section | Every dependency is valid and calculation succeeds | With its earliest expiring input |
 
 Optional publication makes these values observable through the existing targets,
 including MQTT. Publication is not required for one source to consume another's
 telemetry. This is an in-process facility, not an MQTT subscription or persistent
-variable store.
+variable store. Opt-in moving-window calculations and read-only event rules use
+the same runtime without changing existing bindings or consumers.
+Event rules are state transitions, not another variable kind.
 
 **Current consumer scope:** only Open-Meteo's `latitude` and `longitude` settings
 opt into runtime references. All existing sources can supply telemetry to
@@ -132,13 +134,26 @@ Allowed syntax:
 - Numeric literals and explicit runtime references.
 - Parentheses and unary `+` / `-`.
 - Binary `+`, `-`, `*`, `/`, `%`.
+- Optional moving-window functions over directly bound numeric telemetry:
+  `avg`, `min`, `max`, and `rate`.
 
-Calls (including `round`), attribute access, indexing, powers, comparisons,
-string concatenation, arbitrary Python and shell execution are not allowed.
-Expressions are limited to 4096 characters and 64 AST nodes; arithmetic integers
-are also bounded. Booleans and numeric strings are not arithmetic operands.
-Division by zero, oversized/non-finite results and invalid operand types make
-the value unavailable and log a warning, rather than preserving an old result.
+Window functions use the form `avg(${location.voltage}, 60)`: they include
+numeric reports received during the preceding number of seconds, including the
+current report. `avg`, `min` and `max` are sample-based, not time-weighted.
+`rate` is `(newest - oldest) / elapsed_seconds` and needs two samples with
+different receipt times. Windows must be greater than zero and no longer than
+86,400 seconds. Runtime retains at most 1,024 samples per telemetry variable;
+if that cap is reached, oldest samples are evicted. Window functions cannot
+read constants or other derived values. Existing arithmetic expressions do
+not use history and keep their prior behavior.
+
+Other calls (including `round`), attribute access, indexing, powers,
+comparisons, string concatenation, arbitrary Python and shell execution are
+not allowed. Expressions are limited to 4096 characters and 64 AST nodes;
+arithmetic integers are also bounded. Booleans and numeric strings are not
+arithmetic operands. Division by zero, insufficient window samples,
+oversized/non-finite results and invalid operand types make the value
+unavailable and log a warning, rather than preserving an old result.
 
 Derived values do not have their own configurable TTL. They inherit the earliest
 dependency expiry. An expression using only constants/numeric literals has no
@@ -237,6 +252,43 @@ measurement time. Runtime values are never restored from retained MQTT or disk.
 Publication exposes all configured variables, potentially including location;
 enable it only for trusted targets/subscribers.
 
+### 2.6 Define read-only transition events
+
+Event rules publish a message when a condition becomes true, and another when
+it clears. They are opt-in, do not write to CAN/BLE/WLED or invoke coach
+commands, and do not alter source telemetry or existing runtime-variable
+resolution.
+
+```ini
+[runtime]
+events_topic = events
+
+[events.battery_low]
+when = ${battery.voltage} < 12.0
+clear_when = ${battery.voltage} > 12.5
+for_seconds = 30
+```
+
+`[events.NAME]` defines one event. `when` is required and must compare one
+runtime variable with a non-null JSON scalar using `==`, `!=`, `<`, `<=`, `>`
+or `>=`. `clear_when` is optional; without it, the event clears when `when`
+becomes false. A custom `clear_when` provides hysteresis. `for_seconds`
+optionally delays activation while `when` remains true (default `0`, maximum
+86,400 seconds); clearing is immediate. Invalid, missing, or stale inputs pause
+the rule without clearing an already active event; if activation was pending,
+its delay starts over after inputs become available again. Event state starts
+inactive after daemon restart and is not restored from MQTT.
+
+With `events_topic = events`, the example publishes to
+`<base_topic>/events/battery_low`. Nested event names map dots to topic
+separators. Each transition includes `event`, `state`, `previous_state`,
+`variable`, its current `value` and `updated_at`, and `occurred_at`. Event rules
+whose telemetry dependencies have no enabled producer fail startup validation.
+The event topic must be literal, must not overlap enabled source telemetry
+topics, and must be separate from the runtime-variable publication prefix.
+Events are sent through the existing target configuration, so MQTT retain/QoS
+settings apply as they do to other target publications.
+
 ## 3. Binding and resolution over time
 
 There are three distinct events, not a one-time startup substitution:
@@ -306,7 +358,8 @@ source threads
 RuntimePublisher.publish(topic, payload)
     |-- RuntimeContext.update(topic, payload)
     |-- wrapped publisher.publish(original telemetry)
-    `-- optional variable snapshots -> wrapped publisher directly
+    |-- optional variable snapshots -> wrapped publisher directly
+    `-- optional event transitions -> wrapped publisher directly
                                       |
                                       v
                               coach-state/target pipeline
@@ -318,8 +371,10 @@ RuntimePublisher.publish(topic, payload)
 The shared publisher exposes `runtime_context` to sources. Supervised source
 restarts receive that same publisher/context rather than resetting other
 sources' variable state. Target connection precedes initial variable publication
-and maintenance-thread startup. Shutdown stops sources, closes the runtime
-publisher (stopping/joining its maintenance thread), then closes wrapped targets.
+and maintenance-thread startup. The maintenance thread handles variable
+expiry/republication and event activation delays even without incoming telemetry.
+Shutdown stops sources, closes the runtime publisher (stopping/joining its
+maintenance thread), then closes wrapped targets.
 
 Generated snapshots bypass `RuntimePublisher.publish` and therefore never become
 new binding inputs. The wrapper lock serializes source/publication operations;
@@ -335,6 +390,11 @@ the context lock protects bound state and snapshot evaluation.
   remove the stored group; warnings are suppressed until the binding recovers.
 - `Expression` parses a restricted AST and evaluates validated nodes explicitly,
   without Python `eval`.
+- Window functions use bounded per-variable sample history; ordinary arithmetic
+  continues to evaluate current values only.
+- `[events.NAME]` rules debounce optional activations and publish only
+  active/cleared transitions. Unavailable inputs do not create false clears,
+  and event evaluation never dispatches device commands.
 - `dependencies` resolves transitive telemetry inputs and rejects derived cycles.
 - `_snapshot` memoizes calculations within one evaluation, combining constants,
   telemetry and derived status. Derived calculation warnings are suppressed until
