@@ -121,13 +121,37 @@ class Source(threading.Thread, ABC):
         """Start enabled sources and return them indexed by config section."""
         sources = []
         source_map = {}
-        for name, source_type in cls.enabled_sources(config):
-            source = source_type(config, publisher, stop_event, name)
-            LOGGER.info("Starting source instance %s (%s)", name, source_type.source_name)
-            source.start()
-            sources.append(source)
-            source_map[name] = source
+        try:
+            for name, source_type in cls.enabled_sources(config):
+                source = source_type(config, publisher, stop_event, name)
+                sources.append(source)
+                source_map[name] = source
+                LOGGER.info("Starting source instance %s (%s)", name, source_type.source_name)
+                source.start()
+        except BaseException:
+            cls.stop_and_join(sources, stop_event)
+            raise
         return sources, source_map
+
+    @staticmethod
+    def stop_and_join(
+        sources: list[Source], stop_event: threading.Event, grace_period: float = 30,
+    ) -> None:
+        """Signal sources, warn after a grace period, and wait before publisher teardown."""
+        stop_event.set()
+        started = [source for source in sources if source.ident is not None]
+        deadline = time.monotonic() + grace_period
+        for source in started:
+            source.join(timeout=max(0.0, deadline - time.monotonic()))
+        running = [source for source in started if source.is_alive()]
+        if running:
+            names = ", ".join(source.section_name for source in running)
+            LOGGER.error(
+                "Sources exceeded the %.1fs shutdown grace period; keeping targets open until they stop: %s",
+                grace_period, names,
+            )
+            for source in running:
+                source.join()
 
     @classmethod
     def run_until_stopped(
@@ -167,7 +191,11 @@ class Source(threading.Thread, ABC):
         self.config = config
         self.section_name = section_name or self.config_section
         super().__init__(name=self.section_name, daemon=True)
-        self.publisher = publisher
+        self.publisher = (
+            _SourcePublisher(publisher, self.source_name, self.section_name)
+            if callable(getattr(publisher, "publish_source", None))
+            else publisher
+        )
         self.stop_event = stop_event
 
     @property
@@ -227,6 +255,26 @@ class Source(threading.Thread, ABC):
     def interrogate(self) -> dict[str, Any]:
         """Return a current source snapshot, when supported."""
         raise NotImplementedError(f"{self.source_name} does not support interrogation")
+
+
+class _SourcePublisher:
+    """Bind source identity once while preserving the source publish interface."""
+
+    def __init__(self, publisher: Any, source_type: str, source_section: str) -> None:
+        """Retain the shared publisher and this source instance's provenance."""
+        self._publisher = publisher
+        self._source_type = source_type
+        self._source_section = source_section
+
+    def publish(self, topic: str, payload: dict[str, Any]) -> None:
+        """Forward a publication with the bound source type and section."""
+        self._publisher.publish_source(
+            topic, payload, self._source_type, self._source_section,
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        """Preserve access to shared publisher features used by source helpers and tests."""
+        return getattr(self._publisher, name)
 
 
 class PollingSource(Source):

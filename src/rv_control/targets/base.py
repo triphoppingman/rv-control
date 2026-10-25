@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import copy
 import importlib
 import logging
+import queue
+import threading
+import time
 from abc import ABC, abstractmethod
 from configparser import ConfigParser
+from dataclasses import dataclass
 from typing import Any, Callable, TypeVar
 
 LOGGER = logging.getLogger(__name__)
@@ -139,6 +144,22 @@ class MultiTarget(Target):
             except Exception:
                 LOGGER.exception("Target %s failed to publish %s", target.target_name, topic)
 
+    def publish_publication(self, publication: Publication) -> None:
+        """Fan out a queued publication while retaining its provenance in failures."""
+        for target in self.targets:
+            try:
+                target.publish(publication.topic, publication.payload)
+            except Exception:
+                LOGGER.exception(
+                    "Target %s failed: source=%s section=%s topic=%s sequence=%d queue_delay=%.3fs",
+                    target.target_name,
+                    publication.source_type,
+                    publication.source_section,
+                    publication.topic,
+                    publication.sequence,
+                    time.monotonic() - publication.enqueued_at,
+                )
+
     def close(self) -> None:
         """Close every target even if some fail."""
         for target in self.targets:
@@ -151,3 +172,122 @@ class MultiTarget(Target):
             target.close()
         except Exception:
             LOGGER.exception("Target %s failed to close", target.target_name)
+
+
+@dataclass(frozen=True)
+class Publication:
+    """Describe one accepted telemetry publication for asynchronous target delivery."""
+
+    topic: str
+    payload: dict[str, Any]
+    source_type: str
+    source_section: str
+    sequence: int
+    enqueued_at: float
+
+
+class QueuedTarget:
+    """Dispatch accepted publications on one bounded worker before closing targets."""
+
+    DEFAULT_QUEUE_DEPTH = 1024
+
+    def __init__(self, target: Target, queue_depth: int) -> None:
+        """Wrap configured targets with a bounded FIFO dispatch queue."""
+        if queue_depth < 1:
+            raise ValueError("[service] publish_queue_depth must be greater than zero")
+        self.target = target
+        self._queue: queue.Queue[Publication | None] = queue.Queue(maxsize=queue_depth)
+        self._publish_lock = threading.Lock()
+        self._close_lock = threading.Lock()
+        self._worker: threading.Thread | None = None
+        self._connected = False
+        self._closing = False
+        self._closed = False
+        self._sequence = 0
+
+    @classmethod
+    def configured_depth(cls, config: ConfigParser) -> int:
+        """Read and validate the bounded dispatch queue depth."""
+        depth = config.getint(
+            "service", "publish_queue_depth", fallback=cls.DEFAULT_QUEUE_DEPTH,
+        )
+        if depth < 1:
+            raise ValueError("[service] publish_queue_depth must be greater than zero")
+        return depth
+
+    def connect(self) -> None:
+        """Connect all destinations and start the FIFO dispatch worker."""
+        self.target.connect()
+        try:
+            self._worker = threading.Thread(
+                target=self._dispatch,
+                name="target-dispatch",
+                daemon=True,
+            )
+            self._worker.start()
+            self._connected = True
+        except BaseException:
+            self.target.close()
+            raise
+
+    def publish(self, topic: str, payload: dict[str, Any]) -> None:
+        """Queue an un-attributed publication for delivery to configured targets."""
+        self.publish_source(topic, payload, "runtime", "runtime")
+
+    def publish_source(
+        self, topic: str, payload: dict[str, Any], source_type: str, source_section: str,
+    ) -> None:
+        """Snapshot and enqueue telemetry, blocking producers while the queue is full."""
+        snapshot = copy.deepcopy(payload)
+        with self._publish_lock:
+            if not self._connected or self._closing or self._closed:
+                raise RuntimeError("Target dispatcher is not accepting publications")
+            self._sequence += 1
+            self._queue.put(Publication(
+                topic=topic,
+                payload=snapshot,
+                source_type=source_type,
+                source_section=source_section,
+                sequence=self._sequence,
+                enqueued_at=time.monotonic(),
+            ))
+
+    def _dispatch(self) -> None:
+        """Deliver queued publications in acceptance order and log target failures."""
+        while True:
+            publication = self._queue.get()
+            try:
+                if publication is None:
+                    return
+                try:
+                    publish_publication = getattr(self.target, "publish_publication", None)
+                    if callable(publish_publication):
+                        publish_publication(publication)
+                    else:
+                        self.target.publish(publication.topic, publication.payload)
+                except Exception:
+                    LOGGER.exception(
+                        "Target dispatch failed: source=%s section=%s topic=%s sequence=%d queue_delay=%.3fs",
+                        publication.source_type,
+                        publication.source_section,
+                        publication.topic,
+                        publication.sequence,
+                        time.monotonic() - publication.enqueued_at,
+                    )
+            finally:
+                self._queue.task_done()
+
+    def close(self) -> None:
+        """Drain accepted publications before closing each configured target."""
+        with self._close_lock:
+            if self._closed:
+                return
+            with self._publish_lock:
+                self._closing = True
+                worker = self._worker
+                if worker is not None:
+                    self._queue.put(None)
+            if worker is not None:
+                worker.join()
+            self.target.close()
+            self._closed = True

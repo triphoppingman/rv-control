@@ -5,6 +5,8 @@ import threading
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from rv_control.config import load_config
 from rv_control.sources.hughes import HughesSource
 from rv_control.sources.renogy import RenogySource
@@ -40,6 +42,118 @@ def test_source_supervisor_restarts_dead_source() -> None:
     Source.run_until_stopped(None, None, stop_event, sources, source_map)
     assert RestartableSource.instances == 2
     assert source_map["fake"] is sources[0]
+
+
+def test_source_base_binds_type_and_configured_section_to_publish() -> None:
+    """Bind source provenance once in the base class instead of each source."""
+    publications = []
+
+    class Publisher:
+        """Capture provenance provided by the source-bound publisher view."""
+
+        def publish_source(
+            self, topic: str, payload: dict[str, Any], source_type: str, source_section: str,
+        ) -> None:
+            """Record the original event and its source identity."""
+            publications.append((topic, payload, source_type, source_section))
+
+    class SourceStub(Source):
+        """Provide the minimal abstract interface for source publisher binding."""
+
+        source_name = "source-publisher-binding"
+
+        def run(self) -> None:
+            """Perform no collection in this publisher-only test."""
+
+        def comms_check(self) -> dict[str, Any]:
+            """Report the stub as available."""
+            return {"ok": True}
+
+    source = SourceStub(None, Publisher(), threading.Event(), "renogy_battery")
+    source.publisher.publish("renogy", {"voltage": 12.4})
+
+    assert publications == [
+        ("renogy", {"voltage": 12.4}, "source-publisher-binding", "renogy_battery"),
+    ]
+
+
+def test_start_enabled_stops_started_sources_when_later_construction_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify partial source startup is rolled back when a later constructor fails."""
+    stop_event = threading.Event()
+    started: list[WaitingSource] = []
+
+    class WaitingSource(threading.Thread):
+        """Represent a source thread that exits when its shared stop event is set."""
+
+        source_name = "waiting"
+        section_name = "waiting"
+
+        def __init__(self, _config: Any, _publisher: Any, event: threading.Event, _name: str) -> None:
+            """Retain the shutdown event for the fake source worker."""
+            super().__init__(daemon=True)
+            self.stop_event = event
+            started.append(self)
+
+        def run(self) -> None:
+            """Wait until startup rollback signals shutdown."""
+            self.stop_event.wait()
+
+    class FailingSource:
+        """Fail construction to exercise rollback of previously started threads."""
+
+        source_name = "failing"
+
+        def __init__(self, *_args: Any) -> None:
+            """Raise the configured construction failure."""
+            raise ValueError("source construction failed")
+
+    monkeypatch.setattr(
+        Source,
+        "enabled_sources",
+        classmethod(lambda _cls, _config: (("waiting", WaitingSource), ("failing", FailingSource))),
+    )
+
+    with pytest.raises(ValueError, match="source construction failed"):
+        Source.start_enabled(None, None, stop_event)
+
+    assert stop_event.is_set()
+    assert len(started) == 1
+    assert not started[0].is_alive()
+
+
+def test_source_shutdown_keeps_waiting_for_live_threads_after_grace_period() -> None:
+    """Do not return from source shutdown while a source can still publish."""
+    stop_event = threading.Event()
+    release = threading.Event()
+
+    class SlowSource(threading.Thread):
+        """Represent a source that takes longer than the grace period to stop."""
+
+        section_name = "slow"
+
+        def run(self) -> None:
+            """Remain active until the test releases this source."""
+            release.wait()
+
+    source = SlowSource()
+    source.start()
+    shutdown = threading.Thread(
+        target=Source.stop_and_join,
+        args=([source], stop_event, 0.01),
+    )
+    shutdown.start()
+    shutdown.join(timeout=0.05)
+
+    assert shutdown.is_alive()
+    assert source.is_alive()
+    assert stop_event.is_set()
+    release.set()
+    shutdown.join(timeout=1)
+
+    assert not shutdown.is_alive()
+    assert not source.is_alive()
 
 
 def test_renogy_config_propagates_adapter_and_one_shot_mode(config_file: Path) -> None:
@@ -122,3 +236,32 @@ def test_hughes_reconnects_after_session_failure(config_file: Path) -> None:
 
     asyncio.run(source._run_ble(FakeClient, "AA:BB:CC:DD:EE:FF"))
     assert calls == ["construct", "construct"]
+
+
+def test_hughes_reconnect_wait_is_interrupted_by_shutdown(config_file: Path) -> None:
+    """Verify shutdown wakes a Hughes reconnect delay immediately."""
+    config = load_config(str(config_file))
+    config["hughes"]["persistent_connection"] = "true"
+    config["service"]["reconnect_delay"] = "300"
+    config["service"]["max_reconnect_delay"] = "300"
+    source = HughesSource(config, None, threading.Event())
+    calls = 0
+
+    async def fail_session(*_args: Any) -> None:
+        """Fail the first BLE session to enter the reconnect delay."""
+        nonlocal calls
+        calls += 1
+        raise OSError("temporary failure")
+
+    source._run_ble_session = fail_session
+
+    async def run_until_shutdown() -> None:
+        """Set the stop event during the long retry delay and await prompt exit."""
+        asyncio.get_running_loop().call_later(0.02, source.stop_event.set)
+        await asyncio.wait_for(
+            source._run_ble(lambda *_args: None, "AA:BB:CC:DD:EE:FF"),
+            timeout=0.5,
+        )
+
+    asyncio.run(run_until_shutdown())
+    assert calls == 1

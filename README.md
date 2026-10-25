@@ -25,6 +25,8 @@ The runtime is self-contained and does not import code or configuration from ext
   command/query protocol, controller policy, and result guarantees.
 - [BLE connection reliability](docs/BLE-DESIGN.md): current Renogy and Hughes
   lifecycle, configuration differences, cleanup, and known limitations.
+- [Concurrency and threading model](docs/CONCURRENCY.md): source polling,
+  publication dispatch, backpressure, target workers, and shutdown.
 - [Remote RV-C debugging](docs/RVC-REMOTE-DEBUG.md) and
   [remote OBD debugging](docs/OBD-REMOTE-DEBUG.md): temporary diagnostic runbooks.
 

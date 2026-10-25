@@ -472,9 +472,19 @@ class RuntimePublisher:
 
     def publish(self, topic: str, payload: dict[str, Any]) -> None:
         """Update variables before forwarding telemetry unchanged to its destinations."""
+        self.publish_source(topic, payload, "runtime", "runtime")
+
+    def publish_source(
+        self, topic: str, payload: dict[str, Any], source_type: str, source_section: str,
+    ) -> None:
+        """Update runtime bindings synchronously, then forward attributed telemetry."""
         with self._lock:
             self.runtime_context.update(topic, payload)
-            self.publisher.publish(topic, payload)
+            publish_source = getattr(self.publisher, "publish_source", None)
+            if callable(publish_source):
+                publish_source(topic, payload, source_type, source_section)
+            else:
+                self.publisher.publish(topic, payload)
             if self.runtime_context.publish_variables:
                 self._publish_variables()
 

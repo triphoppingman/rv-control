@@ -189,6 +189,6 @@ class RenogySource(Source, source_name="renogy"):
             self.client = getattr(child, class_name)(
                 renogy_config, received, lambda _client, error: LOGGER.error("Renogy: %s", error)
             )
-            self.client.start()
+            self.client.start(self.stop_event)
         except Exception:
             LOGGER.exception("Renogy source stopped")

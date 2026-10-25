@@ -24,7 +24,7 @@ from .sources.rvc import RvcSource
 from .sources.wled import WledSource
 from .sources.writable import WritableSource
 from .targets import log as _log, mqtt as _mqtt, store as _store  # noqa: F401  (register targets)
-from .targets.base import MultiTarget, Target
+from .targets.base import MultiTarget, QueuedTarget, Target
 from .targets.mqtt import MqttTarget
 
 
@@ -58,6 +58,7 @@ def check(config: Any) -> None:
     """Validate configuration without opening hardware connections."""
     try:
         RuntimeContext(config).validate_sources(config)
+        QueuedTarget.configured_depth(config)
     except ValueError as error:
         raise click.ClickException(str(error)) from error
     click.echo(f"Configuration OK: {config['_meta']['path']}")
@@ -193,8 +194,10 @@ def _validate_reload(config: ConfigParser) -> None:
     runtime.validate_sources(config)
     if not Source.enabled_sources(config):
         raise ValueError("No sources are enabled")
+    queue_depth = QueuedTarget.configured_depth(config)
     publisher = Target.build(config)
     try:
+        publisher = QueuedTarget(publisher, queue_depth)
         publisher = wrap_publisher(config, publisher)
         if api_enabled(config):
             if not isinstance(publisher, CoachStatePublisher):
@@ -212,22 +215,24 @@ def _run_session(config: ConfigParser, reloader: ConfigReloader | None = None) -
     try:
         runtime = RuntimeContext(config)
         runtime.validate_sources(config)
+        queue_depth = QueuedTarget.configured_depth(config)
     except ValueError as error:
         raise click.ClickException(str(error)) from error
     stop_event = threading.Event()
     sources = []
     source_map = {}
-    publisher = Target.build(config, lambda topic, payload: _handle_command(config, source_map, topic, payload))
+    target = Target.build(config, lambda topic, payload: _handle_command(config, source_map, topic, payload))
+    publisher: Any = target
     command_service = None
     try:
+        raw_targets = target.targets if isinstance(target, MultiTarget) else [target]
+        mqtt_targets = [item for item in raw_targets if isinstance(item, MqttTarget)]
+        publisher: Any = QueuedTarget(target, queue_depth)
         try:
             publisher = wrap_publisher(config, publisher)
             if api_enabled(config):
                 if not isinstance(publisher, CoachStatePublisher):
                     raise ValueError("Coach MQTT API requires a configured coach tracker")
-                raw_publisher = publisher.publisher
-                targets = raw_publisher.targets if isinstance(raw_publisher, MultiTarget) else [raw_publisher]
-                mqtt_targets = [target for target in targets if isinstance(target, MqttTarget)]
                 if len(mqtt_targets) != 1:
                     raise ValueError("Coach MQTT API requires exactly one MQTT target")
                 mqtt = mqtt_targets[0]
@@ -269,9 +274,7 @@ def _run_session(config: ConfigParser, reloader: ConfigReloader | None = None) -
             if command_service is not None:
                 command_service.close()
         finally:
-            stop_event.set()
-            for source in sources:
-                source.join(timeout=30 if candidate is not None else 3)
+            Source.stop_and_join(sources, stop_event)
             publisher.close()
     if candidate is not None and any(source.is_alive() for source in sources):
         raise click.ClickException("Configuration reload aborted: source threads have not stopped")

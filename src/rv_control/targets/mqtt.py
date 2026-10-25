@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
 import threading
 from typing import Any, Callable
 
 from .base import Target
 
 LOGGER = logging.getLogger(__name__)
+COMMAND_QUEUE_SIZE = 64
 
 
 class MqttTarget(Target, target_name="mqtt"):
@@ -35,6 +37,12 @@ class MqttTarget(Target, target_name="mqtt"):
         self.command_handler = command_handler
         self.coach_service: Any = None
         self.connected = threading.Event()
+        self._command_queue: queue.Queue[tuple[str, dict[str, Any]] | None] = queue.Queue(
+            maxsize=COMMAND_QUEUE_SIZE,
+        )
+        self._command_worker: threading.Thread | None = None
+        self._command_worker_lock = threading.Lock()
+        self._command_worker_stopped = False
         self.client.on_connect = self._on_connect
         self.client.on_disconnect = self._on_disconnect
 
@@ -43,7 +51,13 @@ class MqttTarget(Target, target_name="mqtt"):
         if self.command_handler or self.coach_service is not None:
             self.client.on_message = self._on_message
         self.client.connect(self.host, self.port, keepalive=60)
-        self.client.loop_start()
+        if self.write_enabled and self.command_handler:
+            self._start_command_worker()
+        try:
+            self.client.loop_start()
+        except BaseException:
+            self._stop_command_worker()
+            raise
 
     def _on_connect(self, _client: Any, _userdata: Any, _flags: Any, reason_code: Any, _properties: Any = None) -> None:
         """Restore every enabled subscription after each successful connection."""
@@ -78,9 +92,56 @@ class MqttTarget(Target, target_name="mqtt"):
         try:
             payload = json.loads(message.payload.decode("utf-8"))
             if self.write_enabled and self.command_handler:
-                self.command_handler(message.topic, payload)
+                if not isinstance(payload, dict):
+                    LOGGER.warning("Ignoring non-object MQTT command on %s", message.topic)
+                    return
+                try:
+                    self._command_queue.put_nowait((message.topic, payload))
+                except queue.Full:
+                    LOGGER.error("MQTT command queue is full; dropping command on %s", message.topic)
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
             LOGGER.warning("Ignoring invalid MQTT command on %s: %s", message.topic, error)
+
+    def _start_command_worker(self) -> None:
+        """Start the single serialized worker for source command callbacks."""
+        with self._command_worker_lock:
+            if self._command_worker is not None:
+                return
+            self._command_worker_stopped = False
+            self._command_worker = threading.Thread(
+                target=self._process_commands,
+                name="mqtt-source-commands",
+                daemon=True,
+            )
+            self._command_worker.start()
+
+    def _process_commands(self) -> None:
+        """Run queued source commands away from Paho's network callback thread."""
+        while True:
+            item = self._command_queue.get()
+            try:
+                if item is None:
+                    return
+                topic, payload = item
+                if self.command_handler is not None:
+                    try:
+                        self.command_handler(topic, payload)
+                    except Exception:
+                        LOGGER.exception("MQTT command handler failed for %s", topic)
+            finally:
+                self._command_queue.task_done()
+
+    def _stop_command_worker(self) -> None:
+        """Stop accepting queued work and join the command worker before teardown."""
+        with self._command_worker_lock:
+            worker = self._command_worker
+            if worker is None or self._command_worker_stopped:
+                return
+            self._command_worker_stopped = True
+        self._command_queue.put(None)
+        worker.join()
+        with self._command_worker_lock:
+            self._command_worker = None
 
     def publish(self, topic: str, payload: dict[str, Any]) -> None:
         """Publish a JSON payload beneath the configured base topic."""
@@ -110,6 +171,7 @@ class MqttTarget(Target, target_name="mqtt"):
         """Stop the MQTT loop and disconnect the broker client."""
         self.client.loop_stop()
         self.client.disconnect()
+        self._stop_command_worker()
 
 
 MqttPublisher = MqttTarget

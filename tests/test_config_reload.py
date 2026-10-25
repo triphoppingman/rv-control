@@ -163,6 +163,8 @@ def test_reload_cleans_up_before_restarting(tmp_path: Path, monkeypatch: Any) ->
     class Source:
         """Record source cleanup and support the reload overlap check."""
 
+        ident = 1
+
         def join(self, timeout: float) -> None:
             """Record source shutdown."""
             events.append("join")

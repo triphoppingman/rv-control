@@ -370,7 +370,7 @@ def test_daemon_wires_shared_context(
 
     def supervise(_config: Any, publisher: Any, _stop: Any, sources: Any, _map: Any) -> None:
         """Verify restarted sources will use the same context-bearing publisher."""
-        assert publisher is sources[0].publisher
+        assert publisher.runtime_context is sources[0].publisher.runtime_context
         events.append("supervise")
 
     monkeypatch.setattr(cli_module.Target, "build", lambda *_args: Destination())

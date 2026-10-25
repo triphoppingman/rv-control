@@ -567,14 +567,17 @@ class CoachStatePublisher:
         """
         self.publisher = publisher
         self.request_status_on_start = request_status_on_start
-        self.tracker = tracker_factory(lambda topic, payload: self.publisher.publish(topic, payload))
+        self._pending_entity_publications = threading.local()
+        self.tracker = tracker_factory(
+            self._publish_entity
+        )
 
     def connect(self) -> None:
         """Connect the wrapped publisher."""
         self.publisher.connect()
 
     def publish(self, topic: str, payload: dict[str, Any]) -> None:
-        """Forward a publish, then update coach entity state from source telemetry.
+        """Process unattributed telemetry through the coach tracker and destination.
 
         Tracker failures are logged and never stop the raw publish path.
 
@@ -585,14 +588,54 @@ class CoachStatePublisher:
         payload : dict[str, Any]
             JSON payload.
         """
-        self.publisher.publish(topic, payload)
+        self._publish(topic, payload, "runtime", "runtime")
+
+    def publish_source(
+        self, topic: str, payload: dict[str, Any], source_type: str, source_section: str,
+    ) -> None:
+        """Update coach state synchronously and enqueue the attributed raw publication."""
+        self._publish(topic, payload, source_type, source_section)
+
+    def _publish(
+        self, topic: str, payload: dict[str, Any], source_type: str, source_section: str,
+    ) -> None:
+        """Update semantic state before forwarding one publication with its origin."""
+        entity_publications: list[tuple[str, dict[str, Any]]] = []
         if isinstance(payload, dict):
+            self._pending_entity_publications.publications = entity_publications
             try:
                 if "dgn" in payload:
                     self.tracker.handle(payload)
                 self.tracker.handle_topic(topic, payload)
             except Exception:
                 LOGGER.exception("Coach entity state update failed for %s", topic)
+            finally:
+                del self._pending_entity_publications.publications
+        publish_source = getattr(self.publisher, "publish_source", None)
+        if callable(publish_source):
+            publish_source(topic, payload, source_type, source_section)
+        else:
+            self.publisher.publish(topic, payload)
+        for entity_topic, entity_payload in entity_publications:
+            self._publish_to_target(entity_topic, entity_payload, "coach", "coach")
+
+    def _publish_entity(self, topic: str, payload: dict[str, Any]) -> None:
+        """Stage tracked entity messages behind their triggering telemetry publication."""
+        pending = getattr(self._pending_entity_publications, "publications", None)
+        if pending is not None:
+            pending.append((topic, payload))
+            return
+        self._publish_to_target(topic, payload, "coach", "coach")
+
+    def _publish_to_target(
+        self, topic: str, payload: dict[str, Any], source_type: str, source_section: str,
+    ) -> None:
+        """Forward telemetry with provenance when the destination supports it."""
+        publish_source = getattr(self.publisher, "publish_source", None)
+        if callable(publish_source):
+            publish_source(topic, payload, source_type, source_section)
+        else:
+            self.publisher.publish(topic, payload)
 
     def request_initial_status(self, source_map: dict[str, Any]) -> None:
         """Ask running sources once for the mapped telemetry coach entities need.
@@ -665,13 +708,17 @@ def wrap_publisher(config: Any, publisher: Any) -> Any:
     request_status = section.getboolean("request_status_on_start", fallback=True)
     coach = Coach.load(config)
 
-    def publish_entity(topic: str, payload: dict[str, Any]) -> None:
-        """Publish entity state only when state telemetry publishing is enabled."""
-        if publish_state:
-            publisher.publish(topic, payload)
+    def tracker_factory(publish_entity: Publish) -> EntityStateTracker:
+        """Build the tracker with the wrapper's ordered entity-publication callback."""
+        def publish_if_enabled(topic: str, payload: dict[str, Any]) -> None:
+            """Publish entity state only when state telemetry publishing is enabled."""
+            if publish_state:
+                publish_entity(topic, payload)
+
+        return EntityStateTracker(coach, publish_if_enabled, republish)
 
     wrapped = CoachStatePublisher(
-        publisher, lambda _publish: EntityStateTracker(coach, publish_entity, republish), request_status
+        publisher, tracker_factory, request_status
     )
     LOGGER.info("Publishing coach entity state for %d entities", len(wrapped.tracker.tracked_entities))
     return wrapped

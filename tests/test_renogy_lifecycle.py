@@ -79,6 +79,29 @@ def test_stop_without_start_does_not_create_loop(monkeypatch: pytest.MonkeyPatch
     assert client.loop is None
 
 
+def test_start_stops_when_source_event_is_set() -> None:
+    """Verify the client event loop observes its source's shared shutdown event."""
+    client = LifecycleClient()
+    client_started = threading.Event()
+    stop_event = threading.Event()
+
+    async def connect() -> None:
+        """Mark connection readiness and leave session completion to shutdown."""
+        client.loops.append(asyncio.get_running_loop())
+        client_started.set()
+
+    client.connect = connect
+    worker = threading.Thread(target=client.start, args=(stop_event,))
+    worker.start()
+    assert client_started.wait(timeout=1)
+    stop_event.set()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert client.loops[0].is_closed()
+    assert client.loop is None
+
+
 def test_loop_creation_failure_preserves_original_error(monkeypatch: pytest.MonkeyPatch) -> None:
     """Verify descriptor exhaustion is reported without another loop allocation."""
     client = LifecycleClient()

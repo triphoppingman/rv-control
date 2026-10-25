@@ -183,10 +183,12 @@ class HughesSource(Source, source_name="hughes"):
                     LOGGER.warning("Hughes %s unavailable (%s: %s); retrying in %gs", address, type(error).__name__, error, delay)
                 else:
                     LOGGER.exception("Hughes connection dropped; reconnecting to %s", address)
-                await asyncio.sleep(delay)
+                if await asyncio.to_thread(self.stop_event.wait, delay):
+                    return
                 continue
             delay = min(reconnect_delay * (2 ** max(retry_count - 1, 0)), max_reconnect_delay)
-            await asyncio.sleep(delay)
+            if await asyncio.to_thread(self.stop_event.wait, delay):
+                return
 
     def _retry_setting(self, name: str, default: int | float, value_type: Callable[[str], int | float]) -> int | float:
         """Return a source retry override or the corresponding service default."""

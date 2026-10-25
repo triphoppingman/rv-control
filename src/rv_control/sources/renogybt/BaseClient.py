@@ -4,6 +4,7 @@ import asyncio
 import configparser
 import logging
 import random
+import threading
 import traceback
 from typing import Any, Callable
 from .BLEManager import BLEManager
@@ -53,9 +54,9 @@ class BaseClient:
         )
         logging.info(f"Init {self.__class__.__name__}: {self.config['device']['alias']} => {self.config['device']['mac_addr']}")
 
-    def start(self) -> None:
+    def start(self, stop_event: threading.Event | None = None) -> None:
         """Run one client session and close its owned event loop on every exit."""
-        session = self._run_session()
+        session = self._run_session(stop_event)
         try:
             asyncio.run(session)
         except Exception as e:
@@ -65,18 +66,25 @@ class BaseClient:
         finally:
             session.close()
 
-    async def _run_session(self) -> None:
+    async def _run_session(self, stop_event: threading.Event | None = None) -> None:
         """Collect until stopped, then release BLE resources before loop shutdown."""
         self.loop = asyncio.get_running_loop()
         self.future = self.loop.create_future()
         self._stopping = False
         self._retry_count = 0
         self._retry_reason = None
+        stop_task = (
+            asyncio.create_task(self._watch_stop_event(stop_event))
+            if stop_event is not None else None
+        )
         try:
             await self.connect()
             await self.future
         finally:
             self._stopping = True
+            if stop_task is not None:
+                stop_task.cancel()
+                await asyncio.gather(stop_task, return_exceptions=True)
             if self.read_timeout:
                 self.read_timeout.cancel()
             if self.poll_timer:
@@ -94,6 +102,13 @@ class BaseClient:
                 self.ble_manager = None
                 self.future = None
                 self.loop = None
+
+    async def _watch_stop_event(self, stop_event: threading.Event) -> None:
+        """Resolve the client session when its owning source requests shutdown."""
+        while not stop_event.is_set() and not self._stopping:
+            await asyncio.sleep(0.05)
+        if stop_event.is_set():
+            self.stop()
 
     async def connect(self) -> None:
         """Discover and connect the BLE manager, retrying according to client policy."""
