@@ -233,7 +233,7 @@ class WledSource(WritableSource, source_name="wled"):
                 try:
                     self.request_status([])
                 except (OSError, requests.RequestException, ValueError) as error:
-                    LOGGER.warning("WLED poll failed for %s: %s", self.section_name, error)
+                    LOGGER.info("WLED poll failed for %s: %s", self.section_name, error)
                 self.stop_event.wait(interval)
         except Exception:
             LOGGER.exception("WLED source instance %s stopped", self.section_name)

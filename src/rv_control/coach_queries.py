@@ -31,10 +31,13 @@ class CoachQueries:
         self.coach = coach
         self.tracker = tracker
         self.sources = sources
+        # A tracker and its coach map live for one config generation; retain the
+        # compiled fields locally for selection and refresh-result formatting.
+        self._entities = tracker.monitored_fields()
 
     def entities(self) -> dict[str, list[str]]:
         """Return every monitored entity and its mapped state fields."""
-        return self.tracker.monitored_fields()
+        return {entity: list(fields) for entity, fields in self._entities.items()}
 
     def source_sections(self, entities: list[str]) -> set[str]:
         """Return source configuration sections serving the selected entities."""
@@ -101,7 +104,7 @@ class CoachQueries:
             raise ValueError("entity IDs must be non-empty strings")
         if len(set(entities)) != len(entities):
             raise ValueError("entities must not contain duplicates")
-        unknown = set(entities).difference(self.entities())
+        unknown = set(entities).difference(self._entities)
         if unknown:
             raise ValueError(f"Unknown monitored entities: {', '.join(sorted(unknown))}")
 
@@ -151,7 +154,7 @@ class CoachQueries:
         for entity in entities:
             sections = entity_requests[entity]
             if any(section_status.get(section) == "requested" for section in sections):
-                required_fields[entity] = self.entities()[entity]
+                required_fields[entity] = self._entities[entity]
         if required_fields:
             self.tracker.wait_for_observations(
                 baseline,
@@ -164,7 +167,7 @@ class CoachQueries:
         entity_results: list[dict[str, Any]] = []
         for entity in entities:
             snapshot = snapshots[entity]
-            fields = self.entities()[entity]
+            fields = self._entities[entity]
             observed_fields = [field for field in fields if field in observed_by_entity[entity]]
             missing_fields = [field for field in fields if field not in observed_fields]
             if not missing_fields:

@@ -92,6 +92,27 @@ def test_mid_bath_fan_publishes_on_and_off(coach: Coach) -> None:
     assert tracker.state("mid_bath_fan")["on"] is False
 
 
+def test_tracker_metadata_caches_are_protected_from_caller_mutation() -> None:
+    """Metadata access returns copies rather than exposing compiled tracker indexes."""
+    coach = Coach.load(coach_config(rvc="rv_c_bus"))
+    tracker, _, _ = tracker_for(coach)
+
+    fields = tracker.monitored_fields()
+    fields["mid_bath_fan"].clear()
+    fields["injected"] = ["unsafe"]
+    entities = tracker.tracked_entities
+    entities.clear()
+    requests = tracker.entity_status_requests(["mid_bath_fan"])
+    requests["mid_bath_fan"]["rv_c_bus"].clear()
+
+    assert tracker.monitored_fields()["mid_bath_fan"] == ["level", "on", "remaining"]
+    assert "injected" not in tracker.monitored_fields()
+    assert "mid_bath_fan" in tracker.tracked_entities
+    assert tracker.entity_status_requests(["mid_bath_fan"])["mid_bath_fan"]["rv_c_bus"] == [
+        0x1FEDA,
+    ]
+
+
 def test_unchanged_state_republishes_only_after_interval(coach: Coach) -> None:
     """Repeated identical status is suppressed until the republish interval passes."""
     tracker, published, clock = tracker_for(coach, republish=60)

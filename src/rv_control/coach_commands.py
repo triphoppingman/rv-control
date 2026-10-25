@@ -184,6 +184,23 @@ class ActionStep:
     action: SourceAction
 
 
+@dataclass(frozen=True)
+class PreparedCommand:
+    """A complete command plan that passed authorization and transport preflight."""
+
+    steps: tuple[ActionStep, ...]
+
+
+@dataclass(frozen=True)
+class PreparedQuery:
+    """A validated query selection admitted for asynchronous execution."""
+
+    entities: tuple[str, ...]
+
+
+PreparedOperation = PreparedCommand | PreparedQuery
+
+
 class ControllerPolicy:
     """Validate static controller grants and bind them to loaded action schemas."""
 
@@ -396,6 +413,168 @@ class RequestJournal:
         self._file_lock.close()
 
 
+class CoachRequestPlanner:
+    """Authorize and preflight requests before the service admits worker execution."""
+
+    def __init__(
+        self,
+        config: ConfigParser,
+        coach: Coach,
+        policy: ControllerPolicy,
+        queries: CoachQueries,
+        sources: dict[str, Source],
+        mqtt_section: str,
+        commands_enabled: bool,
+        queries_enabled: bool,
+        clock: Callable[[], float],
+    ) -> None:
+        """Retain the immutable dependencies and rate limits used during planning."""
+        self.config = config
+        self.coach = coach
+        self.policy = policy
+        self.queries = queries
+        self.sources = sources
+        self.mqtt_section = mqtt_section
+        self.commands_enabled = commands_enabled
+        self.queries_enabled = queries_enabled
+        self.clock = clock
+        self._last_refresh: dict[str, float] = {}
+        self._last_source_refresh: dict[str, float] = {}
+
+    def validate_query(self, request: dict[str, Any], expires: float) -> list[str]:
+        """Expose query validation as the planner's single validation entry point."""
+        return self._validate_query(request, expires)
+
+    def prepare(self, kind: str, request: dict[str, Any], expires: float) -> PreparedOperation:
+        """Return a fully validated command or query without performing I/O."""
+        if kind == "query":
+            if not self.queries_enabled:
+                raise CommandError("forbidden", "Monitoring API is disabled")
+            return PreparedQuery(tuple(self.validate_query(request, expires)))
+        if kind != "command" or not self.commands_enabled:
+            raise CommandError("forbidden", "Command API is disabled")
+        if request["target"] == "coach" or request["action"] in QUERY_ACTIONS:
+            raise CommandError("invalid_request", "Monitoring requires the query topic")
+        return PreparedCommand(tuple(self.plan(request)))
+
+    def plan(self, request: dict[str, Any], *, availability: bool = True) -> list[ActionStep]:
+        """Expand, authorize and build every physical operation before dispatch."""
+        client, target, action = request["client_id"], request["target"], request["action"]
+        if target not in self.coach.entities and target not in self.coach.command_groups:
+            raise CommandError("unknown_target", "Unknown target")
+        if action not in self.policy.definition(target).get("actions", {}):
+            raise CommandError("unknown_action", "Unknown action")
+
+        grant = self.policy.grant(client, target, action)
+        validate_params(request["params"], self.policy.schema(target, action, grant))
+        groups: list[tuple[str, str, dict[str, Any]]] = []
+        expanded = self.policy.expand(target, action, request["params"], groups=groups)
+        plan: list[ActionStep] = []
+
+        # Confirmation on a group and on each leaf is independently required.
+        if grant.get("confirm") and not request["confirmed"]:
+            raise CommandError("confirmation_required", "Deliberate user confirmation is required")
+        for group, group_action, params in groups:
+            group_grant = self.policy.grant(client, group, group_action)
+            validate_params(params, self.policy.schema(group, group_action, group_grant))
+            if group_grant.get("confirm") and not request["confirmed"]:
+                raise CommandError("confirmation_required", "Deliberate user confirmation is required")
+
+        # Complete validation before a command can start; malformed later steps must
+        # never leave an earlier actuator step already dispatched.
+        duration = 0.0
+        for entity_name, member_action, params in expanded:
+            member_grant = self.policy.grant(client, entity_name, member_action)
+            validate_params(params, self.policy.schema(entity_name, member_action, member_grant))
+            entity = self.coach.entities[entity_name]
+            if (entity.get("confirm") or member_grant.get("confirm")) and not request["confirmed"]:
+                raise CommandError("confirmation_required", "Deliberate user confirmation is required")
+            try:
+                section = self.coach.resolve_config_section(entity, entity_name)
+                frames = self.coach.prepare_source_actions(entity_name, member_action, params)
+            except (KeyError, ValueError, PermissionError) as error:
+                raise CommandError("invalid_params", "Configured action cannot be preflighted") from error
+            if not frames:
+                raise CommandError("invalid_request", "Action has no transport operations")
+            if availability:
+                self.check_source(section)
+            for wait, prepared in frames:
+                duration += wait + prepared.dispatch_budget_seconds
+                plan.append(ActionStep(entity_name, section, wait, prepared))
+                if len(plan) > 64 or duration > 30:
+                    raise CommandError("invalid_request", "Action plan exceeds 64 steps or 30 seconds")
+        return plan
+
+    def check_source(self, section: str) -> WritableSource:
+        """Recheck global and source write gates plus readiness before each operation."""
+        if (
+            not self.commands_enabled
+            or not self.config[self.mqtt_section].getboolean("write_enabled", fallback=False)
+            or not self.config[section].getboolean("write_enabled", fallback=False)
+        ):
+            raise CommandError("writes_disabled", "Physical writes are disabled")
+        source = self.sources.get(section)
+        if not isinstance(source, WritableSource) or not source.command_ready():
+            raise CommandError("source_unavailable", "Required source is unavailable")
+        return source
+
+    def _validate_query(self, request: dict[str, Any], expires: float) -> list[str]:
+        """Validate query grants, selected entities, deadlines and refresh limits."""
+        action, params = request["action"], request["params"]
+        if request["target"] != "coach" or action not in QUERY_ACTIONS or request["confirmed"]:
+            raise CommandError("invalid_request", "Invalid monitoring operation")
+        grant = self.policy.controllers.get(request["client_id"], {}).get("queries", {}).get(action)
+        if grant is None:
+            raise CommandError("forbidden", "Monitoring operation is not authorized")
+        if action not in ENTITY_QUERIES:
+            expected = {"request_id"} if action == "request_status" else set()
+            if params.keys() != expected:
+                raise CommandError("invalid_params", "Unexpected query parameters")
+            if action == "request_status" and (
+                not isinstance(params["request_id"], str)
+                or not IDENTIFIER.fullmatch(params["request_id"])
+                or params["request_id"] == request["request_id"]
+            ):
+                raise CommandError("invalid_params", "Lookup requires a different valid request ID")
+            return []
+
+        allowed = {"entities", "timeout_s"} if action == "refresh_states" else {"entities"}
+        if set(params) - allowed:
+            raise CommandError("invalid_params", "Unexpected query parameters")
+        known = self.queries.entities()
+        entities = params.get("entities", list(known))
+        if (
+            not isinstance(entities, list)
+            or not 1 <= len(entities) <= 200
+            or any(not isinstance(item, str) or item not in known for item in entities)
+            or len(set(entities)) != len(entities)
+        ):
+            raise CommandError("invalid_params", "Selection requires 1–200 unique monitored entities")
+        if grant["entities"] != ["*"] and any(entity not in grant["entities"] for entity in entities):
+            raise CommandError("forbidden", "Selection includes unauthorized entities")
+
+        if action == "refresh_states":
+            timeout = params.get("timeout_s", 5)
+            if type(timeout) is not int or not 1 <= timeout <= 10:
+                raise CommandError("invalid_params", "timeout_s must be an integer from 1 to 10")
+            if expires - self.clock() < timeout:
+                raise CommandError("expired", "Insufficient lifetime for the refresh observation window")
+            now = time.monotonic()
+            sections = self.queries.source_sections(entities)
+            if (
+                now - self._last_refresh.get(request["client_id"], -math.inf) < 10
+                or any(now - self._last_source_refresh.get(section, -math.inf) < 5 for section in sections)
+            ):
+                raise CommandError("rate_limited", "Refresh rate limit exceeded")
+        return entities
+
+    def record_refresh(self, client: str, sections: set[str], now: float) -> None:
+        """Start the per-client and per-source cooldown when refresh intent is journaled."""
+        self._last_refresh[client] = now
+        for section in sections:
+            self._last_source_refresh[section] = now
+
+
 class CoachCommandService:
     """Validate MQTT requests and execute one bounded plan/query outside callbacks."""
 
@@ -417,9 +596,24 @@ class CoachCommandService:
         self._busy = threading.Lock()
         self._closing = False
         self._worker: threading.Thread | None = None
-        self._last_refresh: dict[str, float] = {}
-        self._last_source_refresh: dict[str, float] = {}
+        self.planner = CoachRequestPlanner(
+            config, coach, self.policy, self.queries, sources, self.mqtt_section,
+            self.enabled, self.queries_enabled, clock,
+        )
         self.started = time.monotonic()
+
+    @property
+    def enabled(self) -> bool:
+        """Return whether physical coach commands are admitted."""
+        return self._enabled
+
+    @enabled.setter
+    def enabled(self, value: bool) -> None:
+        """Keep planner write gates aligned with the service's command gate."""
+        self._enabled = value
+        planner = getattr(self, "planner", None)
+        if planner is not None:
+            planner.commands_enabled = value
 
     @staticmethod
     def validate_config(
@@ -472,6 +666,8 @@ class CoachCommandService:
             expires = validate_envelope(request, self.clock(), check_expiry=False)
             digest = hashlib.sha256(json.dumps([kind, request], sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
             with self._admission:
+                # Serialize identity checks with shutdown and claim the single
+                # execution slot before starting asynchronous work.
                 if self._closing:
                     raise CommandError("source_unavailable", "Service is shutting down")
                 previous = self.journal.lookup(request["client_id"], request["request_id"])
@@ -484,7 +680,7 @@ class CoachCommandService:
                 if not self._busy.acquire(blocking=False):
                     raise CommandError("busy", "Another command or query is in progress")
                 try:
-                    prepared = self._prepare(kind, request, expires)
+                    prepared = self.planner.prepare(kind, request, expires)
                     accepted = self.result(request, "accepted", "accepted", "Request admitted; no physical outcome is confirmed")
                     self.journal.reserve(request, digest, expires, accepted, self.clock())
                     LOGGER.info("Coach request admitted: client=%s request=%s target=%s action=%s", request["client_id"], request["request_id"], request["target"], request["action"])
@@ -515,107 +711,17 @@ class CoachCommandService:
             except (OSError, RuntimeError, ValueError):
                 LOGGER.exception("Unable to publish coach rejection")
 
-    def _prepare(self, kind: str, request: dict[str, Any], expires: float) -> list[ActionStep] | list[str]:
-        """Authorize and preflight the entire request before admission."""
-        if kind == "query":
-            if not self.queries_enabled:
-                raise CommandError("forbidden", "Monitoring API is disabled")
-            return self._prepare_query(request, expires)
-        if kind != "command" or not self.enabled:
-            raise CommandError("forbidden", "Command API is disabled")
-        if request["target"] == "coach" or request["action"] in QUERY_ACTIONS:
-            raise CommandError("invalid_request", "Monitoring requires the query topic")
-        return self._plan(request)
-
     def _plan(self, request: dict[str, Any], *, availability: bool = True) -> list[ActionStep]:
-        """Expand, authorize and build all member operations before the first write."""
-        client, target, action = request["client_id"], request["target"], request["action"]
-        if target not in self.coach.entities and target not in self.coach.command_groups:
-            raise CommandError("unknown_target", "Unknown target")
-        if action not in self.policy.definition(target).get("actions", {}):
-            raise CommandError("unknown_action", "Unknown action")
-        grant = self.policy.grant(client, target, action)
-        validate_params(request["params"], self.policy.schema(target, action, grant))
-        groups: list[tuple[str, str, dict[str, Any]]] = []
-        expanded = self.policy.expand(target, action, request["params"], groups=groups)
-        plan: list[ActionStep] = []
-        if grant.get("confirm") and not request["confirmed"]:
-            raise CommandError("confirmation_required", "Deliberate user confirmation is required")
-        for group, group_action, params in groups:
-            group_grant = self.policy.grant(client, group, group_action)
-            validate_params(params, self.policy.schema(group, group_action, group_grant))
-            if group_grant.get("confirm") and not request["confirmed"]:
-                raise CommandError("confirmation_required", "Deliberate user confirmation is required")
-        duration = 0.0
-        for entity_name, member_action, params in expanded:
-            member_grant = self.policy.grant(client, entity_name, member_action)
-            validate_params(params, self.policy.schema(entity_name, member_action, member_grant))
-            entity = self.coach.entities[entity_name]
-            if (entity.get("confirm") or member_grant.get("confirm")) and not request["confirmed"]:
-                raise CommandError("confirmation_required", "Deliberate user confirmation is required")
-            try:
-                section = self.coach.resolve_config_section(entity, entity_name)
-                frames = self.coach.prepare_source_actions(entity_name, member_action, params)
-            except (KeyError, ValueError, PermissionError) as error:
-                raise CommandError("invalid_params", "Configured action cannot be preflighted") from error
-            if not frames:
-                raise CommandError("invalid_request", "Action has no transport operations")
-            if availability:
-                self._check_source(section)
-            for wait, prepared in frames:
-                duration += wait + prepared.dispatch_budget_seconds
-                plan.append(ActionStep(entity_name, section, wait, prepared))
-                if len(plan) > 64 or duration > 30:
-                    raise CommandError("invalid_request", "Action plan exceeds 64 steps or 30 seconds")
-        return plan
+        """Preserve the service helper while delegating all planning to its planner."""
+        return self.planner.plan(request, availability=availability)
 
-    def _check_source(self, section: str) -> WritableSource:
-        """Recheck every write gate and require an existing, ready daemon source."""
-        if not self.enabled or not self.config[self.mqtt_section].getboolean("write_enabled", fallback=False) or not self.config[section].getboolean("write_enabled", fallback=False):
-            raise CommandError("writes_disabled", "Physical writes are disabled")
-        source = self.sources.get(section)
-        if not isinstance(source, WritableSource) or not source.command_ready():
-            raise CommandError("source_unavailable", "Required source is unavailable")
-        return source
-
-    def _prepare_query(self, request: dict[str, Any], expires: float) -> list[str]:
-        """Validate monitoring grants, bounded selections and refresh rate limits."""
-        action, params = request["action"], request["params"]
-        if request["target"] != "coach" or action not in QUERY_ACTIONS or request["confirmed"]:
-            raise CommandError("invalid_request", "Invalid monitoring operation")
-        grant = self.policy.controllers.get(request["client_id"], {}).get("queries", {}).get(action)
-        if grant is None:
-            raise CommandError("forbidden", "Monitoring operation is not authorized")
-        if action not in ENTITY_QUERIES:
-            expected = {"request_id"} if action == "request_status" else set()
-            if params.keys() != expected:
-                raise CommandError("invalid_params", "Unexpected query parameters")
-            if action == "request_status" and (not isinstance(params["request_id"], str) or not IDENTIFIER.fullmatch(params["request_id"]) or params["request_id"] == request["request_id"]):
-                raise CommandError("invalid_params", "Lookup requires a different valid request ID")
-            return []
-        if set(params) - ({"entities", "timeout_s"} if action == "refresh_states" else {"entities"}):
-            raise CommandError("invalid_params", "Unexpected monitoring parameters")
-        known = self.queries.entities()
-        entities = params.get("entities", list(known))
-        if not isinstance(entities, list) or not 1 <= len(entities) <= 200 or any(not isinstance(item, str) or item not in known for item in entities) or len(set(entities)) != len(entities):
-            raise CommandError("invalid_params", "Selection requires 1–200 unique monitored entities")
-        if grant["entities"] != ["*"] and any(entity not in grant["entities"] for entity in entities):
-            raise CommandError("forbidden", "Selection includes unauthorized entities")
-        if action == "refresh_states":
-            timeout = params.get("timeout_s", 5)
-            if type(timeout) is not int or not 1 <= timeout <= 10:
-                raise CommandError("invalid_params", "timeout_s must be an integer from 1 to 10")
-            if expires - self.clock() < timeout:
-                raise CommandError("expired", "Insufficient lifetime for the refresh observation window")
-            now = time.monotonic()
-            sections = self.queries.source_sections(entities)
-            if now - self._last_refresh.get(request["client_id"], -math.inf) < 10 or any(now - self._last_source_refresh.get(section, -math.inf) < 5 for section in sections):
-                raise CommandError("rate_limited", "Refresh rate limit exceeded")
-        return entities
+    def prepare_query(self, request: dict[str, Any], expires: float) -> list[str]:
+        """Preserve the service query helper while delegating to the request planner."""
+        return self.planner.validate_query(request, expires)
 
     def _execute(
         self, kind: str, request: dict[str, Any], expires: float,
-        prepared: list[ActionStep] | list[str], accepted: dict[str, Any],
+        prepared: PreparedOperation, accepted: dict[str, Any],
     ) -> None:
         """Publish admission, persist intent and dispatch; never automatically retry."""
         completed = 0
@@ -627,20 +733,20 @@ class CoachCommandService:
             self._publish(accepted, wait=True)
             if self.clock() >= expires:
                 raise CommandError("expired", "Request expired before dispatch")
-            if kind == "query":
-                entities = [item for item in prepared if isinstance(item, str)]
-                result = self._query(request, entities, expires)
+            if isinstance(prepared, PreparedQuery):
+                result = self._query(request, list(prepared.entities), expires)
             else:
-                plan = [item for item in prepared if isinstance(item, ActionStep)]
-                for step in plan:
+                for step in prepared.steps:
                     if step.wait:
                         self.coach.sleep(step.wait)
-                    source = self._check_source(step.section)
+                    source = self.planner.check_source(step.section)
                     if not attempted:
                         if self.clock() >= expires:
                             raise CommandError("expired", "Request expired before the first write")
                         self.journal.save(request, accepted, intent=True)
-                        source = self._check_source(step.section)
+                        source = self.planner.check_source(step.section)
+                        # Intent must be durable before entering the hardware path;
+                        # after this point a crash can leave physical outcome unknown.
                         if self.clock() >= expires:
                             raise CommandError("expired", "Request expired while recording execution intent")
                     attempted = True
@@ -683,9 +789,9 @@ class CoachCommandService:
                 if expires - self.clock() < request["params"].get("timeout_s", 5):
                     raise CommandError("expired", "Insufficient lifetime for refresh")
                 now = time.monotonic()
-                self._last_refresh[request["client_id"]] = now
-                for section in self.queries.source_sections(entities):
-                    self._last_source_refresh[section] = now
+                self.planner.record_refresh(
+                    request["client_id"], self.queries.source_sections(entities), now,
+                )
                 self.journal.save(request, self.result(request, "accepted", "accepted", "Refresh intent recorded"), intent=True)
                 if expires - self.clock() < request["params"].get("timeout_s", 5):
                     raise CommandError("expired", "Refresh expired while recording its intent")
@@ -729,7 +835,7 @@ class CoachCommandService:
                     requires_confirmation |= bool(definition.get("confirm") or self.policy.grant(client, entity, member_action).get("confirm"))
                     try:
                         section = self.coach.resolve_config_section(definition, entity)
-                        self._check_source(section)
+                        self.planner.check_source(section)
                     except CommandError as error:
                         reasons.add(error.code)
                     except (ValueError, KeyError):

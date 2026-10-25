@@ -231,12 +231,14 @@ class EntityStateTracker:
         self._by_instance: dict[tuple[int, Any], list[StateBlock]] = {}
         self._by_dgn: dict[int, list[StateBlock]] = {}
         self._by_topic: dict[str, list[StateBlock]] = {}
+        self._blocks_by_entity: dict[str, list[StateBlock]] = {}
         for entity_name, entity in coach.entities.items():
             blocks = entity.get("state")
             if not blocks:
                 continue
             for definition in blocks if isinstance(blocks, list) else [blocks]:
                 block = StateBlock(entity_name, definition)
+                self._blocks_by_entity.setdefault(entity_name, []).append(block)
                 if block.dgn is None:
                     section = coach.resolve_config_section(entity, entity_name)
                     if not coach.config.has_section(section):
@@ -257,49 +259,65 @@ class EntityStateTracker:
                     for instance in instances:
                         self._by_instance.setdefault((block.dgn, instance), []).append(block)
 
+        # Coach definitions are immutable for a daemon generation, so compile
+        # query metadata once instead of rescanning indexes on every API request.
+        self._fields_by_entity = {
+            entity: tuple(sorted({field for block in blocks for field in block.fields}))
+            for entity, blocks in self._blocks_by_entity.items()
+        }
+        self._tracked_entity_names = tuple(sorted(self._fields_by_entity))
+        self._status_request_errors: dict[str, str] = {}
+        self._entity_status_requests = self._compile_status_requests()
+
+    def _compile_status_requests(self) -> dict[str, dict[str, tuple[int, ...]]]:
+        """Resolve each tracked entity's source sections and requested DGNs once."""
+        compiled: dict[str, dict[str, tuple[int, ...]]] = {}
+        for entity_name, blocks in self._blocks_by_entity.items():
+            entity = self.coach.entities[entity_name]
+            try:
+                section = self.coach.resolve_config_section(entity, entity_name)
+            except ValueError as error:
+                self._status_request_errors[entity_name] = str(error)
+                compiled[entity_name] = {}
+                continue
+
+            requested: dict[str, set[int]] = {}
+            for block in blocks:
+                status_ids = requested.setdefault(section, set())
+                if block.dgn is not None:
+                    status_ids.add(block.dgn)
+            compiled[entity_name] = {
+                section: tuple(sorted(status_ids))
+                for section, status_ids in requested.items()
+            }
+        return compiled
+
     @property
     def tracked_entities(self) -> list[str]:
         """Return the names of entities that have at least one state block."""
-        names = {block.entity_name for blocks in self._by_instance.values() for block in blocks}
-        names.update(block.entity_name for blocks in self._by_dgn.values() for block in blocks)
-        names.update(block.entity_name for blocks in self._by_topic.values() for block in blocks)
-        return sorted(names)
+        return list(self._tracked_entity_names)
 
     def monitored_fields(self) -> dict[str, list[str]]:
         """Return sorted state attribute names for every monitored entity."""
-        fields: dict[str, set[str]] = {}
-        for blocks in (*self._by_instance.values(), *self._by_dgn.values(), *self._by_topic.values()):
-            for block in blocks:
-                fields.setdefault(block.entity_name, set()).update(block.fields)
-        return {entity: sorted(names) for entity, names in sorted(fields.items())}
+        # Return fresh lists so a query caller cannot mutate the cached index.
+        return {entity: list(fields) for entity, fields in self._fields_by_entity.items()}
 
     def entity_status_requests(self, entity_names: list[str] | None = None) -> dict[str, dict[str, list[int]]]:
         """Return source-defined status identifiers per entity and source section."""
-        selected = set(entity_names) if entity_names is not None else set(self.tracked_entities)
-        unknown = selected.difference(self.tracked_entities)
+        selected = set(entity_names) if entity_names is not None else set(self._tracked_entity_names)
+        unknown = selected.difference(self._tracked_entity_names)
         if unknown:
             raise ValueError(f"Unknown monitored entities: {', '.join(sorted(unknown))}")
-        requests: dict[str, dict[str, set[int]]] = {name: {} for name in selected}
-        blocks = [
-            block for group in (
-                *self._by_instance.values(), *self._by_dgn.values(), *self._by_topic.values()
-            ) for block in group
-        ]
-        for block in blocks:
-            if block.entity_name not in selected:
-                continue
-            entity = self.coach.entities[block.entity_name]
-            try:
-                section = self.coach.resolve_config_section(entity, block.entity_name)
-            except ValueError as error:
-                LOGGER.warning("No status request for entity %s: %s", block.entity_name, error)
-                continue
-            status_ids = requests[block.entity_name].setdefault(section, set())
-            if block.dgn is not None:
-                status_ids.add(block.dgn)
+        for entity in sorted(selected):
+            error = self._status_request_errors.get(entity)
+            if error:
+                LOGGER.warning("No status request for entity %s: %s", entity, error)
         return {
-            entity: {section: sorted(status_ids) for section, status_ids in sections.items()}
-            for entity, sections in requests.items()
+            entity: {
+                section: list(status_ids)
+                for section, status_ids in self._entity_status_requests[entity].items()
+            }
+            for entity in sorted(selected)
         }
 
     def status_requests(self, entity_names: list[str] | None = None) -> dict[str, list[int]]:
@@ -339,15 +357,14 @@ class EntityStateTracker:
 
     def observation_baseline(self, entity_names: list[str]) -> dict[str, dict[str, int]]:
         """Capture per-field observation generations before a refresh dispatch."""
-        fields = self.monitored_fields()
-        unknown = set(entity_names).difference(fields)
+        unknown = set(entity_names).difference(self._fields_by_entity)
         if unknown:
             raise ValueError(f"Unknown monitored entities: {', '.join(sorted(unknown))}")
         with self._lock:
             return {
                 entity: {
                     field: self._field_generations.get(entity, {}).get(field, 0)
-                    for field in fields[entity]
+                    for field in self._fields_by_entity[entity]
                 }
                 for entity in entity_names
             }
@@ -398,9 +415,8 @@ class EntityStateTracker:
 
     def snapshots(self, entity_names: list[str] | None = None) -> dict[str, dict[str, Any]]:
         """Return cached entity states and per-field observation timestamps."""
-        fields = self.monitored_fields()
-        selected = list(fields) if entity_names is None else list(entity_names)
-        unknown = set(selected).difference(fields)
+        selected = list(self._tracked_entity_names) if entity_names is None else list(entity_names)
+        unknown = set(selected).difference(self._fields_by_entity)
         if unknown:
             raise ValueError(f"Unknown monitored entities: {', '.join(sorted(unknown))}")
         with self._lock:
@@ -409,19 +425,21 @@ class EntityStateTracker:
                 state = deepcopy(self._states.get(entity, {}))
                 observed_at = {
                     field: self._field_observed_at.get(entity, {}).get(field)
-                    for field in fields[entity]
+                    for field in self._fields_by_entity[entity]
                 }
                 result[entity] = {
                     "entity": entity,
                     "state": state,
                     "observed_at": observed_at,
-                    "missing_fields": [field for field in fields[entity] if field not in state],
+                    "missing_fields": [
+                        field for field in self._fields_by_entity[entity] if field not in state
+                    ],
                 }
             return result
 
     def republish_states(self, entity_names: list[str]) -> dict[str, list[str]]:
         """Republish cached payloads without changing their original timestamps."""
-        unknown = set(entity_names).difference(self.monitored_fields())
+        unknown = set(entity_names).difference(self._fields_by_entity)
         if unknown:
             raise ValueError(f"Unknown monitored entities: {', '.join(sorted(unknown))}")
         published: list[str] = []

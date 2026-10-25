@@ -101,6 +101,21 @@ def test_snapshot_is_cached_and_reports_missing_fields(coach: Coach) -> None:
     assert source.requests == []
 
 
+def test_query_service_reuses_compiled_monitored_fields(coach: Coach, monkeypatch: Any) -> None:
+    """Query selection and snapshots do not rebuild the tracker field index."""
+    queries, _, _ = build_queries(coach)
+
+    def unexpected_rebuild() -> dict[str, list[str]]:
+        """Fail if request handling asks the tracker to reconstruct its metadata."""
+        pytest.fail("monitored fields should be cached by tracker and query service")
+
+    monkeypatch.setattr(queries.tracker, "monitored_fields", unexpected_rebuild)
+
+    assert "mid_bath_fan" in queries.entities()
+    result = queries.run("snapshot", {}, ["mid_bath_fan"], remaining_s=5)
+    assert result["data"]["entities"][0]["entity"] == "mid_bath_fan"
+
+
 def test_prevalidated_entities_in_params_match_selected_entities(coach: Coach) -> None:
     """The service may pass its prevalidated entity selection in both API inputs."""
     queries, _, _ = build_queries(coach)

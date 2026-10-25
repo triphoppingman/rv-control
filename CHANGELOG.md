@@ -8,12 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Coach YAML selection, overlay merging, and resolved definitions now have explicit model/loading boundaries; runtime action dispatch and MQTT request planning remain centralized. State-query metadata is compiled once per coach generation and reused without exposing mutable cache data.
 - The shared source monitoring interface names its selection `status_ids` rather than RV-C-specific `dgns`; RV-C continues interpreting those identifiers as DGNs, while WLED reads a whole-controller snapshot.
 - The local `rv-control-web` controller policy now grants all eight `patio_strip` WLED actions, adding `color`, `effect`, `palette`, `transition`, and `preset` while retaining overlay-defined parameter validation.
 - The factory Thor Magnitude BH35 2020 definition no longer includes a WLED template. The local `coach-overlay.yml` and shareable WLED overlay example now own the complete `wled_light` template and custom lights, preserving on/off/brightness and advanced actions when `[coach] overlay` is configured.
 
 ### Fixed
 
+- Temporary WLED polling connectivity failures are logged at `INFO` instead of `WARNING`; polling and retry timing are unchanged.
 - Shutdown now keeps telemetry targets open until every started source thread exits, logging when sources exceed the 30-second grace period. Hughes reconnect waits stop promptly when shutdown is requested, and legacy MQTT source commands run on a bounded single-worker queue instead of Paho's network callback thread; commands are dropped with an error log if that queue is full.
 - Daemon shutdown now stops an active Renogy BLE polling client, and partial source startup signals and joins already-started source threads if a later source cannot be constructed or started.
 - WLED coach entities now receive actual polled brightness and power state, including changes made outside the dashboard, through `<base_topic>/coach/entity/<entity>`. The WLED overlay example maps `on`, raw `bri` and percent `level`; existing local templates must add its `state` block. Temporary HTTP failures retry at the next `poll_interval`, and safe `refresh_states` queries now read WLED state. Coach state blocks without `dgn` consume the bound source's telemetry topic for any source (optional `topic_suffix` for subtopics); BLE polling/notification schedules and write gates are unchanged.

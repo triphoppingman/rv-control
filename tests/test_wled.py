@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import importlib.util
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -75,7 +76,7 @@ def test_wled_command_requires_write_enabled(config_file: Path) -> None:
 
 @pytest.mark.parametrize("custom_topic", ["wled", "/lights/patio/"])
 def test_wled_polls_update_coach_brightness(
-    config_file: Path, monkeypatch: pytest.MonkeyPatch, custom_topic: str,
+    config_file: Path, monkeypatch: pytest.MonkeyPatch, custom_topic: str, caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Polled device changes reach entity state and survive a temporary HTTP failure."""
     config = load_config(str(config_file))
@@ -94,6 +95,7 @@ def test_wled_polls_update_coach_brightness(
             published.append((topic, payload))
 
     publisher = wrap_publisher(config, Target())
+    caplog.set_level(logging.INFO, logger="rv_control.sources.wled")
     stop = threading.Event()
     source = WledSource(config, publisher, stop, "wled")
     brightness = iter([128, None, 255, 255, 0])
@@ -119,6 +121,10 @@ def test_wled_polls_update_coach_brightness(
     monkeypatch.setattr(stop, "wait", wait)
     source.run()
 
+    assert any(
+        record.levelno == logging.INFO and "WLED poll failed for wled" in record.message
+        for record in caplog.records
+    )
     states = [payload["state"] for topic, payload in published if topic == "coach/entity/patio_light"]
     assert states == [
         {"on": True, "bri": 128, "level": 50.2},

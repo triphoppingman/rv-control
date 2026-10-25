@@ -9,6 +9,7 @@ import threading
 import time
 from collections.abc import Callable
 from configparser import ConfigParser
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -206,6 +207,165 @@ def find_coach_file(spec_identifier: str | Path | None = None) -> Path:
     raise FileNotFoundError(f"Unable to resolve coach specification: {spec_identifier}")
 
 
+@dataclass(frozen=True)
+class CoachDocument:
+    """Hold the selected coach YAML and its optional installation overlay."""
+
+    path: Path
+    data: dict[str, Any]
+    factory_data: dict[str, Any] | None = None
+    overlay_path: Path | None = None
+
+
+class CoachDefinitionLoader:
+    """Resolve file selection and merge validated overlay additions."""
+
+    @staticmethod
+    def load(
+        config: ConfigParser,
+        coach_spec: str | Path | None = None,
+    ) -> CoachDocument:
+        """Read the selected factory definition and optional installation overlay."""
+        if coach_spec is None and config.has_section("coach"):
+            coach_spec = (
+                config["coach"].get("specfile", "").strip()
+                or config["coach"].get("spec", "").strip()
+                or config["coach"].get("coach_spec", "").strip()
+                or None
+            )
+        if coach_spec is None and config.has_section("service"):
+            coach_spec = config["service"].get("coach_spec", "").strip() or None
+
+        path = find_coach_file(coach_spec)
+        factory_data = load_coach_yaml(path)
+        overlay = config.get("coach", "overlay", fallback="").strip()
+        if not overlay:
+            return CoachDocument(path=path, data=factory_data)
+
+        # Relative overlays belong to the installation INI, not the process cwd.
+        config_path = Path(config.get("_meta", "path", fallback="config.ini")).resolve()
+        overlay_path = (config_path.parent / overlay).resolve()
+        try:
+            additions = load_coach_yaml(overlay_path)
+            unknown = set(additions) - {"coach", "templates", "entities", "command_groups", "reserved"}
+            if unknown:
+                raise ValueError(f"Unknown overlay sections: {', '.join(sorted(map(str, unknown)))}")
+            for section, value in additions.items():
+                expected = list if section == "reserved" else dict
+                if not isinstance(value, expected):
+                    raise ValueError(f"Overlay section {section!r} must be a {expected.__name__}")
+            for section in ("templates", "entities", "command_groups"):
+                for name, definition in additions.get(section, {}).items():
+                    if not isinstance(name, str) or not name or not isinstance(definition, dict):
+                        raise ValueError(f"Overlay {section} entries need names and mapping definitions")
+            return CoachDocument(
+                path=path,
+                data=merge_coach_overlay(factory_data, additions, str(overlay_path)),
+                factory_data=factory_data,
+                overlay_path=overlay_path,
+            )
+        except (ValueError, KeyError, TypeError, AttributeError, PermissionError, YAMLError) as error:
+            raise ValueError(f"Invalid coach overlay {overlay_path}: {error}") from error
+
+
+class ResolvedCoachDefinition:
+    """Compile raw coach YAML into isolated, resolved entity and template mappings."""
+
+    def __init__(self, config: ConfigParser, data: dict[str, Any]) -> None:
+        """Resolve reusable definitions once, before any source or hardware is opened."""
+        self.config = config
+        self.data = data
+        self.info: dict[str, Any] = data.get("coach", {})
+        self.command_groups: dict[str, Any] = data.get("command_groups", {}) or {}
+        self.templates: dict[str, Any] = data.get("templates", {}) or {}
+
+        # Reservations must be ready before entity resolution checks literal frames.
+        self.reserved = self._load_reserved(data.get("reserved", []))
+        self.entities: dict[str, dict[str, Any]] = {
+            name: self._resolve_entity(name, definition)
+            for name, definition in (data.get("entities", {}) or {}).items()
+        }
+
+    def resolve_template(self, template_name: str, chain: tuple[str, ...] = ()) -> dict[str, Any]:
+        """Resolve a template chain, rejecting cycles and copying inherited data."""
+        if template_name in chain:
+            raise ValueError(f"Template extends loop: {' -> '.join(chain + (template_name,))}")
+        template = self.templates.get(template_name)
+        if not isinstance(template, dict):
+            raise ValueError(f"Template not found: {template_name!r}")
+        parent = template.get("extends")
+        if not parent:
+            return copy.deepcopy(template)
+
+        # Resolve ancestors first so a child can override only its declared entries.
+        return merge_definitions(
+            self.resolve_template(str(parent), chain + (template_name,)),
+            template,
+        )
+
+    def _resolve_entity(self, entity_name: str, definition: Any) -> dict[str, Any]:
+        """Apply template inheritance and static placeholders to one entity."""
+        if not isinstance(definition, dict):
+            raise ValueError(f"Entity {entity_name!r} must be a mapping")
+        template_name = definition.get("template")
+        base = self.resolve_template(str(template_name)) if template_name else {}
+        base.pop("description", None)
+        merged = merge_definitions(base, definition)
+
+        # Keep unresolved runtime parameters intact for the later action-preflight pass.
+        context = {key: value for key, value in definition.items() if not isinstance(value, (dict, list))}
+        context["entity"] = entity_name
+        actions = substitute_placeholders(merged.get("actions") or {}, context, strict=False)
+        if not isinstance(actions, dict):
+            raise ValueError(f"Entity {entity_name!r} actions must be a mapping")
+        for action_name, frames in list(actions.items()):
+            frames = frames if isinstance(frames, list) else [frames]
+            if not all(isinstance(frame, dict) for frame in frames):
+                raise ValueError(f"Entity {entity_name!r} action {action_name!r} frames must be mappings")
+
+            # Reject known reserved targets now; dynamic targets are checked again
+            # after request parameters are resolved by the source action encoder.
+            for frame in frames:
+                self._check_static_reserved(entity_name, frame)
+            actions[action_name] = frames
+        merged["actions"] = actions
+        merged["action_schemas"] = substitute_placeholders(
+            merged.get("action_schemas", {}), context, strict=False,
+        )
+        if "state" in merged:
+            merged["state"] = substitute_placeholders(merged["state"], context, strict=False)
+        return merged
+
+    @staticmethod
+    def _load_reserved(entries: Any) -> dict[int, set[int]]:
+        """Compile the reserved DGN/instance list into lookup sets."""
+        reserved: dict[int, set[int]] = {}
+        for entry in entries or []:
+            if not isinstance(entry, dict):
+                raise ValueError("Reserved entries must be mappings with dgn and instances")
+            dgn = _as_int(entry.get("dgn"), "reserved dgn")
+            instances = entry.get("instances", [entry["instance"]] if "instance" in entry else [])
+            reserved.setdefault(dgn, set()).update(_as_int(item, "reserved instance") for item in instances)
+        return reserved
+
+    def _check_reserved(self, dgn: int, instance: int | None, label: str) -> None:
+        """Reject a known reserved instance before an action can be dispatched."""
+        if instance is not None and instance in self.reserved.get(dgn, set()):
+            raise PermissionError(f"{label}: instance {instance} on DGN 0x{dgn:05X} is reserved")
+
+    def _check_static_reserved(self, entity_name: str, frame: dict[str, Any]) -> None:
+        """Check reserved RV-C instances when a frame's target is statically known."""
+        if "dgn" not in frame:
+            return
+        dgn = _as_int(frame["dgn"], "dgn")
+        instance = frame.get("instance")
+        if isinstance(instance, int) and not isinstance(instance, bool):
+            self._check_reserved(dgn, instance, f"Entity {entity_name!r}")
+        payload = frame.get("payload")
+        if isinstance(payload, str) and len(payload) >= 2:
+            self._check_reserved(dgn, int(payload[:2], 16), f"Entity {entity_name!r}")
+
+
 class Coach:
     """Resolve coach entities from templates and execute entity and group actions."""
 
@@ -235,16 +395,14 @@ class Coach:
         self.coach_file = Path(coach_file).resolve() if coach_file else None
         self._sources: dict[str, Source] = dict(sources) if sources else {}
         self._stop_event = threading.Event()
-        self.info: dict[str, Any] = data.get("coach", {})
-        self.command_groups: dict[str, Any] = data.get("command_groups", {}) or {}
-        self.templates: dict[str, Any] = data.get("templates", {}) or {}
-        # Reservations must exist before entity resolution performs static checks.
-        # Resolve into new mappings so template reuse does not share mutable actions.
-        self.reserved: dict[int, set[int]] = self._load_reserved(data.get("reserved", []))
-        self.entities: dict[str, dict[str, Any]] = {
-            name: self._resolve_entity(name, definition)
-            for name, definition in (data.get("entities", {}) or {}).items()
-        }
+        # Keep resolved declarative data together; this execution facade owns only
+        # source bindings and action dispatch after model construction.
+        self.definition = ResolvedCoachDefinition(config, data)
+        self.info = self.definition.info
+        self.command_groups = self.definition.command_groups
+        self.templates = self.definition.templates
+        self.reserved = self.definition.reserved
+        self.entities = self.definition.entities
         self.sleep: Callable[[float], None] = time.sleep
 
     @classmethod
@@ -270,55 +428,28 @@ class Coach:
         Coach
             Initialized Coach instance.
         """
-        # Explicit caller selection wins, followed by coach settings, the legacy
-        # service setting, and finally find_coach_file's packaged default.
-        if coach_spec is None and config.has_section("coach"):
-            coach_spec = (
-                config["coach"].get("specfile", "").strip()
-                or config["coach"].get("spec", "").strip()
-                or config["coach"].get("coach_spec", "").strip()
-                or None
-            )
-        if coach_spec is None and config.has_section("service"):
-            coach_spec = config["service"].get("coach_spec", "").strip() or None
-        file_path = find_coach_file(coach_spec)
-        data = load_coach_yaml(file_path)
-        overlay = config.get("coach", "overlay", fallback="").strip()
-        if not overlay:
-            return cls(config=config, data=data, coach_file=file_path, sources=sources)
-        # Overlay paths follow the INI location, not the process working directory.
-        config_path = Path(config.get("_meta", "path", fallback="config.ini")).resolve()
-        overlay_path = (config_path.parent / overlay).resolve()
+        document = CoachDefinitionLoader.load(config, coach_spec)
+        if document.overlay_path is None:
+            return cls(config, document.data, document.path, sources)
+
         try:
-            additions = load_coach_yaml(overlay_path)
-            unknown = set(additions) - {"coach", "templates", "entities", "command_groups", "reserved"}
-            if unknown:
-                raise ValueError(f"Unknown overlay sections: {', '.join(sorted(map(str, unknown)))}")
-            for section, value in additions.items():
-                expected = list if section == "reserved" else dict
-                if not isinstance(value, expected):
-                    raise ValueError(f"Overlay section {section!r} must be a {expected.__name__}")
-            for section in ("templates", "entities", "command_groups"):
-                for name, definition in additions.get(section, {}).items():
-                    if not isinstance(name, str) or not name or not isinstance(definition, dict):
-                        raise ValueError(f"Overlay {section} entries need names and mapping definitions")
-            # Build both effective models: first reject raw collisions during
-            # merge, then check that inheritance did not indirectly change factory
-            # templates/entities. Only the merged model receives supplied sources.
-            factory = cls(config=config, data=data, coach_file=file_path)
-            merged = merge_coach_overlay(data, additions, str(overlay_path))
-            coach = cls(config=config, data=merged, coach_file=file_path, sources=sources)
+            # Comparing raw YAML alone misses inherited-value changes introduced
+            # through a newly added template or entity-level override.
+            factory = ResolvedCoachDefinition(config, document.factory_data or {})
+            coach = cls(config, document.data, document.path, sources)
             for name in factory.templates:
                 _require_preserved(
-                    factory._resolve_template(name), coach._resolve_template(name),
-                    str(overlay_path), f"templates.{name}",
+                    factory.resolve_template(name), coach.definition.resolve_template(name),
+                    str(document.overlay_path), f"templates.{name}",
                 )
-            _require_preserved(factory.entities, coach.entities, str(overlay_path), "entities")
+            _require_preserved(
+                factory.entities, coach.entities, str(document.overlay_path), "entities",
+            )
             # Full overlay validation follows resolution, so it sees inherited
             # actions, substituted entity values, and newly added group members.
             coach._validate_overlay()
-        except (ValueError, KeyError, TypeError, AttributeError, PermissionError, YAMLError) as error:
-            raise ValueError(f"Invalid coach overlay {overlay_path}: {error}") from error
+        except (ValueError, KeyError, TypeError, AttributeError, PermissionError) as error:
+            raise ValueError(f"Invalid coach overlay {document.overlay_path}: {error}") from error
         return coach
 
     def _validate_overlay(self) -> None:
@@ -331,7 +462,7 @@ class Coach:
         # Validate even unused templates, then entity-level declarations. Runtime
         # placeholders cannot yet be encoded; source preparation checks them later.
         for name in self.templates:
-            self._resolve_template(name)
+            self.definition.resolve_template(name)
         for dgn, instances in self.reserved.items():
             if not 0 <= dgn <= 0x1FFFF or any(not 0 <= instance <= 255 for instance in instances):
                 raise ValueError("Reserved DGN or instance is out of range")
@@ -673,137 +804,6 @@ class Coach:
                 action, source_params, self.config[section], reserved=self.reserved,
             )))
         return prepared
-
-    # Resolution/safety helpers used during construction and later preparation.
-    def _resolve_template(self, template_name: str, chain: tuple[str, ...] = ()) -> dict[str, Any]:
-        """Return a template merged with the templates it ``extends``.
-
-        Parameters
-        ----------
-        template_name : str
-            Template name under ``templates``.
-        chain : tuple[str, ...]
-            Templates already visited, used to reject ``extends`` loops.
-
-        Returns
-        -------
-        dict[str, Any]
-            Fully merged template definition.
-        """
-        if template_name in chain:
-            raise ValueError(f"Template extends loop: {' -> '.join(chain + (template_name,))}")
-        template = self.templates.get(template_name)
-        if not isinstance(template, dict):
-            raise ValueError(f"Template not found: {template_name!r}")
-        parent = template.get("extends")
-        if not parent:
-            return copy.deepcopy(template)
-        # Resolve oldest ancestors first, then layer each child's per-action overrides.
-        return merge_definitions(self._resolve_template(str(parent), chain + (template_name,)), template)
-
-    def _resolve_entity(self, entity_name: str, definition: Any) -> dict[str, Any]:
-        """Merge an entity with its template and fill in entity-level placeholders.
-
-        Parameters
-        ----------
-        entity_name : str
-            Entity name under ``entities``.
-        definition : Any
-            Raw entity definition from YAML.
-
-        Returns
-        -------
-        dict[str, Any]
-            Resolved entity with ``actions`` mapping action names to frame lists.
-        """
-        if not isinstance(definition, dict):
-            raise ValueError(f"Entity {entity_name!r} must be a mapping")
-        template_name = definition.get("template")
-        base = self._resolve_template(str(template_name)) if template_name else {}
-        base.pop("description", None)
-        merged = merge_definitions(base, definition)
-        # Only this entity's scalar declarations supply first-pass placeholders.
-        # Missing runtime values remain literal placeholders until action preparation.
-        context = {key: value for key, value in definition.items() if not isinstance(value, (dict, list))}
-        context["entity"] = entity_name
-
-        actions = substitute_placeholders(merged.get("actions") or {}, context, strict=False)
-        if not isinstance(actions, dict):
-            raise ValueError(f"Entity {entity_name!r} actions must be a mapping")
-        for action_name, frames in list(actions.items()):
-            # Normalize single-frame shorthand once; downstream execution always
-            # handles an ordered list, including for parameterless actions.
-            frames = frames if isinstance(frames, list) else [frames]
-            if not all(isinstance(frame, dict) for frame in frames):
-                raise ValueError(f"Entity {entity_name!r} action {action_name!r} frames must be mappings")
-            # Reject statically known reserved targets now. Runtime-dependent targets
-            # receive the same protection in the source encoder during preparation.
-            for frame in frames:
-                self._check_static_reserved(entity_name, frame)
-            actions[action_name] = frames
-        merged["actions"] = actions
-        merged["action_schemas"] = substitute_placeholders(merged.get("action_schemas", {}), context, strict=False)
-        if "state" in merged:
-            merged["state"] = substitute_placeholders(merged["state"], context, strict=False)
-        return merged
-
-    def _load_reserved(self, entries: Any) -> dict[int, set[int]]:
-        """Parse the ``reserved`` section into a mapping of DGN to forbidden instances.
-
-        Parameters
-        ----------
-        entries : Any
-            Raw ``reserved`` list from YAML.
-
-        Returns
-        -------
-        dict[int, set[int]]
-            Reserved instance numbers keyed by DGN.
-        """
-        reserved: dict[int, set[int]] = {}
-        for entry in entries or []:
-            if not isinstance(entry, dict):
-                raise ValueError("Reserved entries must be mappings with dgn and instances")
-            dgn = _as_int(entry.get("dgn"), "reserved dgn")
-            instances = entry.get("instances", [entry["instance"]] if "instance" in entry else [])
-            reserved.setdefault(dgn, set()).update(_as_int(item, "reserved instance") for item in instances)
-        return reserved
-
-    def _check_reserved(self, dgn: int, instance: int | None, label: str) -> None:
-        """Raise ``PermissionError`` when a frame addresses a reserved instance.
-
-        Parameters
-        ----------
-        dgn : int
-            Frame DGN.
-        instance : int | None
-            Instance addressed by the frame, if known.
-        label : str
-            Entity or frame description used in the error message.
-        """
-        if instance is not None and instance in self.reserved.get(dgn, set()):
-            raise PermissionError(f"{label}: instance {instance} on DGN 0x{dgn:05X} is reserved")
-
-    def _check_static_reserved(self, entity_name: str, frame: dict[str, Any]) -> None:
-        """Reject, at load time, entity frames that hard-code a reserved instance.
-
-        Parameters
-        ----------
-        entity_name : str
-            Entity name used in the error message.
-        frame : dict[str, Any]
-            Frame definition after entity placeholder substitution.
-        """
-        if "dgn" not in frame:
-            return
-        dgn = _as_int(frame["dgn"], "dgn")
-        instance = frame.get("instance")
-        if isinstance(instance, int) and not isinstance(instance, bool):
-            self._check_reserved(dgn, instance, f"Entity {entity_name!r}")
-        payload = frame.get("payload")
-        if isinstance(payload, str) and len(payload) >= 2:
-            # Captured raw RV-C frames identify their instance in the first byte.
-            self._check_reserved(dgn, int(payload[:2], 16), f"Entity {entity_name!r}")
 
     @staticmethod
     def _frame_wait(frame: dict[str, Any]) -> float:
