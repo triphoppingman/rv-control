@@ -2,14 +2,25 @@
 entities:
   patio_light: {name: Patio strip, kind: light, area: exterior, template: wled_light}
 
-command_groups:
-  evening_scene:
+routines:
+  all_fans_on:
+    name: All fans on
+    actions:
+      - {entity: kitchen_fan, action: on}
+      - {entity: mid_bath_fan, action: on}
+      - {entity: rear_bath_fan, action: on}
+  all_fans_off:
+    name: All fans off
+    actions:
+      - {entity: kitchen_fan, action: off}
+      - {entity: mid_bath_fan, action: off}
+      - {entity: rear_bath_fan, action: off}
+  evening:
     description: Evening ambient lighting scene
     actions:
-      activate:
-        - {entity: living_ceiling_light, action: brightness, params: {level: 30}}
-        - {entity: bedroom_ceiling_light, action: off}
-        - {entity: patio_light, action: on}
+      - {entity: living_ceiling_light, action: brightness, params: {level: 30}}
+      - {entity: bedroom_ceiling_light, action: off}
+      - {entity: patio_light, action: on}
 
 templates:
   wled_light:

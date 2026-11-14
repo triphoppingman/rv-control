@@ -14,7 +14,7 @@ from test_obd import INIT, make_source
 
 
 def load_tool() -> Any:
-    """Load the standalone OBD tool without invoking its command group."""
+    """Load the standalone OBD tool without invoking its CLI."""
     path = Path(__file__).parents[1] / "tools" / "obd_tool.py"
     spec = importlib.util.spec_from_file_location("obd_tool", path)
     assert spec is not None and spec.loader is not None

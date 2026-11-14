@@ -20,21 +20,22 @@ to retry an uncertain command.
 For monitoring only, set `queries_enabled = true` and leave `enabled = false`
 and all write flags false. For physical control, additionally set `enabled = true`,
 the configured MQTT target's `write_enabled = true`, and each affected source's
-`write_enabled = true`. The policy must grant both a group and every expanded
-member action. Restart `rvcontrol --config config.ini run` after configuration
+`write_enabled = true`. The policy must grant each routine, every member action,
+and any selected operating state. Restart `rvcontrol --config config.ini run` after configuration
 or policy changes. Keep broker command topics restricted to trusted backends;
 these options do not configure broker authentication or ACLs.
 
 ### Startup error: policy references unknown target
 
 Every target under a controller's `actions` must exist in the loaded coach's
-entities or command groups, even when only queries are enabled. Invalid grants
+entities, even when only queries are enabled. Routine grants belong under
+`routines`, not `actions`. Invalid grants
 stop startup before broker connection or source startup; they are never ignored.
 The error names the missing target.
 
 The factory Thor definition no longer includes the installation-specific
-`patio_light` entity or `evening_scene` group. If an older local controller policy
-still grants either target, load the installation YAML defining it with
+`patio_light` entity. If an older local controller policy
+still grants that target, load the installation YAML defining it with
 `[coach] overlay` (paths are relative to the INI), or remove those action grants
 from every controller in `[coach_commands] controllers_file` if no longer needed.
 For the shareable patio definitions, use
@@ -43,7 +44,7 @@ repository root. A transport binding such as `wled = wled_patio` does not load
 entity definitions by itself.
 
 Run `rvcontrol --config config.ini coach-list` to inspect the effective entity
-and group names without starting collectors, then restart the service after
+and routine/state names without starting collectors, then restart the service after
 correcting the overlay or policy. `coach-list` checks the coach definition, not
 the controller policy.
 
@@ -68,7 +69,7 @@ rvcontrol --config config.ini mqtt-query sources
 rvcontrol --config config.ini mqtt-command kitchen_light on
 rvcontrol --config config.ini mqtt-command kitchen_light off
 rvcontrol --config config.ini mqtt-command living_ceiling_light brightness --param level 30
-rvcontrol --config config.ini mqtt-command all_fans off
+rvcontrol --config config.ini mqtt-command coach execute_routine --param routine '"all_fans_off"'
 rvcontrol --config config.ini mqtt-command kitchen_fan_lid open --confirm
 rvcontrol --config config.ini mqtt-command generator start --confirm
 
@@ -111,7 +112,7 @@ that a particular coach accepts its mapped commands.
 
 ## Purpose and boundary
 
-Expose the existing coach entity and command-group actions through a stable,
+Expose coach entity actions, routines and operating states through a stable,
 transport-independent MQTT API. A dashboard should request "kitchen fan on",
 not construct CAN frames, invoke the CLI, or load RV-Control's coach files.
 RV-Control remains responsible for transport selection, parameter validation,
@@ -127,7 +128,7 @@ enabled command receiver, not a replacement.
 - `MqttTarget` restores raw and independently enabled semantic subscriptions
   on every successful connection. Semantic routing preserves the original
   bytes and retain flag for strict validation.
-- `CoachCommandService` authorizes and preflights a whole expanded group using
+- `CoachCommandService` authorizes and preflights a whole routine/state using
   source-owned action contracts and encoders, without constructing extra sources.
   Coach translates existing YAML frames through each source's adapter; YAML
   action definitions and controller grants do not need to change.
@@ -559,6 +560,123 @@ progress, and offer "restore configured" when `override` is non-null.
 `enable`/`disable` entries, their `confirm` flag, and `available`.
 `health` source entries include their `source` section name.
 
+## Routines and operating states
+
+These are installation-overlay definitions, not factory coach mappings.
+See [configuration](COACH.md#routines-and-operating-states).
+No GUI is bundled here: the MQTT API provides the backend contract for UI
+buttons, selectors, action previews, permission hints and execution progress.
+
+Grant discovery separately from execution:
+
+```yaml
+controllers:
+  rv-dashboard:
+    queries:
+      actions: {}
+      routines: {}
+      states: {}
+      capabilities: {}
+      request_status: {}
+    actions:
+      kitchen_light: {on: {}, off: {}}
+    sources:
+      leveler_ble: {enable: {}, disable: {}}
+    routines:
+      lights_on: {}
+      enable_levelling: {}
+      disable_levelling: {}
+    states:
+      parked: {}
+      levelling: {}
+```
+
+Only grant IDs defined by the installation overlay. A state grant requires
+grants for every referenced routine; each routine requires every member entity
+action and source verb. Invalid/incomplete grants stop startup. `confirm: true`
+is supported on routine/state definitions and grants, and inherited from member
+actions/source grants. A state cannot bypass routine or member confirmation.
+Queries alone never enable execution.
+
+| Query, target `coach` | Result `data` |
+| --- | --- |
+| `actions` | Authorized `targets` with names, descriptions, kinds and typed action schemas; authorized source controls under `sources` |
+| `routines` | `routines` keyed by ID and latest `execution` progress |
+| `states` | `default`, `apply_on_startup`, `states` keyed by ID, `operating_state`, latest `execution` |
+| `capabilities` | Existing entity/monitoring/source catalogs plus `routines` and `operating_states` |
+
+These discovery queries take no parameters. Routine metadata includes `name`,
+`description`, `confirm`, ordered logical `actions`, `authorized`, `available`,
+`reasons`, and `command`. Actions are omitted for routines the controller cannot
+execute. State metadata contains ordered `routines` instead of actions.
+No CAN frames, device addresses, credentials or installation source bindings are
+exposed in the recipe catalogs. Existing source-control catalogs use INI section
+names as before. Catalog availability is a point-in-time whole-plan preflight,
+not a reservation or guarantee of later device connectivity.
+
+For example:
+
+```json
+{
+  "name": "Lights on", "description": "Kitchen lighting",
+  "confirm": false, "authorized": true, "available": true, "reasons": [],
+  "actions": [{"entity": "kitchen_light", "action": "on"}],
+  "command": {
+    "target": "coach", "action": "execute_routine",
+    "params": {"routine": "lights_on"},
+    "schema": {"routine": {"type": "string", "enum": ["lights_on"], "required": true}}
+  }
+}
+```
+
+Send commands using the same version-1 envelope, non-retained command topic,
+request IDs, TTL, confirmation and result subscription rules as entity actions:
+
+| Action, target `coach` | Parameters |
+| --- | --- |
+| `execute_routine` | Required `routine`: configured ID |
+| `set_state` | Required `state`: configured ID; optional `reapply`: boolean, default false |
+
+```sh
+rvcontrol --config config.ini mqtt-query actions
+rvcontrol --config config.ini mqtt-query routines
+rvcontrol --config config.ini mqtt-query states
+rvcontrol --config config.ini mqtt-command coach execute_routine --param routine '"lights_on"'
+rvcontrol --config config.ini mqtt-command coach set_state --param state '"parked"'
+rvcontrol --config config.ini mqtt-command coach set_state --param state '"parked"' --param reapply true
+```
+
+The daemon preflights the entire sequence before side effects. An entity action
+after a source enable waits for that source to start; an action after disabling
+its source is rejected. Source enable/disable needs the allowlist and source
+grant, but read-only collectors do not require a physical `write_enabled` flag.
+Entity writes still require all existing write gates. Execution stops at the
+first failure; there is no rollback or automatic replay.
+
+Retained QoS-1 UI status topics:
+
+| Topic | Payload |
+| --- | --- |
+| `<base_topic>/coach/operating_state` | `version`, `online`, `current`, `requested`, `application_status` (`not_applied`, `applying`, `applied`, `failed`), `steps_completed`, `error` (null or `{code}`) |
+| `<base_topic>/coach/execution` | `version`, `online`, `status` (`idle`, `accepted`, `running`, `completed`, `failed`, `rejected`); active/latest execution adds `client_id`, `request_id`, `action`, `name`, `steps_total`, `steps_completed`, `code` |
+
+Progress counts prepared dispatch/lifecycle operations, not necessarily logical
+actions (one entity action can generate several operations). Both topics refresh
+on broker reconnect and carry `online: false` on orderly shutdown.
+After a crash retained data may be stale; pair it with daemon health/broker
+availability. Results include `data.execution`; state results additionally
+include `data.operating_state`. The existing result topic and journal remain the
+authoritative per-request outcome. Busy queries during execution use the same
+existing rejection rules; observe retained progress instead of polling queries.
+
+Startup always selects the configured default as `not_applied`. Optional startup
+execution uses `[coach_commands] startup_client_id`, normal grants/write gates,
+a new journaled request ID and no confirmation bypass. A failed startup request
+leaves explicit failed status. A configuration reload repeats startup selection
+and optional application; no previous selected state is restored from MQTT.
+Independent routine execution never changes the selected operating state.
+`applied` is dispatch completion, not a physical-state assertion.
+
 ## Admission, concurrency, expiry, and duplicates
 
 1. Parse and validate the envelope, identity, expiry, policy, and parameters.
@@ -578,8 +696,9 @@ queries. Concurrent requests with new identities receive `busy`, including
 cache and health queries while physical work or refresh is in progress. Thus a
 successful health response reports no other active physical plan or refresh.
 Plans are limited to 64 transport operations and a conservative 30-second
-transport/wait budget; group expansion is limited to 64 entity actions and 16
-levels. WLED request timeouts must be positive and at most 10 seconds.
+transport/wait budget; routines cannot nest, and a state expands at most 64
+actions. Source lifecycle operations reserve five seconds each.
+WLED request timeouts must be positive and at most 10 seconds.
 
 Use `(client_id, request_id)` as the duplicate key and a canonical request
 digest for collision detection. An identical duplicate gets the last result
@@ -639,7 +758,7 @@ Transport calls without a reliable outcome must not produce `completed`.
 An uncertain current step yields `unknown`, even when earlier steps completed.
 Completed-step counts describe action-plan transport operations, not MQTT
 packets or physical device movements. Group failures include sanitized
-per-entity progress; preflight failure never executes earlier group members.
+per-entity progress; preflight failure never executes earlier routine members.
 
 Stable codes include `invalid_request`, `unsupported_version`, `expired`,
 `clock_skew`, `writes_disabled`, `forbidden`, `unknown_target`, `unknown_action`,
@@ -702,7 +821,7 @@ Hardware-free tests with fake sources and a fake clock must demonstrate:
 1. Disabled defaults perform no writes and add no semantic subscription.
 2. Opted-in subscriptions recover after MQTT reconnect.
 3. Fan On/Off, typed light brightness, kitchen lid open/close, generator
-   start/stop, and an allow-listed group dispatch through the coach executor.
+   start/stop, and an allowlisted routine dispatch through the coach executor.
 4. Malformed/oversized JSON, unknown fields, bad IDs, unknown targets/actions,
    invalid parameters, forbidden members, and reserved instances cause no writes.
 5. All three write gates and required confirmation are enforced, including
@@ -711,7 +830,7 @@ Hardware-free tests with fake sources and a fake clock must demonstrate:
    never replay physical operations.
 7. Duplicate delivery, concurrent duplicate delivery, ID collisions, restart
    recovery, journal exhaustion, and journal failure behave as specified.
-8. Whole-group preflight prevents partial writes for validation failures;
+8. Whole-routine/state preflight prevents partial writes for validation failures;
    transport failures report partial/unknown outcomes without automatic retries.
 9. A slow action does not block MQTT keepalive or telemetry; concurrent new
    requests receive `busy`; shutdown does not replay unfinished work.

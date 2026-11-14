@@ -31,9 +31,6 @@ controllers:
       rear_bath_fan:
         on: {}
         off: {}
-      all_fans:
-        on: {}
-        off: {}
       kitchen_fan_lid:
         open: {confirm: true}
         close: {confirm: true}
@@ -48,6 +45,15 @@ controllers:
       health: {}
       request_status: {}
       sources: {}
+      actions: {}
+      routines: {}
+      states: {}
+    # With matching overlay routines loaded, grant the routine AND all member actions:
+    # routines:
+    #   all_fans_on: {}
+    #   all_fans_off: {}
+    # states:
+    #   parked: {}
     # Source enable/disable; sections must be listed in [coach_commands] source_control.
     # sources:
     #   leveler: {enable: {}, disable: {confirm: true}}

@@ -720,11 +720,13 @@ def wrap_publisher(config: Any, publisher: Any) -> Any:
         config["coach_commands"].getboolean("enabled", fallback=False)
         or config["coach_commands"].getboolean("queries_enabled", fallback=False)
     )
+    coach = Coach.load(config)
+    if coach.operating_states.apply_on_startup and not config.getboolean("coach_commands", "enabled", fallback=False):
+        raise ValueError("operating_states.apply_on_startup requires enabled coach commands")
     if not publish_state and not api_enabled:
         return publisher
     republish = section.getfloat("state_republish_seconds", fallback=DEFAULT_REPUBLISH_SECONDS)
     request_status = section.getboolean("request_status_on_start", fallback=True)
-    coach = Coach.load(config)
 
     def tracker_factory(publish_entity: Publish) -> EntityStateTracker:
         """Build the tracker with the wrapper's ordered entity-publication callback."""

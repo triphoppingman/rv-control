@@ -10,6 +10,7 @@ import re
 import sqlite3
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from configparser import ConfigParser
 from dataclasses import dataclass
@@ -23,6 +24,7 @@ from ruamel.yaml.error import YAMLError
 from .coach import Coach
 from .coach_queries import CoachQueries
 from .coach_state import EntityStateTracker
+from .operating_states import STATE_TOPIC
 from .sources.base import Source
 from .source_control import MAX_DURATION_S, MAX_REASON, SOURCE_ACTIONS, SOURCE_VERBS, SourceController, controllable_sections
 from .sources.writable import SourceAction, WritableSource
@@ -31,7 +33,9 @@ LOGGER = logging.getLogger(__name__)
 IDENTIFIER = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
 MAX_PAYLOAD = 8192
 MAX_RESULT = 256 * 1024
-QUERY_ACTIONS = {"refresh_states", "snapshot", "republish_states", "capabilities", "health", "request_status", "sources"}
+QUERY_ACTIONS = {"refresh_states", "snapshot", "republish_states", "capabilities", "health", "request_status", "sources", "states", "routines", "actions"}
+SOURCE_SETTLE_SECONDS = 5.0
+EXECUTION_TOPIC = "coach/execution"
 ENTITY_QUERIES = {"refresh_states", "snapshot", "republish_states"}
 ENVELOPE_KEYS = {
     "version", "client_id", "request_id", "issued_at", "expires_at",
@@ -209,7 +213,17 @@ class PreparedSourceControl:
     reason: str
 
 
-PreparedOperation = PreparedCommand | PreparedQuery | PreparedSourceControl
+@dataclass(frozen=True)
+class PreparedState:
+    """One authorized operating-state recipe, including ordered source lifecycle operations."""
+
+    name: str
+    steps: tuple[ActionStep | PreparedSourceControl, ...]
+    unchanged: bool = False
+    routine: bool = False
+
+
+PreparedOperation = PreparedCommand | PreparedQuery | PreparedSourceControl | PreparedState
 
 
 class ControllerPolicy:
@@ -229,10 +243,8 @@ class ControllerPolicy:
             raise ValueError("Policy requires a nonempty controllers mapping")
         self.coach = coach
         self.controllers: dict[str, Any] = data["controllers"]
-        if set(coach.entities) & set(coach.command_groups):
-            raise ValueError("Entity and group names must not overlap")
         for client, policy in self.controllers.items():
-            if not isinstance(client, str) or not IDENTIFIER.fullmatch(client) or not isinstance(policy, dict) or set(policy) - {"actions", "queries", "sources"}:
+            if not isinstance(client, str) or not IDENTIFIER.fullmatch(client) or not isinstance(policy, dict) or set(policy) - {"actions", "queries", "sources", "states", "routines"}:
                 raise ValueError("Invalid controller policy")
             self._validate_source_grants(policy.get("sources", {}), source_control)
             actions = policy.get("actions", {})
@@ -268,7 +280,37 @@ class ControllerPolicy:
         for client, policy in self.controllers.items():
             for target, grants in policy.get("actions", {}).items():
                 for action in grants:
-                    self._validate_expansion(client, target, action)
+                    self.schema(target, action, self.grant(client, target, action))
+            for kind, definitions in (("routines", coach.routines.definitions), ("states", coach.operating_states.definitions)):
+                grants = policy.get(kind, {})
+                if not isinstance(grants, dict):
+                    raise ValueError(f"Controller {kind} grants must be a mapping")
+                for name, grant in grants.items():
+                    if name not in definitions:
+                        raise ValueError(f"Policy references unknown {kind} ID {name!r}")
+                    if not isinstance(grant, dict) or set(grant) - {"confirm"} or type(grant.get("confirm", False)) is not bool:
+                        raise ValueError(f"Invalid {kind} grant")
+                    if kind == "states":
+                        for routine in definitions[name]["routines"]:
+                            self.recipe_grant(client, routine, routine=True)
+            for name in policy.get("routines", {}):
+                for step in coach.routines.definitions[name]["actions"]:
+                    if "source" in step:
+                        section = coach.resolve_config_section({"target": step["source"]}, step["source"])
+                        if section not in source_control:
+                            raise ValueError(f"Routine {name!r} source is not in source_control")
+                        self.source_grant(client, section, step["action"])
+                    else:
+                        target, action = step["entity"], step["action"]
+                        validate_params(step.get("params", {}), self.schema(target, action, self.grant(client, target, action)))
+
+    def recipe_grant(self, client: str, name: str, *, routine: bool = False) -> dict[str, Any]:
+        """Require an explicit routine/state grant in addition to every member action grant."""
+        kind = "routines" if routine else "states"
+        grant = self.controllers.get(client, {}).get(kind, {}).get(name)
+        if grant is None:
+            raise CommandError("forbidden", f"Controller is not authorized for this {kind} ID")
+        return grant
 
     @staticmethod
     def _validate_source_grants(grants: Any, source_control: tuple[str, ...]) -> None:
@@ -294,21 +336,19 @@ class ControllerPolicy:
         return grant
 
     def definition(self, target: str) -> dict[str, Any]:
-        """Return a known entity or group definition without opening sources."""
-        if target not in self.coach.entities and target not in self.coach.command_groups:
+        """Return a known entity definition without opening sources."""
+        if target not in self.coach.entities:
             raise ValueError(
                 f"Policy references unknown target {target!r}; "
                 "check [coach] specfile/overlay or remove the target's controller action grants"
             )
-        return self.coach.entities.get(target) or self.coach.command_groups[target]
+        return self.coach.entities[target]
 
     def schema(self, target: str, action: str, grant: dict[str, Any] | None = None) -> dict[str, Any]:
         """Combine declared schemas with policy bounds that may only narrow them."""
         definition = self.definition(target)
         schemas = definition.get("action_schemas", {})
-        if target in self.coach.command_groups:
-            schema = schemas.get(action, {})
-        elif action not in schemas:
+        if action not in schemas:
             raise ValueError("MQTT actions require a declared action_schemas entry")
         else:
             schema = schemas[action]
@@ -338,55 +378,6 @@ class ControllerPolicy:
         if grant is None:
             raise CommandError("forbidden", "Controller is not authorized for this action")
         return grant
-
-    def expand(
-        self, target: str, action: str, params: dict[str, Any], chain: tuple[str, ...] = (),
-        groups: list[tuple[str, str, dict[str, Any]]] | None = None,
-    ) -> list[tuple[str, str, dict[str, Any]]]:
-        """Expand a bounded acyclic group into entity actions without executing it."""
-        if len(chain) >= 16 or target in chain:
-            raise CommandError("invalid_request", "Cyclic or excessive group expansion")
-        if target in self.coach.entities:
-            if action not in self.coach.entities[target]["actions"]:
-                raise CommandError("unknown_action", "Unknown entity action")
-            return [(target, action, params)]
-        group = self.coach.command_groups.get(target)
-        if group is None:
-            raise CommandError("unknown_target", "Unknown target")
-        actions = group.get("actions", {})
-        if action not in actions:
-            raise CommandError("unknown_action", "Unknown group action")
-        if groups is not None:
-            groups.append((target, action, params))
-        steps = (
-            [{"entity": member, "action": action} for member in group.get("members", [])]
-            if isinstance(actions, list) else actions[action]
-        )
-        if not isinstance(steps, list) or not steps or len(steps) > 64:
-            raise CommandError("invalid_request", "Invalid or excessive group action")
-        result: list[tuple[str, str, dict[str, Any]]] = []
-        for step in steps:
-            if not isinstance(step, dict) or set(step) - {"entity", "action", "params"} or not isinstance(step.get("entity"), str) or not isinstance(step.get("action", action), str) or not isinstance(step.get("params", {}), dict) or any(not isinstance(key, str) for key in step.get("params", {})):
-                raise CommandError("invalid_request", "Invalid group member")
-            result.extend(self.expand(step["entity"], step.get("action", action), dict(step.get("params", {}), **params), chain + (target,), groups))
-            if len(result) > 64:
-                raise CommandError("invalid_request", "Excessive group expansion")
-        return result
-
-    def _validate_expansion(self, client: str, target: str, action: str) -> None:
-        """Fail startup when a group contains unknown, forbidden or undeclared actions."""
-        groups: list[tuple[str, str, dict[str, Any]]] = []
-        expanded = self.expand(target, action, {}, groups=groups)
-        for group, group_action, _params in groups:
-            self.schema(group, group_action, self.grant(client, group, group_action))
-        for entity, member_action, params in expanded:
-            self.schema(entity, member_action, self.grant(client, entity, member_action))
-            if target in self.coach.command_groups:
-                schema = self.schema(entity, member_action, self.grant(client, entity, member_action))
-                group_schema = self.schema(target, action)
-                if not group_schema:
-                    validate_params(params, schema)
-
 
 class RequestJournal:
     """Bounded durable request identities with crash-recovery outcomes."""
@@ -494,57 +485,104 @@ class CoachRequestPlanner:
             raise CommandError("forbidden", "Command API is disabled")
         if request["target"] == "coach" and request["action"] in SOURCE_ACTIONS:
             return self.prepare_source_control(request)
+        if request["target"] == "coach" and request["action"] == "set_state":
+            return self.prepare_state(request)
+        if request["target"] == "coach" and request["action"] == "execute_routine":
+            return self.prepare_state(request, routine=True)
         if request["target"] == "coach" or request["action"] in QUERY_ACTIONS:
             raise CommandError("invalid_request", "Monitoring requires the query topic")
         return PreparedCommand(tuple(self.plan(request)))
 
     def plan(self, request: dict[str, Any], *, availability: bool = True) -> list[ActionStep]:
-        """Expand, authorize and build every physical operation before dispatch."""
+        """Authorize an entity action and build every physical operation before dispatch."""
         client, target, action = request["client_id"], request["target"], request["action"]
-        if target not in self.coach.entities and target not in self.coach.command_groups:
+        if target not in self.coach.entities:
             raise CommandError("unknown_target", "Unknown target")
         if action not in self.policy.definition(target).get("actions", {}):
             raise CommandError("unknown_action", "Unknown action")
 
         grant = self.policy.grant(client, target, action)
         validate_params(request["params"], self.policy.schema(target, action, grant))
-        groups: list[tuple[str, str, dict[str, Any]]] = []
-        expanded = self.policy.expand(target, action, request["params"], groups=groups)
-        plan: list[ActionStep] = []
-
-        # Confirmation on a group and on each leaf is independently required.
-        if grant.get("confirm") and not request["confirmed"]:
+        entity = self.coach.entities[target]
+        if (entity.get("confirm") or grant.get("confirm")) and not request["confirmed"]:
             raise CommandError("confirmation_required", "Deliberate user confirmation is required")
-        for group, group_action, params in groups:
-            group_grant = self.policy.grant(client, group, group_action)
-            validate_params(params, self.policy.schema(group, group_action, group_grant))
-            if group_grant.get("confirm") and not request["confirmed"]:
-                raise CommandError("confirmation_required", "Deliberate user confirmation is required")
-
-        # Complete validation before a command can start; malformed later steps must
-        # never leave an earlier actuator step already dispatched.
+        try:
+            section = self.coach.resolve_config_section(entity, target)
+            frames = self.coach.prepare_source_actions(target, action, request["params"])
+        except (KeyError, ValueError, PermissionError) as error:
+            raise CommandError("invalid_params", "Configured action cannot be preflighted") from error
+        if not frames:
+            raise CommandError("invalid_request", "Action has no transport operations")
+        if availability:
+            self.check_source(section)
+        plan: list[ActionStep] = []
         duration = 0.0
-        for entity_name, member_action, params in expanded:
-            member_grant = self.policy.grant(client, entity_name, member_action)
-            validate_params(params, self.policy.schema(entity_name, member_action, member_grant))
-            entity = self.coach.entities[entity_name]
-            if (entity.get("confirm") or member_grant.get("confirm")) and not request["confirmed"]:
-                raise CommandError("confirmation_required", "Deliberate user confirmation is required")
-            try:
-                section = self.coach.resolve_config_section(entity, entity_name)
-                frames = self.coach.prepare_source_actions(entity_name, member_action, params)
-            except (KeyError, ValueError, PermissionError) as error:
-                raise CommandError("invalid_params", "Configured action cannot be preflighted") from error
-            if not frames:
-                raise CommandError("invalid_request", "Action has no transport operations")
-            if availability:
-                self.check_source(section)
-            for wait, prepared in frames:
-                duration += wait + prepared.dispatch_budget_seconds
-                plan.append(ActionStep(entity_name, section, wait, prepared))
-                if len(plan) > 64 or duration > 30:
-                    raise CommandError("invalid_request", "Action plan exceeds 64 steps or 30 seconds")
+        for wait, prepared in frames:
+            duration += wait + prepared.dispatch_budget_seconds
+            plan.append(ActionStep(target, section, wait, prepared))
+            if len(plan) > 64 or duration > 30:
+                raise CommandError("invalid_request", "Action plan exceeds 64 steps or 30 seconds")
         return plan
+
+    def prepare_state(self, request: dict[str, Any], *, routine: bool = False) -> PreparedState:
+        """Preflight a routine or whole state before writes or source enablement changes."""
+        params = request["params"]
+        key = "routine" if routine else "state"
+        allowed = {key} if routine else {key, "reapply"}
+        if set(params) - allowed or key not in params or type(params.get("reapply", False)) is not bool:
+            raise CommandError("invalid_params", f"Expected {key}" + ("" if routine else " and optional boolean reapply"))
+        name = params[key]
+        states = self.coach.operating_states
+        definitions = self.coach.routines.definitions if routine else states.definitions
+        if not isinstance(name, str) or name not in definitions:
+            raise CommandError("unknown_target", f"Unknown {key}")
+        grant = self.policy.recipe_grant(request["client_id"], name, routine=routine)
+        definition = definitions[name]
+        if (grant.get("confirm") or definition.get("confirm")) and not request["confirmed"]:
+            raise CommandError("confirmation_required", "Deliberate user confirmation is required")
+        snapshot = states.snapshot()
+        if not routine and snapshot["current"] == name and snapshot["application_status"] == "applied" and not params.get("reapply", False):
+            return PreparedState(name, (), unchanged=True)
+        actions: list[dict[str, Any]] = []
+        for routine_name in [name] if routine else definition["routines"]:
+            routine_grant = self.policy.recipe_grant(request["client_id"], routine_name, routine=True)
+            routine_definition = self.coach.routines.definitions[routine_name]
+            if (routine_grant.get("confirm") or routine_definition.get("confirm")) and not request["confirmed"]:
+                raise CommandError("confirmation_required", "Deliberate user confirmation is required")
+            actions.extend(routine_definition["actions"])
+            if len(actions) > 64:
+                raise CommandError("invalid_request", "Recipe exceeds 64 actions")
+        steps: list[ActionStep | PreparedSourceControl] = []
+        desired: dict[str, bool] = {}
+        duration = 0.0
+        for step in actions:
+            if "source" in step:
+                try:
+                    section = self.coach.resolve_config_section({"target": step["source"]}, step["source"])
+                except ValueError as error:
+                    raise CommandError("source_unavailable", "Routine source binding is unavailable") from error
+                member = dict(request, action=f"source_{step['action']}", params={"source": section, "reason": f"{key}:{name}"})
+                prepared = self.prepare_source_control(member)
+                desired[section] = prepared.enabled
+                steps.append(prepared)
+                duration += SOURCE_SETTLE_SECONDS
+            else:
+                member = dict(request, target=step["entity"], action=step["action"], params=step.get("params", {}))
+                physical = self.plan(member, availability=False)
+                for operation in physical:
+                    self.check_write_gates(operation.section)
+                    source_class = Source.source_class(self.config[operation.section].get("type", ""))
+                    if not issubclass(source_class, WritableSource):
+                        raise CommandError("source_unavailable", "Required source does not support writes")
+                    if desired.get(operation.section) is False:
+                        raise CommandError("source_unavailable", "Recipe uses a source after disabling it")
+                    if not desired.get(operation.section, False):
+                        self.check_source(operation.section)
+                    duration += operation.wait + operation.action.dispatch_budget_seconds
+                steps.extend(physical)
+            if len(steps) > 64 or duration > 30:
+                raise CommandError("invalid_request", "State plan exceeds 64 steps or 30 seconds")
+        return PreparedState(name, tuple(steps), routine=routine)
 
     def prepare_source_control(self, request: dict[str, Any]) -> PreparedSourceControl:
         """Authorize and validate an enable/disable request without touching sources."""
@@ -568,14 +606,18 @@ class CoachRequestPlanner:
             raise CommandError("invalid_params", f"reason must be printable text of at most {MAX_REASON} characters")
         return PreparedSourceControl(section, SOURCE_ACTIONS[request["action"]], duration, reason)
 
-    def check_source(self, section: str) -> WritableSource:
-        """Recheck global and source write gates plus readiness before each operation."""
+    def check_write_gates(self, section: str) -> None:
+        """Check command, MQTT and source write gates even for a not-yet-started source."""
         if (
             not self.commands_enabled
             or not self.config[self.mqtt_section].getboolean("write_enabled", fallback=False)
             or not self.config[section].getboolean("write_enabled", fallback=False)
         ):
             raise CommandError("writes_disabled", "Physical writes are disabled")
+
+    def check_source(self, section: str) -> WritableSource:
+        """Recheck global and source write gates plus readiness before each operation."""
+        self.check_write_gates(section)
         source = self.sources.get(section)
         if not isinstance(source, WritableSource) or not source.command_ready():
             raise CommandError("source_unavailable", "Required source is unavailable")
@@ -646,6 +688,7 @@ class CoachCommandService:
         sources: dict[str, Source], publish: PublishResult,
         connected: Callable[[], bool], clock: Callable[[], float] = utc_now,
         source_controller: SourceController | None = None,
+        publish_state: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
         """Validate configuration, load policy, and recover the durable journal."""
         self.config, self.coach, self.sources = config, coach, sources
@@ -666,6 +709,66 @@ class CoachCommandService:
         )
         self.planner.source_controller = source_controller
         self.started = time.monotonic()
+        self._publish_state = publish_state
+        self._state_published: dict[str, Any] | None = None
+        self._state_connected = False
+        self._states_started = False
+        self._startup_request_id: str | None = None
+        self._status_lock = threading.RLock()
+        self._execution: dict[str, Any] = {"version": 1, "online": True, "status": "idle"}
+        self._execution_published: dict[str, Any] | None = None
+
+    def start_operating_states(self) -> None:
+        """Publish the startup selection and optionally admit its actions after sources attach."""
+        if self._states_started:
+            return
+        self._states_started = True
+        states = self.coach.operating_states
+        self.tick()
+        if not states.apply_on_startup:
+            return
+        now = self.clock()
+        self._startup_request_id = str(uuid.uuid4())
+        request = {
+            "version": 1, "client_id": self.config["coach_commands"]["startup_client_id"],
+            "request_id": self._startup_request_id, "issued_at": timestamp(now),
+            "expires_at": timestamp(now + 15), "target": "coach", "action": "set_state",
+            "params": {"state": states.default}, "confirmed": False,
+        }
+        self.receive("command", json.dumps(request).encode())
+
+    def tick(self) -> None:
+        """Publish retained operating-state changes and refresh them after broker reconnects."""
+        if self._publish_state is None or not (self.coach.operating_states.definitions or self.coach.routines.definitions):
+            return
+        with self._status_lock:
+            connected = self.connected()
+            reconnected = connected and not self._state_connected
+            self._state_connected = connected
+            if not connected:
+                return
+            snapshot = self.coach.operating_states.snapshot()
+            try:
+                if self.coach.operating_states.definitions and (snapshot != self._state_published or reconnected):
+                    self._publish_state(STATE_TOPIC, snapshot)
+                    self._state_published = snapshot
+                if self._execution != self._execution_published or reconnected:
+                    self._publish_state(EXECUTION_TOPIC, dict(self._execution))
+                    self._execution_published = dict(self._execution)
+            except Exception:
+                LOGGER.exception("Unable to publish coach operating-state/execution status")
+                self._state_connected = False
+
+    def execution_snapshot(self) -> dict[str, Any]:
+        """Return detached progress and correlation metadata for the latest routine/state request."""
+        with self._status_lock:
+            return dict(self._execution)
+
+    def _execution_update(self, **values: Any) -> None:
+        """Serialize execution progress publication with supervision reconnect publication."""
+        with self._status_lock:
+            self._execution.update(values)
+            self.tick()
 
     @property
     def enabled(self) -> bool:
@@ -704,6 +807,14 @@ class CoachCommandService:
             coach, config_dir / policy_path, CoachQueries(coach, tracker, {}).entities(),
             controllable_sections(config),
         )
+        if coach.operating_states.apply_on_startup:
+            client = section.get("startup_client_id", "").strip()
+            if not enabled or not IDENTIFIER.fullmatch(client):
+                raise ValueError("apply_on_startup requires enabled coach commands and startup_client_id")
+            default = coach.operating_states.default
+            if default is None:
+                raise ValueError("apply_on_startup requires a default state")
+            policy.recipe_grant(client, default)
         limit = section.getint("journal_max_entries", fallback=1024)
         if not 1 <= limit <= 10000:
             raise ValueError("journal_max_entries must be between 1 and 10000")
@@ -770,6 +881,8 @@ class CoachCommandService:
 
     def _reject(self, request: dict[str, Any], code: str, message: str) -> None:
         """Log rejections and reply only when both correlation identifiers are safe."""
+        if self._startup_request_id is not None and request.get("request_id") == self._startup_request_id:
+            self.coach.operating_states.fail(request["params"]["state"], code, attempted=False)
         LOGGER.warning("Coach request rejected: code=%s client=%s request=%s", code, request.get("client_id") if isinstance(request.get("client_id"), str) and IDENTIFIER.fullmatch(request["client_id"]) else "invalid", request.get("request_id") if isinstance(request.get("request_id"), str) and IDENTIFIER.fullmatch(request["request_id"]) else "invalid")
         if all(isinstance(request.get(key), str) and IDENTIFIER.fullmatch(request[key]) for key in ("client_id", "request_id")):
             safe = {key: request[key] for key in ("client_id", "request_id")}
@@ -798,6 +911,15 @@ class CoachCommandService:
         result = accepted
         start = time.monotonic()
         try:
+            if isinstance(prepared, PreparedState):
+                with self._status_lock:
+                    self._execution = {
+                        "version": 1, "online": True, "status": "accepted",
+                        "client_id": request["client_id"], "request_id": request["request_id"],
+                        "action": request["action"], "name": prepared.name,
+                        "steps_total": len(prepared.steps), "steps_completed": 0, "code": None,
+                    }
+                self.tick()
             self._publish(accepted, wait=True)
             if self.clock() >= expires:
                 raise CommandError("expired", "Request expired before dispatch")
@@ -814,29 +936,45 @@ class CoachCommandService:
                 completed = 1
                 result = self.result(request, "completed", "executed", "Source control recorded; the supervisor applies it within about one second")
                 result.update(outcome="dispatched", steps_completed=completed, data=data)
+            elif isinstance(prepared, PreparedState) and prepared.unchanged:
+                result = self.result(request, "completed", "unchanged", "Operating state is already applied; use reapply to execute it again")
             else:
+                if isinstance(prepared, PreparedState) and not prepared.routine:
+                    self.coach.operating_states.begin(prepared.name)
+                if isinstance(prepared, PreparedState):
+                    self._execution_update(status="running")
                 for step in prepared.steps:
-                    if step.wait:
-                        self.coach.sleep(step.wait)
-                    source = self.planner.check_source(step.section)
+                    if isinstance(step, ActionStep):
+                        if step.wait:
+                            self.coach.sleep(step.wait)
+                        self.planner.check_source(step.section)
                     if not attempted:
                         if self.clock() >= expires:
                             raise CommandError("expired", "Request expired before the first write")
                         self.journal.save(request, accepted, intent=True)
-                        source = self.planner.check_source(step.section)
                         # Intent must be durable before entering the hardware path;
                         # after this point a crash can leave physical outcome unknown.
                         if self.clock() >= expires:
                             raise CommandError("expired", "Request expired while recording execution intent")
                     attempted = True
-                    source.execute_action(step.action.name, step.action.params)
+                    if isinstance(step, PreparedSourceControl):
+                        self._apply_state_source(step, request["client_id"])
+                    else:
+                        source = self.planner.check_source(step.section)
+                        source.execute_action(step.action.name, step.action.params)
+                        progress[step.entity] = progress.get(step.entity, 0) + 1
                     completed += 1
-                    progress[step.entity] = progress.get(step.entity, 0) + 1
+                    if isinstance(prepared, PreparedState) and not prepared.routine:
+                        self.coach.operating_states.progress(completed)
+                    if isinstance(prepared, PreparedState):
+                        self._execution_update(steps_completed=completed)
+                if isinstance(prepared, PreparedState) and not prepared.routine:
+                    self.coach.operating_states.finish(prepared.name)
                 result = self.result(request, "completed", "executed", "Configured action dispatched; physical state is not confirmed")
                 result.update(outcome="dispatched", steps_completed=completed, data={"entities": [{"entity": name, "steps_completed": count} for name, count in progress.items()]})
         except CommandError as error:
             result = self.result(request, "failed" if attempted else "rejected", error.code, str(error))
-            result.update(outcome="partial" if completed else "not_started", steps_completed=completed)
+            result.update(outcome="partial" if completed else ("unknown" if attempted else "not_started"), steps_completed=completed)
         except Exception as error:
             LOGGER.error("Coach request execution failed: client=%s request=%s error_type=%s", request["client_id"], request["request_id"], type(error).__name__)
             result = self.result(request, "failed" if attempted or kind == "query" else "rejected", "execution_failed", "Dispatch failed; inspect telemetry before any new request")
@@ -844,6 +982,13 @@ class CoachCommandService:
         finally:
             if kind == "command" and completed and result["status"] != "completed":
                 result["data"] = {"entities": [{"entity": name, "steps_completed": count} for name, count in progress.items()]}
+            if isinstance(prepared, PreparedState) and not prepared.routine:
+                if result["status"] != "completed":
+                    self.coach.operating_states.fail(prepared.name, result["code"], attempted=attempted)
+                result.setdefault("data", {})["operating_state"] = self.coach.operating_states.snapshot()
+            if isinstance(prepared, PreparedState):
+                self._execution_update(status=result["status"], code=result["code"], steps_completed=completed)
+                result.setdefault("data", {})["execution"] = self.execution_snapshot()
             try:
                 size = len(json.dumps(result, allow_nan=False).encode())
             except (ValueError, TypeError, OverflowError):
@@ -859,6 +1004,28 @@ class CoachCommandService:
                 LOGGER.exception("Unable to persist/publish coach terminal result: client=%s request=%s", request["client_id"], request["request_id"])
             LOGGER.info("Coach request client=%s request=%s target=%s action=%s status=%s code=%s outcome=%s duration=%.3f", request["client_id"], request["request_id"], request["target"], request["action"], result["status"], result["code"], result["outcome"], time.monotonic() - start)
             self._busy.release()
+
+    def _apply_state_source(self, step: PreparedSourceControl, client: str) -> None:
+        """Record a source decision and wait a bounded time for the supervisor to apply it."""
+        controller = self.planner.source_controller
+        if controller is None:
+            raise CommandError("source_unavailable", "Source control is unavailable")
+        controller.request(step.section, step.enabled, reason=step.reason, client_id=client)
+        deadline = time.monotonic() + SOURCE_SETTLE_SECONDS
+        while time.monotonic() < deadline:
+            if self._closing:
+                raise CommandError("source_unavailable", "Service is shutting down")
+            entries = controller.snapshot()["sources"]
+            state = next(entry["state"] for entry in entries if entry["source"] == step.section)
+            if not step.enabled and state == "disabled":
+                return
+            source = self.sources.get(step.section)
+            if step.enabled and state == "running" and (
+                not isinstance(source, WritableSource) or source.command_ready()
+            ):
+                return
+            time.sleep(0.05)
+        raise CommandError("source_unavailable", "Source did not reach the requested lifecycle state within five seconds")
 
     def _query(self, request: dict[str, Any], entities: list[str], expires: float) -> dict[str, Any]:
         """Run only authorized safe queries; never call the coach action executor."""
@@ -885,6 +1052,16 @@ class CoachCommandService:
             data = {"result": recorded[1]}
         elif action == "capabilities":
             data = self._capabilities(request["client_id"])
+        elif action == "states":
+            data = self._state_capabilities(request["client_id"])
+            data["operating_state"] = self.coach.operating_states.snapshot()
+            data["execution"] = self.execution_snapshot()
+        elif action == "routines":
+            data = {"routines": self._recipe_capabilities(request["client_id"], routine=True),
+                    "execution": self.execution_snapshot()}
+        elif action == "actions":
+            capabilities = self._capabilities(request["client_id"])
+            data = {"targets": capabilities["targets"], "sources": capabilities["sources"]}
         elif action == "sources":
             controller = self.planner.source_controller
             if controller is None:
@@ -911,21 +1088,22 @@ class CoachCommandService:
                 schema = self.policy.schema(target, action, grant)
                 requires_confirmation = bool(grant.get("confirm"))
                 reasons: set[str] = set()
-                groups: list[tuple[str, str, dict[str, Any]]] = []
-                expanded = self.policy.expand(target, action, {}, groups=groups)
-                requires_confirmation |= any(self.policy.grant(client, group, group_action).get("confirm", False) for group, group_action, _params in groups)
-                for entity, member_action, _params in expanded:
-                    definition = self.coach.entities[entity]
-                    requires_confirmation |= bool(definition.get("confirm") or self.policy.grant(client, entity, member_action).get("confirm"))
-                    try:
-                        section = self.coach.resolve_config_section(definition, entity)
-                        self.planner.check_source(section)
-                    except CommandError as error:
-                        reasons.add(error.code)
-                    except (ValueError, KeyError):
-                        reasons.add("source_unavailable")
+                definition = self.coach.entities[target]
+                requires_confirmation |= bool(definition.get("confirm"))
+                try:
+                    section = self.coach.resolve_config_section(definition, target)
+                    self.planner.check_source(section)
+                except CommandError as error:
+                    reasons.add(error.code)
+                except (ValueError, KeyError):
+                    reasons.add("source_unavailable")
                 actions[action] = {"params": schema, "confirm": requires_confirmation, "available": not reasons, "reasons": sorted(reasons)}
-            targets[target] = {"actions": actions}
+            definition = self.policy.definition(target)
+            targets[target] = {
+                "name": definition.get("name", target), "description": definition.get("description", ""),
+                "kind": definition.get("kind", ""),
+                "actions": actions,
+            }
         allowed: set[str] = set()
         for action, grant in policy.get("queries", {}).items():
             if action in ENTITY_QUERIES:
@@ -946,7 +1124,59 @@ class CoachCommandService:
             }
             for section, verbs in policy.get("sources", {}).items()
         }
-        return {"targets": targets, "monitoring": monitoring, "queries": policy.get("queries", {}), "sources": source_controls}
+        return {"targets": targets, "monitoring": monitoring, "queries": policy.get("queries", {}), "sources": source_controls,
+                "operating_states": self._state_capabilities(client),
+                "routines": self._recipe_capabilities(client, routine=True)}
+
+    def _state_capabilities(self, client: str) -> dict[str, Any]:
+        """List UI state metadata with caller-specific authorization and preflight availability."""
+        states = self.coach.operating_states
+        return {
+            "default": states.default, "apply_on_startup": states.apply_on_startup,
+            "states": self._recipe_capabilities(client, routine=False),
+        }
+
+    def _recipe_capabilities(self, client: str, *, routine: bool) -> dict[str, Any]:
+        """Describe logical recipes, exact invocation schemas, permissions and inherited confirmation."""
+        catalog = self.coach.routines.catalog() if routine else self.coach.operating_states.catalog()["states"]
+        kind = "routines" if routine else "states"
+        key = "routine" if routine else "state"
+        action = "execute_routine" if routine else "set_state"
+        for name, metadata in catalog.items():
+            reasons: list[str] = []
+            selectable = name in self.policy.controllers[client].get(kind, {})
+            try:
+                self.planner.prepare_state({
+                    "client_id": client, "target": "coach", "action": action,
+                    "params": {key: name} if routine else {key: name, "reapply": True}, "confirmed": True,
+                }, routine=routine)
+                if not self.enabled:
+                    reasons.append("writes_disabled")
+            except CommandError as error:
+                reasons.append(error.code)
+            confirm = bool(metadata["confirm"] or self.policy.controllers[client].get(kind, {}).get(name, {}).get("confirm"))
+            routines = [name] if routine else metadata["routines"]
+            if selectable:
+                for routine_name in routines:
+                    definition = self.coach.routines.definitions[routine_name]
+                    confirm |= bool(definition.get("confirm") or self.policy.controllers[client].get("routines", {}).get(routine_name, {}).get("confirm"))
+                    for step in definition["actions"]:
+                        if "source" in step:
+                            section = self.coach.resolve_config_section({"target": step["source"]}, step["source"])
+                            confirm |= bool(self.policy.controllers[client].get("sources", {}).get(section, {}).get(step["action"], {}).get("confirm"))
+                        else:
+                            entity, member_action = step["entity"], step["action"]
+                            confirm |= bool(self.coach.entities[entity].get("confirm") or self.policy.controllers[client].get("actions", {}).get(entity, {}).get(member_action, {}).get("confirm"))
+            schema: dict[str, Any] = {key: {"type": "string", "enum": [name], "required": True}}
+            if not routine:
+                schema["reapply"] = {"type": "boolean", "required": False, "default": False}
+            metadata.update(
+                authorized=selectable, available=not reasons, reasons=reasons, confirm=confirm,
+                command={"target": "coach", "action": action, "params": {key: name}, "schema": schema},
+            )
+            if not selectable and routine:
+                metadata.pop("actions")
+        return catalog
 
     def close(self) -> None:
         """Stop admission and finish the bounded worker before closing its journal."""
@@ -954,7 +1184,14 @@ class CoachCommandService:
             self._closing = True
         if self._worker:
             self._worker.join()
-        self.journal.close()
+        try:
+            if self._publish_state is not None and self.connected():
+                if self.coach.operating_states.definitions:
+                    self._publish_state(STATE_TOPIC, dict(self.coach.operating_states.snapshot(), online=False))
+                if self.coach.routines.definitions:
+                    self._publish_state(EXECUTION_TOPIC, dict(self.execution_snapshot(), online=False))
+        finally:
+            self.journal.close()
 
 
 def api_enabled(config: ConfigParser) -> bool:

@@ -211,10 +211,10 @@ generic decoder just to make an unverified installation guess look correct.
    INI bindings. Do not add a new source type for a coach file.
 5. Add explicit parameter schemas for actions intended for semantic MQTT.
 6. Reserve channels that must not be commanded. Do not expose unknown channels
-   in groups. Add confirmation requirements where appropriate.
+   in routines. Add confirmation requirements where appropriate.
 7. Preserve inference notes and leave `verified` false/absent until tested from
    RV-Control on that installation. That flag is descriptive, not enforcement.
-8. Add groups/scenes only after each member's behavior is independently known.
+8. Add overlay routines only after each action's behavior is independently known.
 9. Prepare a least-privilege controller policy separately if MQTT control is
    wanted; discovery does not require enabling that endpoint.
 

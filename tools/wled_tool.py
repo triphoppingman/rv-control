@@ -36,7 +36,7 @@ def emit(value: dict[str, Any] | list[str]) -> None:
 
 
 def source_from(context: click.Context) -> WledSource:
-    """Return the configured WLED source stored by the command group."""
+    """Return the configured WLED source stored in the CLI context."""
     return context.obj["source"]
 
 

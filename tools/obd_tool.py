@@ -41,7 +41,7 @@ def emit(value: Any) -> None:
 
 
 def source_from(context: click.Context) -> ObdSource:
-    """Return the configured OBD source stored by the command group."""
+    """Return the configured OBD source stored in the CLI context."""
     return context.obj["source"]
 
 

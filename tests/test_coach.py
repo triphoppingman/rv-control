@@ -166,17 +166,17 @@ def test_wled_entities_select_distinct_controllers(coach_env: Any) -> None:
     assert wled_calls == [{"seg": [{"id": 0, "fx": 1}]}, {"seg": [{"id": 0, "pal": 2}]}]
 
 
-def test_coach_execute_group(coach_env: Any) -> None:
-    """Member groups apply one action to every member; step groups run explicit steps."""
-    coach, bus, wled_calls, _sleeps = coach_env
-    results = coach.execute("all_fans", "off")
-    assert [r["target"] for r in results] == ["kitchen_fan", "mid_bath_fan", "rear_bath_fan"]
-    assert len(bus.sent) == 3
-
-    results = coach.execute("evening_scene", "activate")
-    assert [r["target"] for r in results] == ["living_ceiling_light", "bedroom_ceiling_light", "patio_light"]
-    assert frames(bus)[3] == (0x19FEDB00, "01 FF 3C 00 FF 00 FF FF")
-    assert wled_calls == [{"on": True}]
+def test_coach_routine_catalog(coach_env: Any) -> None:
+    """Installation routines use the journaled MQTT execution path."""
+    coach, bus, _wled_calls, _sleeps = coach_env
+    routines = coach.routines.catalog()
+    assert [step["entity"] for step in routines["all_fans_off"]["actions"]] == [
+        "kitchen_fan", "mid_bath_fan", "rear_bath_fan",
+    ]
+    assert routines["evening"]["actions"][0]["params"] == {"level": 30}
+    with pytest.raises(KeyError, match="execute_routine"):
+        coach.execute("all_fans_off", "execute")
+    assert not bus.sent
 
 
 def test_coach_error_handling(config_file: Path) -> None:

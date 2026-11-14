@@ -29,7 +29,7 @@ def test_overlay_optional_preserves_factory(config_file: Path) -> None:
     config["coach"]["overlay"] = " "
     assert Coach.load(config).data == original.data
     assert "patio_light" not in original.entities
-    assert "evening_scene" not in original.command_groups
+    assert not original.routines.definitions
     assert "wled_light" not in original.templates
     assert all(item.get("transport") != "wled" for item in original.templates.values())
     assert all(item.get("transport") != "wled" for item in original.entities.values())
@@ -59,17 +59,17 @@ def test_overlay_adds_wled_actions_without_mutating_factory(config_file: Path) -
         assert merged.prepare_action("patio_light", "brightness", {"bri": bri}) == [
             (0.0, {"on": True, "bri": bri}),
         ]
-    assert "evening_scene" in merged.command_groups
+    assert "evening" in merged.routines.definitions
     assert factory.data == before
 
 
-def test_overlay_adds_entities_groups_and_reservations(config_file: Path) -> None:
+def test_overlay_adds_entities_routines_and_reservations(config_file: Path) -> None:
     """New entities, scenes, metadata and safety exclusions are additive."""
     coach = load_overlay(config_file, {
         "coach": {"installation": "custom"},
         "templates": {"wled_light": {"transport": "wled", "actions": {"off": [{"on": False}]}}},
         "entities": {"custom_strip": {"template": "wled_light", "target": "custom_strip"}},
-        "command_groups": {"custom_scene": {"members": ["custom_strip"], "actions": ["off"]}},
+        "routines": {"custom_scene": {"actions": [{"entity": "custom_strip", "action": "off"}]}},
         "reserved": [{"dgn": 0x1FEDB, "instances": [100]}],
     })
     assert coach.info["installation"] == "custom"
@@ -86,7 +86,6 @@ def test_overlay_adds_entities_groups_and_reservations(config_file: Path) -> Non
     {"templates": {"dimmable_light": {"action_schemas": {"brightness": {"level": {"max": 999}}}}}},
     {"templates": {"dimmable_light": {"action_schemas": {"brightness": {"level": {"enum": [1]}}}}}},
     {"entities": {"living_ceiling_light": {"action_schemas": {"brightness": {"level": {"enum": [1]}}}}}},
-    {"command_groups": {"all_fans": {"members": ["kitchen_fan"]}}},
     {"entities": {"fresh_tank": {"state": {"fields": {"level": "other"}}}}},
 ])
 def test_overlay_rejects_direct_and_inherited_overrides(
@@ -107,9 +106,9 @@ def test_overlay_rejects_direct_and_inherited_overrides(
     {"entities": {"bad": {"transport": "wled", "actions": {"x": {}}, "action_schemas": {"x": {"p": {"type": "invalid"}}}}}},
     {"entities": {"bad": {"transport": "wled", "actions": {"x": {"wait": 100}}}}},
     {"entities": {"bad": {"transport": "wled", "actions": {"x": {}}}}},
-    {"command_groups": {"bad": {"members": ["missing"], "actions": ["on"]}}},
-    {"command_groups": {"bad": {"members": ["bad"], "actions": ["on"]}}},
-    {"command_groups": {"bad": {"members": ["patio_light"], "actions": ["missing"]}}},
+    {"routines": {"bad": {"actions": [{"entity": "missing", "action": "on"}]}}},
+    {"routines": {"bad": {"actions": [{"routine": "bad", "action": "execute"}]}}},
+    {"routines": {"bad": {"actions": [{"entity": "patio_light", "action": "missing"}]}}},
     {"reserved": [{"dgn": 0x1FEDB, "instances": [1]}]},
     {"reserved": [{"dgn": 0x1FEDB, "instances": [256]}]},
 ])

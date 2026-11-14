@@ -106,13 +106,14 @@ def interrogate(config: Any) -> None:
 @click.option("--coach-spec", default=None, help="Coach specification file path or model stem.")
 @click.pass_obj
 def coach_list(config: Any, coach_spec: str | None) -> None:
-    """List all coach entities and command groups."""
+    """List coach entities, routines and operating states."""
     try:
         coach = Coach.load(config, coach_spec)
         result = {
             "coach": coach.info,
             "entities": coach.list_entities(),
-            "command_groups": coach.list_command_groups(),
+            "operating_states": coach.operating_states.catalog(),
+            "routines": coach.routines.catalog(),
         }
         click.echo(json.dumps(result, indent=2, sort_keys=True, default=str))
     except (FileNotFoundError, ValueError, KeyError) as error:
@@ -147,7 +148,7 @@ def coach_exec(
     params: tuple[tuple[str, str], ...],
     confirm: bool,
 ) -> None:
-    """Execute an action on a coach entity or command group."""
+    """Execute an action on a coach entity; use mqtt-command coach execute_routine for routines."""
     kw: dict[str, Any] = {"confirm": True} if confirm else {}
     for key, val in params:
         try:
@@ -260,6 +261,7 @@ def _run_session(
                 command_service = CoachCommandService(
                     config, publisher.tracker.coach, publisher.tracker, source_map,
                     mqtt.publish_result, mqtt.connected.is_set, source_controller=controller,
+                    publish_state=mqtt.publish_retained,
                 )
                 mqtt.coach_service = command_service
         except (ValueError, KeyError, OSError, sqlite3.Error) as error:
@@ -281,12 +283,16 @@ def _run_session(
             coach_publisher.request_initial_status(source_map)
         if controller is not None:
             controller.attach(publisher, stop_event, sources, source_map)
+        if command_service is not None:
+            command_service.start_operating_states()
 
         def tick() -> None:
             """Apply source control and request shutdown after a validated reload."""
             nonlocal candidate
             if controller is not None:
                 controller.tick()
+            if command_service is not None:
+                command_service.tick()
             if reloader is not None:
                 candidate = reloader.poll()
                 if candidate is not None:

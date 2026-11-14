@@ -340,7 +340,7 @@ rv-control --config config.ini interrogate
 
 Renogy interrogation connects once, reads every register block defined by the configured Renogy client type, and prints the decoded state. Hughes connects once, waits for a complete notification packet, and prints its decoded power attributes. BeechLane connects once, reads device status and setup, waits for one tilt sample, and prints `status` and `state` (`state` is null when the device has not been set up). RV-C listens for `interrogate_seconds` (10 by default), decodes received DGN frames, and prints the latest state for each DGN/source combination. The command exits with status `1` if an enabled source cannot be interrogated.
 
-List the coach entities and command groups:
+List the coach entities, installation routines and operating states:
 
 ```sh
 rv-control --config config.ini coach-list
@@ -359,15 +359,28 @@ migration is required. Source catalogs describe implemented support, not write
 permission or current device availability. See the
 [source action interface](docs/COACH.md#source-owned-action-interface).
 
-Execute an action on a coach entity or command group (`-p` supplies action parameters; `--confirm` is required for entities marked `confirm`, such as the generator):
+Execute an action on a coach entity (`-p` supplies action parameters; `--confirm` is required for entities marked `confirm`, such as the generator):
 
 ```sh
 rv-control --config config.ini coach-exec kitchen_fan toggle
 rv-control --config config.ini coach-exec living_ceiling_light brightness -p level 30
-# Requires the customization overlay defining evening_scene:
-rv-control --config config.ini coach-exec evening_scene activate
 rv-control --config config.ini coach-exec generator start --confirm
 ```
+
+Routines live only in the installation overlay.
+Use the daemon's authorized MQTT API to inspect and execute them or select an
+operating state:
+
+```sh
+rvcontrol --config config.ini mqtt-query actions
+rvcontrol --config config.ini mqtt-query routines
+rvcontrol --config config.ini mqtt-query states
+rvcontrol --config config.ini mqtt-command coach execute_routine --param routine '"all_fans_off"'
+rvcontrol --config config.ini mqtt-command coach set_state --param state '"parked"'
+```
+
+See [routines and operating states](docs/COACH.md#routines-and-operating-states)
+for overlay configuration, startup selection/application and UI introspection.
 
 Run the collectors in the foreground:
 
@@ -1005,7 +1018,7 @@ wled = wled_patio
 
 Use [Coach architecture and configuration](docs/COACH.md) as the canonical
 architecture and YAML reference, including inheritance, parameter schemas,
-groups, reserved instances, state freshness, file selection, and write gates.
+routines, reserved instances, state freshness, file selection, and write gates.
 Use [RV-C discovery and coach authoring](docs/RVC-DISCOVERY.md) to build a new
 definition from observed device behavior rather than copying another vehicle's
 instance assignments. `verified` records evidence; it is not a write gate.

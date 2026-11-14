@@ -1,0 +1,82 @@
+# Installation-only example. Select with [coach] overlay; merge with any other
+# local overlay content rather than configuring a second overlay file.
+# Bind [coach] leveler to an allowlisted INI source section before granting
+# these routines. Review equipment actions for your installation before use.
+routines:
+  all_fans_on:
+    name: All fans on
+    actions:
+      - {entity: kitchen_fan, action: on}
+      - {entity: mid_bath_fan, action: on}
+      - {entity: rear_bath_fan, action: on}
+  all_fans_off:
+    name: All fans off
+    actions:
+      - {entity: kitchen_fan, action: off}
+      - {entity: mid_bath_fan, action: off}
+      - {entity: rear_bath_fan, action: off}
+  interior_lights_on:
+    name: Interior lights on
+    actions:
+      - {entity: living_ceiling_light, action: on}
+      - {entity: hall_light, action: on}
+      - {entity: dinette_light, action: on}
+      - {entity: bedroom_ceiling_light, action: on}
+      - {entity: rear_bath_light, action: on}
+      - {entity: kitchen_light, action: on}
+      - {entity: sofa_light, action: on}
+      - {entity: mid_bath_light, action: on}
+      - {entity: accent_light, action: on}
+      - {entity: vanity_light, action: on}
+  interior_lights_off:
+    name: Interior lights off
+    actions:
+      - {entity: living_ceiling_light, action: off}
+      - {entity: hall_light, action: off}
+      - {entity: dinette_light, action: off}
+      - {entity: bedroom_ceiling_light, action: off}
+      - {entity: rear_bath_light, action: off}
+      - {entity: kitchen_light, action: off}
+      - {entity: sofa_light, action: off}
+      - {entity: mid_bath_light, action: off}
+      - {entity: accent_light, action: off}
+      - {entity: vanity_light, action: off}
+  exterior_lights_on:
+    name: Exterior lights on
+    actions:
+      - {entity: cargo_light, action: on}
+      - {entity: step_light, action: on}
+      - {entity: awning_light, action: on}
+  exterior_lights_off:
+    name: Exterior lights off
+    actions:
+      - {entity: cargo_light, action: off}
+      - {entity: step_light, action: off}
+      - {entity: awning_light, action: off}
+  enable_levelling:
+    name: Enable levelling
+    description: Start the leveler telemetry source
+    actions:
+      - {source: leveler, action: enable}
+  disable_levelling:
+    name: Disable levelling
+    description: Stop the leveler telemetry source
+    actions:
+      - {source: leveler, action: disable}
+
+operating_states:
+  default: parked
+  apply_on_startup: false
+  states:
+    parked:
+      name: Parked
+      routines: [disable_levelling]
+    driving:
+      name: Driving
+      routines: [exterior_lights_off, disable_levelling]
+    levelling:
+      name: Levelling
+      routines: [enable_levelling]
+    stored:
+      name: Stored
+      routines: [interior_lights_off, exterior_lights_off, all_fans_off, disable_levelling]

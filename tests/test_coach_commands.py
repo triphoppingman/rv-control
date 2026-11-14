@@ -79,11 +79,13 @@ controllers:
             level: {type: number, min: 10, max: 80}
       kitchen_fan_lid: {open: {confirm: true}, close: {confirm: true}}
       generator: {start: {confirm: true}, stop: {confirm: true}}
-      all_fans: {on: {}, off: {}}
       kitchen_fan: {on: {}, off: {}}
       mid_bath_fan: {on: {}, off: {}}
       rear_bath_fan: {on: {}, off: {}}
       patio_light: {on: {}, off: {}, brightness: {}, color: {}, effect: {}, palette: {}, transition: {}, preset: {}}
+    routines:
+      all_fans_on: {}
+      all_fans_off: {}
     queries:
       snapshot: {entities: ["*"]}
       republish_states: {entities: ["*"]}
@@ -302,10 +304,10 @@ def test_source_actions_preserve_exact_step_limit(service_env: Any) -> None:
     assert error.value.code == "invalid_request"
 
 
-def test_group_preflight_is_all_or_nothing(service_env: Any) -> None:
-    """A later malformed or forbidden group member prevents every earlier write."""
+def test_routine_preflight_is_all_or_nothing(service_env: Any) -> None:
+    """A later malformed or forbidden routine action prevents every earlier write."""
     service, source, _results, clock, _tracker = service_env
-    request = envelope(clock, target="all_fans", action="on")
+    request = envelope(clock, target="coach", action="execute_routine", params={"routine": "all_fans_on"})
     service.coach.entities["rear_bath_fan"]["actions"]["on"][0]["instance"] = 999
     assert dispatch(service_env, request)["status"] == "rejected"
     assert source.calls == []
@@ -315,25 +317,24 @@ def test_group_preflight_is_all_or_nothing(service_env: Any) -> None:
     assert source.calls == []
 
 
-def test_valid_group_and_cycle(service_env: Any) -> None:
-    """Allow-listed members dispatch together; runtime cycles fail closed."""
+def test_valid_routine_and_unknown_member(service_env: Any) -> None:
+    """Allowlisted actions dispatch together; unknown runtime members fail closed."""
     service, source, _results, clock, _tracker = service_env
-    request = envelope(clock, target="all_fans", action="off")
+    request = envelope(clock, target="coach", action="execute_routine", params={"routine": "all_fans_off"})
     assert dispatch(service_env, request)["steps_completed"] == 3
-    service.coach.command_groups["all_fans"]["members"].append("all_fans")
+    service.coach.routines.definitions["all_fans_off"]["actions"].append({"entity": "missing", "action": "off"})
     assert dispatch(service_env, dict(request, request_id="cycle"))["status"] == "rejected"
     assert len(source.calls) == 3
 
 
-def test_nested_group_grants_are_not_bypassed(service_env: Any) -> None:
-    """Leaf grants do not implicitly authorize an unlisted nested macro."""
+def test_routine_grants_and_confirmation_are_not_bypassed(service_env: Any) -> None:
+    """Leaf grants do not implicitly authorize an unlisted routine."""
     service, source, _results, clock, _tracker = service_env
-    service.coach.command_groups["nested_fans"] = {"members": ["kitchen_fan"], "actions": ["on"]}
-    service.coach.command_groups["all_fans"]["members"] = ["nested_fans"]
-    request = envelope(clock, target="all_fans")
+    service.coach.routines.definitions["single_fan"] = {"actions": [{"entity": "kitchen_fan", "action": "on"}]}
+    request = envelope(clock, target="coach", action="execute_routine", params={"routine": "single_fan"})
     assert dispatch(service_env, request)["code"] == "forbidden"
     assert not source.calls
-    service.policy.controllers["rv-cli"]["actions"]["nested_fans"] = {"on": {"confirm": True}}
+    service.policy.controllers["rv-cli"]["routines"]["single_fan"] = {"confirm": True}
     assert dispatch(service_env, request)["code"] == "confirmation_required"
     assert not source.calls
     assert dispatch(service_env, dict(request, confirmed=True))["status"] == "completed"

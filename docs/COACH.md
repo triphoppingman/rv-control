@@ -16,7 +16,7 @@ controller authorization, request/result schemas, and delivery guarantees.
 | Layer | File | Responsibility |
 | --- | --- | --- |
 | Protocol vocabulary | [rvc-spec.yml](../src/rv_control/data/rvc-spec.yml) | DGN names, wire fields and decoding; shared across coaches. |
-| Coach semantics | [Thor Magnitude example](../src/rv_control/coaches/thor-magnitude-bh35-2020.yml) | Which instance is the kitchen fan, its actions and state, scenes, and forbidden command instances. |
+| Coach semantics | [Thor Magnitude example](../src/rv_control/coaches/thor-magnitude-bh35-2020.yml) | Which instance is the kitchen fan, its actions and state, and forbidden command instances. |
 | Installation and permissions | Local INI based on [config-example.ini](../config-example.ini), plus a local policy based on [config-example-controllers.yaml](../config-example-controllers.yaml) | Interfaces, hosts, credentials, enabled sources/targets, transport bindings, write gates, controller grants, and journal location. |
 
 Do not put device addresses, credentials, SocketCAN interface names, or WLED
@@ -29,7 +29,7 @@ can differ between nominally identical coaches.
 
 ```mermaid
 flowchart TD
-    YAML[Coach YAML] --> Coach[Coach: resolved entities and groups]
+    YAML[Coach YAML and overlay] --> Coach[Coach: entities, routines and operating states]
     INI[INI: coach bindings and source sections] --> Coach
     CLI[coach-list / coach-exec] --> Coach
     MQTT[MQTT command/query service and policy] --> Coach
@@ -117,8 +117,8 @@ overlay.
 
 The loader merges **factory first, overlay second, then resolves inheritance**.
 Overlays use the same top-level sections: `coach`, `templates`, `entities`,
-`command_groups`, and `reserved`. They may add named definitions, absent metadata,
-and new actions/schemas to existing templates/entities/groups. Existing values
+`reserved`, plus installation-only `routines` and `operating_states`. They may add named definitions, absent metadata,
+and new actions/schemas to existing templates/entities. Existing values
 must not be redefined, even identically. Existing action sequences, state
 mappings and action schemas cannot be replaced or modified; ordinary lists are
 not concatenated. `reserved` is the sole list exception: new restrictions append
@@ -128,14 +128,14 @@ Conflicts fail with the overlay filename and conflicting definition path.
 Resolved factory templates/entities are checked too: adding an entity-level
 action or transport cannot silently shadow an inherited factory definition.
 The merged model validates template inheritance, action schemas, state blocks,
-frame waits, reserved instances, and group references/cycles without opening
+frame waits, reserved instances, and routine/state references without opening
 hardware. Validation is not proof of device compatibility, complete raw-payload
 semantics, or controller-specific WLED ID availability. Normal transport checks
 and semantic command preflight still apply at execution.
 
 Copy [wled-overlay-example.yml](../src/rv_control/coaches/wled-overlay-example.yml)
 to a local `coach-overlay.yml` beside your INI to add the complete WLED template,
-custom light, and scene. WLED templates and lights are installation customizations,
+custom light, and routines. WLED templates and lights are installation customizations,
 not part of the factory Thor definition.
 That local filename is Git-ignored; the packaged example is shareable.
 Neither the overlay nor its loading enables writes or grants controller access.
@@ -179,7 +179,7 @@ it does not limit the coach to one controller.
 
 The Thor installation has two customized WLED devices. The factory coach file
 does not define `patio_light`; the local overlay and shareable WLED example add
-that entity and its dependent `evening_scene`. The second physical device is
+that entity and its dependent `evening` routine. The second physical device is
 not yet mapped. The following two-controller example uses illustrative
 labels/hosts, not an asserted mapping of that second device:
 
@@ -228,8 +228,8 @@ In particular, an unmapped/misspelled `target` can fall through to a configured
 generic `wled` binding; it is not automatically rejected as an unknown target.
 Inspect `coach-list`'s resolved `config_section` for every entity before writes.
 
-Groups/scenes may include entities on either controller without a new transport
-or group format. Semantic MQTT grants remain entity/action-based, and each
+Routines may include entities on either controller without a new transport
+format. Semantic MQTT requires routine and member entity/action grants, and each
 resolved source must independently be enabled, running, and write-enabled.
 Use distinct source telemetry topics to keep their snapshots distinguishable.
 The example's `state` mapping converts WLED snapshots into coach entity state.
@@ -246,8 +246,9 @@ The file is a YAML mapping with these conventional top-level sections:
 | `coach` | Descriptive identity, normally `manufacturer`, `model`, `model_year`. |
 | `templates` | Reusable entity definitions, optionally extending another template. |
 | `entities` | Stable machine identifiers mapped to named equipment. |
-| `command_groups` | Shared actions across members or ordered scenes. |
 | `reserved` | DGN/instance pairs forbidden in coach-generated command frames. |
+| `routines` | Overlay only: named ordered sequences of entity/source actions. |
+| `operating_states` | Overlay only: mutually exclusive operating states composed of routines. |
 
 The loader is not a complete external schema validator. Some errors are detected
 at load time, others when state mappings compile or actions/policies are
@@ -292,12 +293,6 @@ entities:
     template: switched_load
     instance: 20
     verified: false
-
-command_groups:
-  all_fans:
-    description: All mapped fans
-    members: [kitchen_fan]
-    actions: [on, off]
 
 reserved:
   - {dgn: 0x1FEDB, instances: [43, 44]}
@@ -363,7 +358,7 @@ See the `wled_light` template in the
 ### Source-owned action interface
 
 Existing coach/installation YAML does not need to change. Coach still resolves
-entity actions, placeholders, confirmation, groups and per-frame waits. It now
+entity actions, placeholders, confirmation, routines and per-frame waits. It now
 passes each resolved frame to a `WritableSource` adapter, rather than encoding
 CAN frames or constructing WLED state updates itself.
 
@@ -494,25 +489,81 @@ advanced raw JSON interfaces. No configuration-write API, preset-file management
 boot waiting, or awning power sequencing is introduced by these actions.
 No additional MQTT telemetry topics are created.
 
-### Command groups
+### Routines and operating states
 
-A group can use `members: [entity_a, entity_b]` and `actions: [on, off]` to
-apply the selected action in member order. Or define a scene:
+The public hierarchy is **actions -> routines -> operating states**.
+An action controls one entity or enables/disables one source. A routine is a
+named ordered sequence of actions; an operating state selects ordered routines.
+Both `routines` and `operating_states` must be defined in `[coach] overlay`,
+never the base coach specification. Definitions are additive and validated
+without hardware. Routines cannot call other routines.
 
 ```yaml
-command_groups:
+routines:
   evening:
+    name: Evening lighting
+    description: Dim the living area and switch off the bedroom light
     actions:
-      activate:
-        - {entity: living_ceiling_light, action: brightness, params: {level: 30}}
-        - {entity: bedroom_ceiling_light, action: off}
+      - {entity: living_ceiling_light, action: brightness, params: {level: 30}}
+      - {entity: bedroom_ceiling_light, action: off}
+  enable_levelling:
+    name: Enable levelling
+    actions:
+      - {source: leveler, action: enable}
+  disable_levelling:
+    actions:
+      - {source: leveler, action: disable}
+
+operating_states:
+  default: parked
+  apply_on_startup: false
+  states:
+    parked:
+      name: Parked
+      routines: [disable_levelling]
+    levelling:
+      name: Levelling
+      routines: [enable_levelling]
 ```
 
-Runtime parameters override step parameters. Referenced entities/actions must
-exist. Avoid recursive groups. Local execution expands and executes sequentially;
-it does not preflight the entire group before the first entity runs. Semantic
-MQTT execution additionally checks the entire expanded plan and all grants
-before writes. Neither path rolls back completed hardware operations.
+Entity action parameters are explicit typed values in each routine step.
+Source references are logical `[coach]` bindings (for example `leveler = leveler_ble`);
+the resolved INI section must be in `[coach_commands] source_control`.
+Source operations wait up to five seconds each for the supervisor to reach the
+requested lifecycle state. Writable sources must also be command-ready after
+enablement. Thread liveness is not proof of device connectivity.
+
+See [automation-overlay-example.yml](../src/rv_control/coaches/automation-overlay-example.yml)
+for migrated all-light/all-fan recipes and four example operating states.
+Copy/merge its content into the installation overlay and review every action;
+it does not configure permissions, bindings or write flags.
+
+Startup selects `default` with `application_status: not_applied`.
+With `apply_on_startup: true`, enabled coach commands and an explicit
+`[coach_commands] startup_client_id` are required. That identity needs the
+state, routine and all member-action/source grants. Startup uses the ordinary
+journaled command path after sources attach. It never supplies deliberate
+confirmation: confirmation-required startup recipes fail explicitly. Each
+configuration reload starts a new session and repeats this startup policy.
+Startup actions are not automatically retried after rejection/failure.
+
+States are mutually exclusive. Only one command/transition executes at a time.
+The old selected state remains visible while `requested` is applying; successful
+dispatch selects the new state. Failures after possible side effects set
+`current: null` and report `failed`, completed steps and an error. Re-selecting
+an applied state is a no-op unless `reapply: true`; an unapplied default is
+executed normally on explicit selection. An empty routine list is permitted
+for a logical-only state. Running a routine independently does not change the
+selected operating state. States are entry recipes, not continuous enforcement;
+manual changes afterward are allowed. There are no exit actions or rollback.
+`applied` means dispatch/lifecycle completion, not physical telemetry confirmation.
+
+Grant routine execution with `routines: {all_fans_off: {}}` in controller policy,
+alongside all member action grants. Invoke it with
+`mqtt-command coach execute_routine --param routine '"all_fans_off"'`.
+There is no unjournaled local routine executor.
+See [MQTT discovery and dashboard integration](COACH-MQTT-COMMANDS.md#routines-and-operating-states)
+for machine-readable catalogs, commands, progress and permissions.
 
 ### Reserved instances
 

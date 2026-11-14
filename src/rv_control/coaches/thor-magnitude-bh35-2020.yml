@@ -7,7 +7,6 @@
 #   templates       Reusable entity behaviours: actions (frame lists) and state mappings.
 #   entities        Every named device on this coach, for monitoring and control.
 #                   Run with `rvcontrol coach-exec <entity> <action>`.
-#   command_groups  Actions applied to several entities at once.
 #   reserved        Instances seen on the bus that must never be controlled.
 #
 # Bus facts (observed on this coach)
@@ -22,32 +21,6 @@ coach:
   manufacturer: Thor Motor Coach
   model: Magnitude BH35
   model_year: 2020
-
-command_groups:
-  all_interior_lights:
-    description: All interior lights
-    members:
-      - living_ceiling_light
-      - hall_light
-      - dinette_light
-      - bedroom_ceiling_light
-      - rear_bath_light
-      - kitchen_light
-      - sofa_light
-      - mid_bath_light
-      - accent_light
-      - vanity_light
-    actions: [on, off]
-
-  all_exterior_lights:
-    description: Cargo, step and awning lights
-    members: [cargo_light, step_light, awning_light]
-    actions: [on, off]
-
-  all_fans:
-    description: Kitchen and bath roof fans
-    members: [kitchen_fan, mid_bath_fan, rear_bath_fan]
-    actions: [on, off]
 
 # ---------------------------------------------------------------------------
 # Entity model (monitoring + control). Placeholders in braces ({instance},

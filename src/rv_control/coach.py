@@ -1,4 +1,4 @@
-"""Coach entity model: template resolution and entity/group action execution."""
+"""Coach entity model: template resolution and entity action execution."""
 
 from __future__ import annotations
 
@@ -17,6 +17,8 @@ from ruamel.yaml import YAML
 from ruamel.yaml.error import YAMLError
 
 from .sources.base import Source
+from .operating_states import OperatingStates
+from .routines import Routines
 from .sources.writable import SourceAction, WritableSource, action_integer as _as_int
 
 LOGGER = logging.getLogger(__name__)
@@ -27,7 +29,7 @@ CONFIRM_VALUES = {"1", "true", "yes", "y", "on"}
 
 # Flow map:
 #   load -> parse base/overlay -> __init__ -> resolve templates/entities.
-#   execute -> expand groups -> execute_entity -> prepare_source_actions -> send.
+#   execute -> execute_entity -> prepare_source_actions -> send.
 #   Semantic MQTT takes a different execution path: CoachCommandService expands
 #   and authorizes the whole plan, calls prepare_source_actions here, then uses
 #   the running sources directly for journaled execute_action dispatch.
@@ -238,6 +240,8 @@ class CoachDefinitionLoader:
 
         path = find_coach_file(coach_spec)
         factory_data = load_coach_yaml(path)
+        if set(factory_data) - {"coach", "templates", "entities", "reserved"}:
+            raise ValueError("Base coach sections must be coach, templates, entities or reserved; automation belongs in [coach] overlay")
         overlay = config.get("coach", "overlay", fallback="").strip()
         if not overlay:
             return CoachDocument(path=path, data=factory_data)
@@ -247,14 +251,14 @@ class CoachDefinitionLoader:
         overlay_path = (config_path.parent / overlay).resolve()
         try:
             additions = load_coach_yaml(overlay_path)
-            unknown = set(additions) - {"coach", "templates", "entities", "command_groups", "reserved"}
+            unknown = set(additions) - {"coach", "templates", "entities", "reserved", "operating_states", "routines"}
             if unknown:
                 raise ValueError(f"Unknown overlay sections: {', '.join(sorted(map(str, unknown)))}")
             for section, value in additions.items():
                 expected = list if section == "reserved" else dict
                 if not isinstance(value, expected):
                     raise ValueError(f"Overlay section {section!r} must be a {expected.__name__}")
-            for section in ("templates", "entities", "command_groups"):
+            for section in ("templates", "entities", "routines"):
                 for name, definition in additions.get(section, {}).items():
                     if not isinstance(name, str) or not name or not isinstance(definition, dict):
                         raise ValueError(f"Overlay {section} entries need names and mapping definitions")
@@ -276,7 +280,6 @@ class ResolvedCoachDefinition:
         self.config = config
         self.data = data
         self.info: dict[str, Any] = data.get("coach", {})
-        self.command_groups: dict[str, Any] = data.get("command_groups", {}) or {}
         self.templates: dict[str, Any] = data.get("templates", {}) or {}
 
         # Reservations must be ready before entity resolution checks literal frames.
@@ -367,7 +370,7 @@ class ResolvedCoachDefinition:
 
 
 class Coach:
-    """Resolve coach entities from templates and execute entity and group actions."""
+    """Resolve coach entities and installation routines from declarative mappings."""
 
     # Construction/loading: turn declarative YAML into effective entity mappings.
     def __init__(
@@ -391,6 +394,8 @@ class Coach:
             Optional pre-instantiated Source objects keyed by configuration section name.
         """
         self.config = config
+        if set(data) - {"coach", "templates", "entities", "reserved", "routines", "operating_states"}:
+            raise ValueError("Unsupported coach section; expected coach, templates, entities, reserved, routines or operating_states")
         self.data = data
         self.coach_file = Path(coach_file).resolve() if coach_file else None
         self._sources: dict[str, Source] = dict(sources) if sources else {}
@@ -399,11 +404,12 @@ class Coach:
         # source bindings and action dispatch after model construction.
         self.definition = ResolvedCoachDefinition(config, data)
         self.info = self.definition.info
-        self.command_groups = self.definition.command_groups
         self.templates = self.definition.templates
         self.reserved = self.definition.reserved
         self.entities = self.definition.entities
         self.sleep: Callable[[float], None] = time.sleep
+        self.routines = Routines(self, data.get("routines", {}))
+        self.operating_states = OperatingStates(self, data.get("operating_states"))
 
     @classmethod
     def load(
@@ -446,14 +452,14 @@ class Coach:
                 factory.entities, coach.entities, str(document.overlay_path), "entities",
             )
             # Full overlay validation follows resolution, so it sees inherited
-            # actions, substituted entity values, and newly added group members.
+            # actions, substituted entity values, and installation routines.
             coach._validate_overlay()
         except (ValueError, KeyError, TypeError, AttributeError, PermissionError) as error:
             raise ValueError(f"Invalid coach overlay {document.overlay_path}: {error}") from error
         return coach
 
     def _validate_overlay(self) -> None:
-        """Validate merged mappings, state, schemas and group references without hardware."""
+        """Validate merged mappings, state and schemas without hardware."""
         # These modules depend on Coach; import their validators only after this
         # module has loaded. The temporary tracker validates state without publishing.
         from .coach_commands import validate_schema
@@ -466,8 +472,6 @@ class Coach:
         for dgn, instances in self.reserved.items():
             if not 0 <= dgn <= 0x1FFFF or any(not 0 <= instance <= 255 for instance in instances):
                 raise ValueError("Reserved DGN or instance is out of range")
-        if set(self.entities) & set(self.command_groups):
-            raise ValueError("Entity and group names must not overlap")
         for name, entity in self.entities.items():
             if entity.get("actions"):
                 source_type = Source.source_class(str(entity.get("transport", "")))
@@ -483,44 +487,6 @@ class Coach:
                     if entity.get("transport") == "wled" and not any(key != "wait" for key in frame):
                         raise ValueError(f"Entity {name!r} action {action!r} has an empty WLED frame")
         EntityStateTracker(self, lambda _topic, _payload: None)
-
-        # Walk each group/action as a graph. Track only the current ancestry:
-        # reusing an entity in different branches is valid, revisiting an ancestor is not.
-        def visit(target: str, action: str, chain: tuple[str, ...] = ()) -> None:
-            """Check one group expansion for cycles and missing targets/actions."""
-            if target in chain:
-                raise ValueError(f"Command group cycle: {' -> '.join(chain + (target,))}")
-            if target in self.entities:
-                if action not in self.entities[target]["actions"]:
-                    raise ValueError(f"Unknown action {target}.{action}")
-                return
-            if target not in self.command_groups:
-                raise ValueError(f"Unknown group member {target!r}")
-            group = self.command_groups[target]
-            actions = group.get("actions", {})
-            if action not in actions:
-                raise ValueError(f"Unknown group action {target}.{action}")
-            steps = (
-                [{"entity": member, "action": action} for member in group.get("members", [])]
-                if isinstance(actions, list) else actions[action]
-            )
-            if not isinstance(steps, list):
-                raise ValueError(f"Group {target!r} steps must be a list")
-            for step in steps:
-                if not isinstance(step, dict) or "entity" not in step:
-                    raise ValueError(f"Group {target!r} step needs an entity")
-                visit(step["entity"], step.get("action", action), chain + (target,))
-
-        for name, group in self.command_groups.items():
-            actions = group.get("actions", {})
-            if not isinstance(actions, (list, dict)):
-                raise ValueError(f"Group {name!r} actions must be a mapping or list")
-            for action, schema in group.get("action_schemas", {}).items():
-                if action not in actions:
-                    raise ValueError(f"Group {name!r} schema references unknown action {action!r}")
-                validate_schema(schema)
-            for action in group.get("actions", {}):
-                visit(name, action)
 
     # Source binding and read-only summaries.
     def get_source(self, config_section: str) -> Source:
@@ -610,25 +576,14 @@ class Coach:
             }
         return result
 
-    def list_command_groups(self) -> dict[str, dict[str, Any]]:
-        """Return a summary of every command group: description, members and actions."""
-        return {
-            name: {
-                "description": group.get("description", ""),
-                "members": list(group.get("members", [])),
-                "actions": list(group.get("actions", {})),
-            }
-            for name, group in self.command_groups.items()
-        }
-
     # Local execution (coach-exec), not the semantic MQTT authorization/journal path.
     def execute(self, target: str, action: str, **kwargs: Any) -> list[dict[str, Any]]:
-        """Execute an action on an entity or a command group.
+        """Execute an action on an entity.
 
         Parameters
         ----------
         target : str
-            Entity name (e.g. ``kitchen_fan``) or command group name (e.g. ``all_interior_lights``).
+            Entity name (e.g. ``kitchen_fan``).
         action : str
             Action name (e.g. ``on``, ``off``, ``toggle``, ``brightness``).
         **kwargs : Any
@@ -639,63 +594,9 @@ class Coach:
         list[dict[str, Any]]
             One result dictionary per entity action performed.
         """
-        # Re-enter this dispatcher for group members so nested groups and leaf
-        # entities share the same routing and return one flattened result list.
-        if target in self.command_groups:
-            return self.execute_group(target, action, **kwargs)
         if target in self.entities:
             return [self.execute_entity(target, action, **kwargs)]
-        raise KeyError(f"Unknown entity or command group: {target!r}")
-
-    def execute_group(self, group_name: str, action_name: str, **kwargs: Any) -> list[dict[str, Any]]:
-        """Execute a command group action.
-
-        A group either lists ``members`` and the ``actions`` (names) applied to
-        every member, or maps each action to explicit steps
-        (``{entity, action, params}``).
-
-        Parameters
-        ----------
-        group_name : str
-            Command group name.
-        action_name : str
-            Group action name.
-        **kwargs : Any
-            Runtime parameters passed to every step; they override step params.
-
-        Returns
-        -------
-        list[dict[str, Any]]
-            Result dictionaries for every entity action performed.
-        """
-        group_def = self.command_groups.get(group_name)
-        if not group_def:
-            raise KeyError(f"Command group not found: {group_name!r}")
-        actions = group_def.get("actions", {})
-        if action_name not in actions:
-            raise ValueError(f"Action {action_name!r} not supported by group {group_name!r}")
-
-        # Member-list groups fan out one action; explicit scenes select an action
-        # and parameters per step. Both execute in declaration order, without rollback
-        # or whole-group preflight here (the semantic MQTT service adds that).
-        if isinstance(actions, list):
-            results: list[dict[str, Any]] = []
-            for member in group_def.get("members", []):
-                results.extend(self.execute(member, action_name, **kwargs))
-            return results
-
-        steps = actions[action_name]
-        if not isinstance(steps, list):
-            raise ValueError(f"Group action {action_name!r} in {group_name!r} must be a list of steps")
-        results = []
-        for step in steps:
-            if not isinstance(step, dict) or "entity" not in step:
-                raise ValueError(f"Group {group_name!r} action {action_name!r} has a step without 'entity'")
-            step_params = dict(step.get("params", {}))
-            # Local runtime arguments intentionally override scene defaults.
-            step_params.update(kwargs)
-            results.extend(self.execute(step["entity"], step.get("action", action_name), **step_params))
-        return results
+        raise KeyError(f"Unknown entity: {target!r}; execute routines through coach execute_routine over MQTT")
 
     def execute_entity(self, entity_name: str, action_name: str, **kwargs: Any) -> dict[str, Any]:
         """Execute one entity action by sending its frames in order.
