@@ -9,7 +9,11 @@ delivers publications to all enabled targets in turn.
 - **Source threads:** Each enabled source is a `Source` thread. Its polling,
   reconnect, and device-specific work runs in that thread; sources share a
   stop event and publish through the common publisher interface. The supervisor
-  restarts a source thread that exits unexpectedly.
+  restarts a source thread that exits unexpectedly. Sections listed in
+  `[coach_commands] source_control` instead get a private stop event so they
+  can be stopped individually; the coach worker only records enable/disable
+  decisions, and the main supervision loop applies them once per second
+  (stopping, removing from routing, joining, or starting a new instance).
 - **Target dispatcher:** `QueuedTarget` owns one worker and a bounded FIFO
   queue. Its default capacity is 1024 messages and `[service]
   publish_queue_depth` configures it.
@@ -45,7 +49,8 @@ logged; they are not retried by the dispatcher.
 
 ## Shutdown
 
-On shutdown, the daemon sets the shared stop event and waits for source threads
+On shutdown, the daemon sets the shared stop event and every private source
+stop event, and waits for source threads (including disabled ones still exiting)
 before closing the publisher. It allows a 30-second grace period, logs sources
 that exceed it, and continues waiting for them so they cannot publish into
 closed targets. The dispatcher then drains accepted messages before closing

@@ -136,7 +136,7 @@ def test_run_wires_commands_to_running_source_map(monkeypatch: Any, config_file:
     monkeypatch.setattr(cli_module.Target, "build", lambda *_args: mqtt)
     monkeypatch.setattr(cli_module.Source, "start_enabled", lambda *_args: ([source], {"rv_c_bus": source}))
 
-    def supervise(_config: Any, _publisher: Any, _stop: Any, _sources: Any, source_map: Any) -> None:
+    def supervise(_config: Any, _publisher: Any, _stop: Any, _sources: Any, source_map: Any, **_kwargs: Any) -> None:
         """Submit a broker-shaped request after the daemon's sources are installed."""
         assert mqtt.coach_service.sources is source_map
         now = time.time()

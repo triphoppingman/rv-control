@@ -24,13 +24,14 @@ from .coach import Coach
 from .coach_queries import CoachQueries
 from .coach_state import EntityStateTracker
 from .sources.base import Source
+from .source_control import MAX_DURATION_S, MAX_REASON, SOURCE_ACTIONS, SOURCE_VERBS, SourceController, controllable_sections
 from .sources.writable import SourceAction, WritableSource
 
 LOGGER = logging.getLogger(__name__)
 IDENTIFIER = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
 MAX_PAYLOAD = 8192
 MAX_RESULT = 256 * 1024
-QUERY_ACTIONS = {"refresh_states", "snapshot", "republish_states", "capabilities", "health", "request_status"}
+QUERY_ACTIONS = {"refresh_states", "snapshot", "republish_states", "capabilities", "health", "request_status", "sources"}
 ENTITY_QUERIES = {"refresh_states", "snapshot", "republish_states"}
 ENVELOPE_KEYS = {
     "version", "client_id", "request_id", "issued_at", "expires_at",
@@ -198,13 +199,26 @@ class PreparedQuery:
     entities: tuple[str, ...]
 
 
-PreparedOperation = PreparedCommand | PreparedQuery
+@dataclass(frozen=True)
+class PreparedSourceControl:
+    """A validated request to enable or disable one allowlisted source."""
+
+    section: str
+    enabled: bool
+    duration_s: int | None
+    reason: str
+
+
+PreparedOperation = PreparedCommand | PreparedQuery | PreparedSourceControl
 
 
 class ControllerPolicy:
     """Validate static controller grants and bind them to loaded action schemas."""
 
-    def __init__(self, coach: Coach, path: Path, monitored: dict[str, list[str]]) -> None:
+    def __init__(
+        self, coach: Coach, path: Path, monitored: dict[str, list[str]],
+        source_control: tuple[str, ...] = (),
+    ) -> None:
         """Read one local policy file and validate every grant before subscribing."""
         try:
             with path.open(encoding="utf-8") as handle:
@@ -218,8 +232,9 @@ class ControllerPolicy:
         if set(coach.entities) & set(coach.command_groups):
             raise ValueError("Entity and group names must not overlap")
         for client, policy in self.controllers.items():
-            if not isinstance(client, str) or not IDENTIFIER.fullmatch(client) or not isinstance(policy, dict) or set(policy) - {"actions", "queries"}:
+            if not isinstance(client, str) or not IDENTIFIER.fullmatch(client) or not isinstance(policy, dict) or set(policy) - {"actions", "queries", "sources"}:
                 raise ValueError("Invalid controller policy")
+            self._validate_source_grants(policy.get("sources", {}), source_control)
             actions = policy.get("actions", {})
             queries = policy.get("queries", {})
             if not isinstance(actions, dict) or not isinstance(queries, dict):
@@ -254,6 +269,29 @@ class ControllerPolicy:
             for target, grants in policy.get("actions", {}).items():
                 for action in grants:
                     self._validate_expansion(client, target, action)
+
+    @staticmethod
+    def _validate_source_grants(grants: Any, source_control: tuple[str, ...]) -> None:
+        """Require source grants to name allowlisted sections and enable/disable only."""
+        if not isinstance(grants, dict):
+            raise ValueError("Controller source grants must be a mapping")
+        for section, verbs in grants.items():
+            if section not in source_control:
+                raise ValueError(
+                    f"Policy grants control of source {section!r}, which is not listed in [coach_commands] source_control"
+                )
+            if not isinstance(verbs, dict) or not verbs or set(verbs) - {"enable", "disable"}:
+                raise ValueError("Source grants require enable and/or disable")
+            for grant in verbs.values():
+                if not isinstance(grant, dict) or set(grant) - {"confirm"} or type(grant.get("confirm", False)) is not bool:
+                    raise ValueError("Invalid source grant")
+
+    def source_grant(self, client: str, section: str, verb: str) -> dict[str, Any]:
+        """Return an explicit source-control grant, denying everything unlisted."""
+        grant = self.controllers.get(client, {}).get("sources", {}).get(section, {}).get(verb)
+        if grant is None:
+            raise CommandError("forbidden", "Controller is not authorized to control this source")
+        return grant
 
     def definition(self, target: str) -> dict[str, Any]:
         """Return a known entity or group definition without opening sources."""
@@ -440,6 +478,7 @@ class CoachRequestPlanner:
         self.clock = clock
         self._last_refresh: dict[str, float] = {}
         self._last_source_refresh: dict[str, float] = {}
+        self.source_controller: SourceController | None = None
 
     def validate_query(self, request: dict[str, Any], expires: float) -> list[str]:
         """Expose query validation as the planner's single validation entry point."""
@@ -453,6 +492,8 @@ class CoachRequestPlanner:
             return PreparedQuery(tuple(self.validate_query(request, expires)))
         if kind != "command" or not self.commands_enabled:
             raise CommandError("forbidden", "Command API is disabled")
+        if request["target"] == "coach" and request["action"] in SOURCE_ACTIONS:
+            return self.prepare_source_control(request)
         if request["target"] == "coach" or request["action"] in QUERY_ACTIONS:
             raise CommandError("invalid_request", "Monitoring requires the query topic")
         return PreparedCommand(tuple(self.plan(request)))
@@ -504,6 +545,28 @@ class CoachRequestPlanner:
                 if len(plan) > 64 or duration > 30:
                     raise CommandError("invalid_request", "Action plan exceeds 64 steps or 30 seconds")
         return plan
+
+    def prepare_source_control(self, request: dict[str, Any]) -> PreparedSourceControl:
+        """Authorize and validate an enable/disable request without touching sources."""
+        controller = self.source_controller
+        if controller is None or not controller.active:
+            raise CommandError("forbidden", "Source control is not configured")
+        params = request["params"]
+        if set(params) - {"source", "duration_s", "reason"} or "source" not in params:
+            raise CommandError("invalid_params", "Source control requires source and optional duration_s and reason")
+        section = params["source"]
+        if not isinstance(section, str) or section not in controller.controllable:
+            raise CommandError("unknown_target", "Source is not controllable")
+        grant = self.policy.source_grant(request["client_id"], section, SOURCE_VERBS[request["action"]])
+        if grant.get("confirm") and not request["confirmed"]:
+            raise CommandError("confirmation_required", "Deliberate user confirmation is required")
+        duration = params.get("duration_s")
+        if duration is not None and (type(duration) is not int or not 1 <= duration <= MAX_DURATION_S):
+            raise CommandError("invalid_params", f"duration_s must be an integer from 1 to {MAX_DURATION_S}")
+        reason = params.get("reason", "")
+        if not isinstance(reason, str) or len(reason) > MAX_REASON or not reason.isprintable():
+            raise CommandError("invalid_params", f"reason must be printable text of at most {MAX_REASON} characters")
+        return PreparedSourceControl(section, SOURCE_ACTIONS[request["action"]], duration, reason)
 
     def check_source(self, section: str) -> WritableSource:
         """Recheck global and source write gates plus readiness before each operation."""
@@ -582,6 +645,7 @@ class CoachCommandService:
         self, config: ConfigParser, coach: Coach, tracker: EntityStateTracker,
         sources: dict[str, Source], publish: PublishResult,
         connected: Callable[[], bool], clock: Callable[[], float] = utc_now,
+        source_controller: SourceController | None = None,
     ) -> None:
         """Validate configuration, load policy, and recover the durable journal."""
         self.config, self.coach, self.sources = config, coach, sources
@@ -600,6 +664,7 @@ class CoachCommandService:
             config, coach, self.policy, self.queries, sources, self.mqtt_section,
             self.enabled, self.queries_enabled, clock,
         )
+        self.planner.source_controller = source_controller
         self.started = time.monotonic()
 
     @property
@@ -635,7 +700,10 @@ class CoachCommandService:
         policy_path = section.get("controllers_file", "").strip()
         if not policy_path:
             raise ValueError("Coach API requires controllers_file")
-        policy = ControllerPolicy(coach, config_dir / policy_path, CoachQueries(coach, tracker, {}).entities())
+        policy = ControllerPolicy(
+            coach, config_dir / policy_path, CoachQueries(coach, tracker, {}).entities(),
+            controllable_sections(config),
+        )
         limit = section.getint("journal_max_entries", fallback=1024)
         if not 1 <= limit <= 10000:
             raise ValueError("journal_max_entries must be between 1 and 10000")
@@ -735,6 +803,17 @@ class CoachCommandService:
                 raise CommandError("expired", "Request expired before dispatch")
             if isinstance(prepared, PreparedQuery):
                 result = self._query(request, list(prepared.entities), expires)
+            elif isinstance(prepared, PreparedSourceControl):
+                controller = self.planner.source_controller
+                if controller is None:
+                    raise CommandError("source_unavailable", "Source control is unavailable")
+                attempted = True
+                data = controller.request(
+                    prepared.section, prepared.enabled, prepared.duration_s, prepared.reason, request["client_id"],
+                )
+                completed = 1
+                result = self.result(request, "completed", "executed", "Source control recorded; the supervisor applies it within about one second")
+                result.update(outcome="dispatched", steps_completed=completed, data=data)
             else:
                 for step in prepared.steps:
                     if step.wait:
@@ -806,12 +885,17 @@ class CoachCommandService:
             data = {"result": recorded[1]}
         elif action == "capabilities":
             data = self._capabilities(request["client_id"])
+        elif action == "sources":
+            controller = self.planner.source_controller
+            if controller is None:
+                raise CommandError("source_unavailable", "Source status is unavailable")
+            data = controller.snapshot()
         else:
             data = {
                 "uptime_s": round(time.monotonic() - self.started, 3),
                 "ready": not self._closing and self.connected() and bool(self.sources),
                 "broker_connected": self.connected(), "busy": False,
-                "sources": [{"type": source.source_name, "available": source.is_alive(), "commands_available": source.command_ready(), "monitoring_supported": source.supports_status_requests} for source in self.sources.values()],
+                "sources": [{"source": section, "type": source.source_name, "available": source.is_alive(), "commands_available": source.command_ready(), "monitoring_supported": source.supports_status_requests} for section, source in self.sources.items()],
             }
         result = self.result(request, "completed", "queried", "Monitoring operation finished")
         result["data"] = data
@@ -853,7 +937,16 @@ class CoachCommandService:
             sections = self.queries.source_sections([entity])
             sources = [self.sources.get(section) for section in sections]
             monitoring[entity] = {"fields": fields, "refresh_supported": bool(sources) and all(source is not None and source.supports_status_requests for source in sources), "available": bool(sources) and all(source is not None and source.is_alive() for source in sources)}
-        return {"targets": targets, "monitoring": monitoring, "queries": policy.get("queries", {})}
+        controller = self.planner.source_controller
+        controllable = controller.controllable if controller is not None and self.enabled else ()
+        source_controls = {
+            section: {
+                verb: {"confirm": bool(grant.get("confirm")), "available": section in controllable}
+                for verb, grant in verbs.items()
+            }
+            for section, verbs in policy.get("sources", {}).items()
+        }
+        return {"targets": targets, "monitoring": monitoring, "queries": policy.get("queries", {}), "sources": source_controls}
 
     def close(self) -> None:
         """Stop admission and finish the bounded worker before closing its journal."""

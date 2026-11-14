@@ -23,6 +23,7 @@ QUERY_ACTIONS = {
     "capabilities",
     "health",
     "request_status",
+    "sources",
 }
 TERMINAL_STATUSES = {"completed", "rejected", "failed"}
 MAX_RESULT_BYTES = 256 * 1024
@@ -439,6 +440,7 @@ def _query_params(
         "capabilities": set(),
         "health": set(),
         "request_status": {"request_id"},
+        "sources": set(),
     }[action]
     unknown = sorted(set(result) - allowed_keys)
     if unknown:

@@ -47,4 +47,8 @@ controllers:
       capabilities: {}
       health: {}
       request_status: {}
+      sources: {}
+    # Source enable/disable; sections must be listed in [coach_commands] source_control.
+    # sources:
+    #   leveler: {enable: {}, disable: {confirm: true}}
   rv-dashboard: *dashboard

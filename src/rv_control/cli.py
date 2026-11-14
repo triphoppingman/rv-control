@@ -16,6 +16,7 @@ from .coach_mqtt_client import mqtt_command, mqtt_query
 from .coach_state import CoachStatePublisher, wrap_publisher
 from .config import ConfigReloader, load_config
 from .runtime import RuntimeContext, RuntimePublisher
+from .source_control import STATUS_TOPIC, SourceController, SourceOverrides, controllable_sections
 from .sources.base import Source
 from .sources.hughes import HughesSource
 from .sources.obd import ObdSource
@@ -176,8 +177,9 @@ def run(context: click.Context) -> None:
     )
     if reloader is not None:
         config = reloader.initial_config
+    source_overrides = SourceOverrides()
     while True:
-        candidate = _run_session(config, reloader)
+        candidate = _run_session(config, reloader, source_overrides)
         if candidate is None:
             return
         config = candidate
@@ -209,8 +211,15 @@ def _validate_reload(config: ConfigParser) -> None:
         publisher.close()
 
 
-def _run_session(config: ConfigParser, reloader: ConfigReloader | None = None) -> ConfigParser | None:
-    """Run one configuration generation and close it before returning a replacement."""
+def _run_session(
+    config: ConfigParser, reloader: ConfigReloader | None = None,
+    source_overrides: SourceOverrides | None = None,
+) -> ConfigParser | None:
+    """Run one configuration generation and close it before returning a replacement.
+
+    ``source_overrides`` carries MQTT source enable/disable decisions across
+    configuration reloads within one daemon process.
+    """
     candidate = None
     try:
         runtime = RuntimeContext(config)
@@ -224,6 +233,7 @@ def _run_session(config: ConfigParser, reloader: ConfigReloader | None = None) -
     target = Target.build(config, lambda topic, payload: _handle_command(config, source_map, topic, payload))
     publisher: Any = target
     command_service = None
+    controller: SourceController | None = None
     try:
         raw_targets = target.targets if isinstance(target, MultiTarget) else [target]
         mqtt_targets = [item for item in raw_targets if isinstance(item, MqttTarget)]
@@ -236,9 +246,20 @@ def _run_session(config: ConfigParser, reloader: ConfigReloader | None = None) -
                 if len(mqtt_targets) != 1:
                     raise ValueError("Coach MQTT API requires exactly one MQTT target")
                 mqtt = mqtt_targets[0]
+                coach_tracker = publisher
+
+                def started(section: str, source: Source) -> None:
+                    """Request coach status for a source re-enabled by source control."""
+                    coach_tracker.request_initial_status({section: source})
+
+                controller = SourceController(
+                    config, source_overrides or SourceOverrides(), controllable_sections(config),
+                    lambda payload: mqtt.publish_retained(STATUS_TOPIC, payload),
+                    mqtt.connected.is_set, started,
+                )
                 command_service = CoachCommandService(
                     config, publisher.tracker.coach, publisher.tracker, source_map,
-                    mqtt.publish_result, mqtt.connected.is_set,
+                    mqtt.publish_result, mqtt.connected.is_set, source_controller=controller,
                 )
                 mqtt.coach_service = command_service
         except (ValueError, KeyError, OSError, sqlite3.Error) as error:
@@ -246,25 +267,35 @@ def _run_session(config: ConfigParser, reloader: ConfigReloader | None = None) -
         coach_publisher = publisher if isinstance(publisher, CoachStatePublisher) else None
         publisher = RuntimePublisher(publisher, runtime)
         publisher.connect()
-        sources, started_sources = Source.start_enabled(config, publisher, stop_event)
+        controlled = controller is not None and controller.active
+        if controlled:
+            sources, started_sources = Source.start_enabled(
+                config, publisher, stop_event, isolated=controller.controllable, skip=controller.skipped(),
+            )
+        else:
+            sources, started_sources = Source.start_enabled(config, publisher, stop_event)
         source_map.update(started_sources)
-        if not sources:
+        if not sources and not controlled:
             raise click.ClickException("No sources are enabled")
         if coach_publisher is not None:
             coach_publisher.request_initial_status(source_map)
-        if reloader is None:
-            Source.run_until_stopped(config, publisher, stop_event, sources, source_map)
-        else:
-            def check_reload() -> None:
-                """Request shutdown only after the changed configuration passes validation."""
-                nonlocal candidate
+        if controller is not None:
+            controller.attach(publisher, stop_event, sources, source_map)
+
+        def tick() -> None:
+            """Apply source control and request shutdown after a validated reload."""
+            nonlocal candidate
+            if controller is not None:
+                controller.tick()
+            if reloader is not None:
                 candidate = reloader.poll()
                 if candidate is not None:
                     stop_event.set()
 
-            Source.run_until_stopped(
-                config, publisher, stop_event, sources, source_map, on_tick=check_reload,
-            )
+        if reloader is None and controller is None:
+            Source.run_until_stopped(config, publisher, stop_event, sources, source_map)
+        else:
+            Source.run_until_stopped(config, publisher, stop_event, sources, source_map, on_tick=tick)
     except OSError as error:
         raise click.ClickException(f"Unable to connect to target: {error}") from error
     except KeyboardInterrupt:
@@ -274,8 +305,14 @@ def _run_session(config: ConfigParser, reloader: ConfigReloader | None = None) -
             if command_service is not None:
                 command_service.close()
         finally:
-            Source.stop_and_join(sources, stop_event)
-            publisher.close()
+            stopping = controller.stopping_sources() if controller is not None else []
+            sources = list(sources) + stopping
+            try:
+                Source.stop_and_join(sources, stop_event)
+            finally:
+                if controller is not None:
+                    controller.close()
+                publisher.close()
     if candidate is not None and any(source.is_alive() for source in sources):
         raise click.ClickException("Configuration reload aborted: source threads have not stopped")
     return candidate

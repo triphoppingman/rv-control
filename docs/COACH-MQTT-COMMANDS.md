@@ -59,6 +59,7 @@ rvcontrol --config config.ini mqtt-query snapshot
 rvcontrol --config config.ini mqtt-query snapshot --entity kitchen_light
 rvcontrol --config config.ini mqtt-query refresh_states --entity kitchen_light --refresh-timeout 5
 rvcontrol --config config.ini mqtt-query republish_states
+rvcontrol --config config.ini mqtt-query sources
 
 # Equivalent standalone tool, without using the installed console entry point.
 .venv/bin/python tools/coach_mqtt.py --config config.ini mqtt-query health
@@ -70,6 +71,10 @@ rvcontrol --config config.ini mqtt-command living_ceiling_light brightness --par
 rvcontrol --config config.ini mqtt-command all_fans off
 rvcontrol --config config.ini mqtt-command kitchen_fan_lid open --confirm
 rvcontrol --config config.ini mqtt-command generator start --confirm
+
+# Source control: requires [coach_commands] source_control and a policy grant.
+rvcontrol --config config.ini mqtt-command coach source_disable --param source '"leveler"' --param duration_s 3600 --confirm
+rvcontrol --config config.ini mqtt-command coach source_enable --param source '"leveler"'
 
 # Retrieve a prior result without executing its action again.
 rvcontrol --config config.ini mqtt-query request_status --lookup-request-id PREVIOUS_REQUEST_ID
@@ -143,6 +148,7 @@ With `base_topic = rv`:
 | `rv/coach/command` | Controller to RV-Control | 1 | false |
 | `rv/coach/query` | Controller to RV-Control, monitoring only | 1 | false |
 | `rv/coach/result/<client_id>/<request_id>` | RV-Control to controller | 1 | false |
+| `rv/coach/sources` | RV-Control to dashboards, source status | 1 | true |
 
 Subscribe to results before submitting a request. There is no client-supplied
 reply topic. Derive the result topic from strictly validated identifiers.
@@ -207,6 +213,7 @@ on the query topic. Require `confirmed: false` for monitoring requests.
 | `capabilities` | none | Discover available entities, typed actions, confirmation requirements, and monitoring support |
 | `health` | none | Return service readiness and sanitized source/command availability |
 | `request_status` | `request_id`: identifier | Retrieve this controller's latest journaled command/query result without retrying execution |
+| `sources` | none | Return every configured or controllable source with its lifecycle state; see [Source control](#source-control) |
 
 An entity list contains 1–200 known entity identifiers. An empty list is
 invalid, not shorthand for all entities. Reject unknown identifiers and unknown
@@ -427,6 +434,130 @@ confirmation in the initial dashboard policy.
 The existing raw source write API can bypass this semantic allow-list. Broker
 ACLs must deny dashboard credentials publication to raw `*/set` topics. This
 feature must not imply that enabling the semantic policy secures raw endpoints.
+
+## Source control
+
+Controllers can stop and start individual source instances at runtime, for
+example to switch off the BLE leveler while parked or to bring up an on-demand
+source. This is opt-in at two levels.
+
+1. The installation lists controllable INI sections:
+
+   ```ini
+   [coach_commands]
+   enabled = true
+   source_control = leveler, obd_engine
+   ```
+
+   Listed sections must exist and have a known `type`. They do not have to be
+   in `[source] enabled-sources`; such a source starts stopped and can be
+   enabled on demand. Unlisted sources can never be stopped over MQTT.
+   `source_control` is ignored unless the coach API is enabled. Enable and
+   disable requests use the command topic, so `enabled = true` is required
+   (which in turn requires MQTT `write_enabled`). Source-level write flags are
+   not involved, because no device write occurs.
+
+2. The controller policy grants individual sections and verbs:
+
+   ```yaml
+   controllers:
+     rv-dashboard:
+       sources:
+         leveler: {enable: {}, disable: {confirm: true}}
+       queries:
+         sources: {}
+   ```
+
+   Grants for sections not in `source_control` fail startup. Grant keys are
+   only `enable` and `disable`; each grant accepts only an optional
+   boolean `confirm`.
+
+### Commands
+
+Publish on `<base_topic>/coach/command` with target `coach`:
+
+| Action | Parameters | Effect |
+| --- | --- | --- |
+| `source_enable` | `source`: section; optional `duration_s`: integer 1–86400; optional `reason`: printable text, max 120 characters | Start the source (or keep it running) |
+| `source_disable` | same | Stop the source and remove it from command routing |
+
+```json
+{
+  "version": 1, "client_id": "rv-dashboard", "request_id": "c4f1",
+  "issued_at": "2026-10-17T18:00:00Z", "expires_at": "2026-10-17T18:00:10Z",
+  "target": "coach", "action": "source_disable",
+  "params": {"source": "leveler", "duration_s": 3600, "reason": "parked"},
+  "confirmed": true
+}
+```
+
+The completed result records the decision; it does not wait for the thread:
+
+```json
+{"status": "completed", "code": "executed", "outcome": "dispatched",
+ "data": {"source": "leveler", "enabled": false, "until": "2026-10-17T19:00:00Z", "state": "running"}}
+```
+
+The supervisor applies the decision within about one second. Watch the
+retained status topic or repeat the `sources` query for the resulting state.
+Rejections use the standard codes: `forbidden` (no grant, or source control
+not configured), `unknown_target` (section not in `source_control`),
+`invalid_params`, and `confirmation_required`.
+
+Override semantics:
+
+- With `duration_s`, the override expires and the source returns to its
+  configured state (`enabled-sources` membership) without another request.
+- Without `duration_s`, the override lasts until changed. Requesting the
+  configured state without a duration clears the override.
+- Overrides are held in memory. They survive configuration reloads (overrides
+  for sections removed from `source_control` are dropped) but not a service
+  restart, which always starts from configuration.
+- A disabled source's thread is signalled through its own stop event and is
+  removed from command routing immediately, so semantic commands for its
+  entities return `source_unavailable` and raw `<topic>/set` writes are
+  ignored. Re-enabling waits for the previous thread to exit and then starts a
+  new instance, followed by a coach status request when supported.
+- Crashed sources are still restarted automatically unless disabled.
+
+### Status for dashboards
+
+The `sources` query and the retained `<base_topic>/coach/sources` topic carry
+the same payload. The topic is published on every change and after broker
+reconnects; on orderly shutdown it is replaced with
+`{"version": 1, "online": false, "sources": []}`. After a crash the last
+retained payload may be stale, so pair it with the `health` query.
+
+```json
+{
+  "version": 1,
+  "online": true,
+  "sources": [
+    {"source": "rv_c_bus", "type": "rvc", "controllable": false, "configured_enabled": true,
+     "enabled": true, "state": "running", "since": "2026-10-17T17:00:00Z", "override": null},
+    {"source": "leveler", "type": "beechlane", "controllable": true, "configured_enabled": true,
+     "enabled": false, "state": "disabled", "since": "2026-10-17T18:00:01Z",
+     "override": {"enabled": false, "until": "2026-10-17T19:00:00Z", "reason": "parked",
+                  "client_id": "rv-dashboard", "changed_at": "2026-10-17T18:00:00Z"}}
+  ]
+}
+```
+
+| `state` | Meaning |
+| --- | --- |
+| `running` | Thread alive |
+| `restarting` | Thread exited unexpectedly; the supervisor restarts it |
+| `stopping` | Disabled, thread still shutting down |
+| `starting` | Enabled; waiting for a previous thread to exit or retrying construction |
+| `disabled` | Not running by configuration or override |
+
+`running` means the collection thread is alive, not that the device is
+reachable; use the source's own telemetry/status topics for device health.
+A dashboard toggle should show `enabled` as the switch position, `state` as
+progress, and offer "restore configured" when `override` is non-null.
+`capabilities` adds a `sources` object listing each granted section with
+`enable`/`disable` entries, their `confirm` flag, and `available`.
+`health` source entries include their `source` section name.
 
 ## Admission, concurrency, expiry, and duplicates
 

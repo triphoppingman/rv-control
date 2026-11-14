@@ -133,7 +133,7 @@ def test_reload_flag_default_disabled(tmp_path: Path, monkeypatch: Any) -> None:
     path = tmp_path / "config.ini"
     path.write_text(CONFIG)
     sessions: list[Any] = []
-    monkeypatch.setattr(module, "_run_session", lambda config, watcher: sessions.append(watcher))
+    monkeypatch.setattr(module, "_run_session", lambda config, watcher, _overrides=None: sessions.append(watcher))
     result = CliRunner().invoke(cli, ["--config", str(path), "run"])
     assert result.exit_code == 0, result.output
     assert sessions == [None]

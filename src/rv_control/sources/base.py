@@ -6,6 +6,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from configparser import ConfigParser
+from collections.abc import Collection
 from typing import Any, Callable, TypeVar
 
 
@@ -117,13 +118,24 @@ class Source(threading.Thread, ABC):
         return results
 
     @classmethod
-    def start_enabled(cls, config: ConfigParser, publisher: Any, stop_event: threading.Event) -> tuple[list[Source], dict[str, Source]]:
-        """Start enabled sources and return them indexed by config section."""
+    def start_enabled(
+        cls, config: ConfigParser, publisher: Any, stop_event: threading.Event,
+        *, isolated: Collection[str] = (), skip: Collection[str] = (),
+    ) -> tuple[list[Source], dict[str, Source]]:
+        """Start enabled sources and return them indexed by config section.
+
+        Sections in ``isolated`` receive a private stop event so they can be
+        stopped individually; sections in ``skip`` are left stopped.
+        """
         sources = []
         source_map = {}
         try:
             for name, source_type in cls.enabled_sources(config):
-                source = source_type(config, publisher, stop_event, name)
+                if name in skip:
+                    LOGGER.info("Source instance %s is disabled by source control", name)
+                    continue
+                event = threading.Event() if name in isolated else stop_event
+                source = source_type(config, publisher, event, name)
                 sources.append(source)
                 source_map[name] = source
                 LOGGER.info("Starting source instance %s (%s)", name, source_type.source_name)
@@ -139,6 +151,10 @@ class Source(threading.Thread, ABC):
     ) -> None:
         """Signal sources, warn after a grace period, and wait before publisher teardown."""
         stop_event.set()
+        for source in sources:
+            own_event = getattr(source, "stop_event", None)
+            if isinstance(own_event, threading.Event):
+                own_event.set()
         started = [source for source in sources if source.ident is not None]
         deadline = time.monotonic() + grace_period
         for source in started:
@@ -168,9 +184,13 @@ class Source(threading.Thread, ABC):
             for index, source in enumerate(tuple(sources)):
                 if source.is_alive() or stop_event.is_set():
                     continue
+                own_event = getattr(source, "stop_event", None)
+                event = own_event if isinstance(own_event, threading.Event) else stop_event
+                if event.is_set():
+                    continue
                 source_type = type(source)
                 LOGGER.error("Source %s stopped; restarting it", source.section_name)
-                replacement = source_type(config, publisher, stop_event, source.section_name)
+                replacement = source_type(config, publisher, event, source.section_name)
                 replacement.start()
                 sources[index] = replacement
                 source_map[replacement.section_name] = replacement

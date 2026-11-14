@@ -167,6 +167,15 @@ class MqttTarget(Target, target_name="mqtt"):
             if not result.is_published():
                 raise TimeoutError("MQTT result acknowledgment timed out")
 
+    def publish_retained(self, topic: str, payload: dict[str, Any]) -> None:
+        """Publish retained QoS-1 service status regardless of telemetry retain settings."""
+        if not self.connected.is_set():
+            raise ConnectionError("MQTT broker is disconnected")
+        full_topic = self._topic(topic)
+        result = self.client.publish(full_topic, json.dumps(payload, allow_nan=False), qos=1, retain=True)
+        if result.rc != self._mqtt.MQTT_ERR_SUCCESS:
+            raise ConnectionError(f"MQTT status publication failed: rc={result.rc}")
+
     def close(self) -> None:
         """Stop the MQTT loop and disconnect the broker client."""
         self.client.loop_stop()

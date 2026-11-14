@@ -24,6 +24,7 @@ Telemetry is published as JSON to a local MQTT broker such as Mosquitto.
 - `src/rv_control/sources/renogybt/`: Project-owned Renogy client implementation.
 - `src/rv_control/sources/beechlanebt/`: Project-owned BeechLane UUIDs, codecs, and leveling math (pure, no I/O).
 - `src/rv_control/data/rvc-spec.yml`: Project-owned RV-C DGN specification.
+- `src/rv_control/source_control.py`: Coach-API source enable/disable overrides, `[coach_commands] source_control` allowlist, supervision-thread application, and retained `coach/sources` status.
 - `src/rv_control/targets/base.py`: `Target` ABC, target registry, and `MultiTarget` fan-out.
 - `src/rv_control/targets/mqtt.py`: MQTT publishing and optional command subscription.
 - `src/rv_control/targets/store.py`: Latest-value-per-topic local JSON file target.

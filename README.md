@@ -776,7 +776,9 @@ For the implemented, opt-in semantic coach command and monitoring API suitable
 for configurable dashboard controls, see
 [Coach MQTT command API](docs/COACH-MQTT-COMMANDS.md). It adds authorized,
 journaled actions and read-only queries alongside the legacy raw commands below;
-it is disabled by default.
+it is disabled by default. The same API can also enable and disable individual
+sources listed in `[coach_commands] source_control` and publishes retained
+source status on `<base_topic>/coach/sources` for dashboards.
 
 Bidirectional commands are opt-in. Set `mqtt.write_enabled = true` and the relevant source's `write_enabled = true`, then publish JSON to the source command topic.
 
