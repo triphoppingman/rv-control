@@ -53,16 +53,16 @@ via `asyncio.to_thread`, allowing sharing across source threads/event loops.
 
 | Operation | Current coordinated callers |
 | --- | --- |
-| `scan_slot()` | Renogy `BLEManager.discover`. |
-| `connect_slot()` | Renogy GATT connect and Hughes daemon client context entry. |
+| `scan_slot()` | Renogy `BLEManager.discover` and BeechLane `comms-check` discovery. |
+| `connect_slot()` | Renogy GATT connect, Hughes daemon client context entry, and BeechLane client context entry (daemon and `interrogate`). |
 | `connect_slot_sync()` | OBD RFCOMM connection setup; shares the connect lock. |
 
 Scans serialize with other coordinated scans; connects serialize with other
 coordinated connects. The two locks do **not** exclude scans from connects.
 Locks are released after setup, so active connections remain independent.
-Hughes connects by address without an explicit daemon scan. BLE communication
-checks, Hughes interrogation, and the standalone discovery tool do not use
-these coordination slots. This is process-local coordination, not a lock against
+Hughes connects by address without an explicit daemon scan. Renogy/Hughes
+communication checks, Hughes interrogation, and the standalone discovery tool
+do not use these coordination slots. This is process-local coordination, not a lock against
 phone apps, other processes, or all BlueZ activity.
 
 There is no connection-capacity setting, device-address reservation,
@@ -145,6 +145,41 @@ active session.
 Hughes nonpersistent mode does not implement Renogy's periodic
 connect/read/disconnect behavior: it runs a notification session until stopped
 or failed, then returns/raises instead of retrying internally.
+
+## BeechLane leveler lifecycle and payloads
+
+[BeechlaneSource](../src/rv_control/sources/beechlane.py) is read-only. Pure
+protocol code (UUIDs, decoding, vendor-app leveling math) lives in
+[beechlanebt/](../src/rv_control/sources/beechlanebt/), derived from
+pyrvleveler (MIT). Every connection, including `interrogate`, waits for a
+per-instance rate limit of 5 attempts per 30 seconds (the vendor app's limit),
+releases stale BlueZ links before and after, enters the client under
+`connect_slot()` with the configured adapter, and waits
+`connect_settle_delay` (default 1 s).
+
+Each session reads orientation, sensitivity, geometry, and calibration offset,
+then publishes `<topic>/status` (battery, temperature, name, orientation,
+vehicle type/dimensions, `configured`). If orientation or geometry is unset,
+no leveling math is attempted: the session ends and the daemon waits
+`status_interval` before reconnecting, leaving the device free for vendor-app
+setup.
+
+- **Persistent** (blank `persistent_connection` inheriting `daemon_mode = true`):
+  subscribes to `XYZ_OUT` indications and publishes `<topic>/state` when the
+  computed values change, at most every `publish_interval` seconds, with an
+  unchanged heartbeat every `status_interval`. Setup and status are re-read
+  every `status_interval`, so a recalibration takes effect without
+  reconnecting. `notification_timeout` (0 disables) raises a stall timeout.
+- **Nonpersistent**: every `poll_interval`, connect, read status, wait up to
+  `sample_timeout` for one indication, publish both topics, and disconnect.
+  Failures retry with backoff no shorter than `poll_interval`.
+
+Reconnect backoff follows Hughes (`reconnect_delay`, `max_reconnect_delay`,
+`max_retry` inheriting `[service]`; a session that delivered telemetry restarts
+at the base delay). The stall timeout assumes the device indicates continuously;
+confirm this on hardware and set `notification_timeout = 0` if it only
+indicates on change. Roll/pitch sign conventions follow the vendor app and are
+not yet verified on hardware.
 
 ## Configuration: actual defaults and differences
 

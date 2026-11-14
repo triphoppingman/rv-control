@@ -18,9 +18,11 @@ Telemetry is published as JSON to a local MQTT broker such as Mosquitto.
 - `src/rv_control/sources/rvc.py`: RV-C decoding, CAN reads, interrogation, and optional writes.
 - `src/rv_control/sources/renogy.py`: Renogy adapter, self-contained configuration mapping, register inventory, interrogation, and optional writes.
 - `src/rv_control/sources/hughes.py`: Hughes BLE protocols, attribute inventory, interrogation, and daemon reconnects.
+- `src/rv_control/sources/beechlane.py`: Read-only BeechLane leveler BLE source, connection rate limiting, streaming/polling sessions, and interrogation.
 - `src/rv_control/sources/wled.py`: WLED local JSON API source, polling, interrogation, and guarded state writes.
 - `src/rv_control/sources/obd.py`: Read-only ELM327 Bluetooth RFCOMM OBD-II PID source, INI-defined PIDs, safe decode expressions, and engine on/off reconnects.
 - `src/rv_control/sources/renogybt/`: Project-owned Renogy client implementation.
+- `src/rv_control/sources/beechlanebt/`: Project-owned BeechLane UUIDs, codecs, and leveling math (pure, no I/O).
 - `src/rv_control/data/rvc-spec.yml`: Project-owned RV-C DGN specification.
 - `src/rv_control/targets/base.py`: `Target` ABC, target registry, and `MultiTarget` fan-out.
 - `src/rv_control/targets/mqtt.py`: MQTT publishing and optional command subscription.
@@ -88,5 +90,6 @@ The project incorporates or follows work from these upstream repositories:
 - https://github.com/linuxkidd/rvc-monitor-py, Apache License 2.0.
 - https://github.com/cyrils/renogy-bt, GNU GPL v3.0.
 - https://github.com/IAmTheMitchell/Hughes-Power-Watchdog, MIT License.
+- pyrvleveler (BeechLane leveler interface), MIT License.
 
 Preserve the applicable license notices in the project-owned copied or derived components.

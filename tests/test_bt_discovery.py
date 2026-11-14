@@ -121,6 +121,13 @@ def test_default_scan_preserves_filter_and_options(tool: Any) -> None:
     assert tool.calls == [("scan", {"timeout": 15, "adapter": "hci2", "return_adv": True})]
 
 
+def test_device_kind_detects_beechlane_by_service(tool: Any) -> None:
+    """A BeechLane leveler is identified by its advertised service UUID, not its name."""
+    assert tool.device_kind("Anything", ["FB860F65-5683-B6B1-E740-FAA035D58C29"]) == "BeechLane Leveler"
+    assert tool.device_kind("Beech-test", ["service"]) is None
+    assert tool.device_kind("PMD-test") == "Hughes Power Watchdog"
+
+
 def test_scan_all_json_and_details(tool: Any, tmp_path: Path) -> None:
     """Unknown/unnamed devices and advertisement bytes are retained in machine-readable exports."""
     path = tmp_path / "scan.json"
@@ -373,7 +380,7 @@ def test_empty_scan_and_scan_errors(tool: Any, monkeypatch: pytest.MonkeyPatch, 
     monkeypatch.setattr(tool.BleakScanner, "discover", scan)
     result = CliRunner().invoke(tool.main)
     assert result.exit_code == (0 if empty else 1)
-    assert ("No likely Renogy or Hughes" if empty else "adapter unavailable") in result.output
+    assert ("No likely Renogy, Hughes, or BeechLane" if empty else "adapter unavailable") in result.output
 
 
 @pytest.mark.parametrize("args", [

@@ -21,10 +21,13 @@ from bleak.exc import BleakError
 
 RENOGY_PREFIXES = ("BT-TH", "RNGRBP", "BTRIC", "RTMShunt", "RNGRIU")
 HUGHES_PREFIXES = ("PMD", "PWS", "PMS", "WD_V5", "WD_E5")
+BEECHLANE_SERVICE = "fb860f65-5683-b6b1-e740-faa035d58c29"
 
 
-def device_kind(name: str | None) -> str | None:
-    """Return the likely device family for a BLE advertised name."""
+def device_kind(name: str | None, service_uuids: list[str] | None = None) -> str | None:
+    """Return the likely device family for a BLE advertised name or service UUIDs."""
+    if BEECHLANE_SERVICE in [str(uuid).lower() for uuid in service_uuids or []]:
+        return "BeechLane Leveler"
     advertised_name = (name or "").strip()
     if advertised_name.startswith(RENOGY_PREFIXES):
         return "Renogy"
@@ -57,7 +60,7 @@ async def scan_records(adapter: str, timeout: float, include_all: bool) -> list[
     records = []
     for device, advertisement in discovered.values():
         name = advertisement.local_name or device.name
-        kind = device_kind(name)
+        kind = device_kind(name, advertisement.service_uuids)
         if not include_all and not kind:
             continue
         records.append({
@@ -233,7 +236,7 @@ def main(
     context: click.Context, adapter: str, timeout: float, include_all: bool,
     details: bool, json_output: bool, output: Path | None,
 ) -> None:
-    """Scan BLE (Renogy/Hughes by default), or explicitly inspect a selected device.
+    """Scan BLE (Renogy/Hughes/BeechLane by default), or explicitly inspect a selected device.
 
     Put shared --adapter and --timeout options before the subcommand.
     """
@@ -247,7 +250,7 @@ def main(
         emit_json(records, output)
         return
     if not records:
-        label = "BLE" if include_all else "likely Renogy or Hughes"
+        label = "BLE" if include_all else "likely Renogy, Hughes, or BeechLane"
         click.echo(f"No {label} devices found on {adapter}.")
         return
     click.echo(f"Found {len(records)} {'BLE' if include_all else 'likely'} device(s) on {adapter}:")

@@ -1,12 +1,13 @@
 # rv-control
 
-`rv-control` collects telemetry from an RV-C CAN bus, Renogy BLE devices, Hughes Power Watchdog devices, WLED controllers, gpsd, and ELM327 Bluetooth OBD-II adapters, publishing each reading as JSON to Mosquitto.
+`rv-control` collects telemetry from an RV-C CAN bus, Renogy BLE devices, Hughes Power Watchdog devices, BeechLane wireless RV levelers, WLED controllers, gpsd, and ELM327 Bluetooth OBD-II adapters, publishing each reading as JSON to Mosquitto.
 
 The runtime is self-contained and does not import code or configuration from external checkout directories:
 
 - `src/rv_control/data/rvc-spec.yml` is the project-owned RV-C DGN specification.
 - `src/rv_control/sources/renogybt` contains the project-owned Renogy client implementation.
 - `src/rv_control/sources/hughes.py` contains the standalone Hughes BLE implementation.
+- `src/rv_control/sources/beechlane.py` contains the read-only BeechLane leveler BLE source; `src/rv_control/sources/beechlanebt` contains its project-owned protocol and leveling math.
 - `src/rv_control/sources/wled.py` contains the WLED local JSON API source.
 - `src/rv_control/sources/gpsd.py` contains the gpsd JSON TCP source.
 - `src/rv_control/sources/open_meteo.py` contains the opt-in Open-Meteo weather source.
@@ -23,7 +24,7 @@ The runtime is self-contained and does not import code or configuration from ext
   coach definitions, including lessons from the Thor mapping.
 - [Coach MQTT command API](docs/COACH-MQTT-COMMANDS.md): the implemented, opt-in
   command/query protocol, controller policy, and result guarantees.
-- [BLE connection reliability](docs/BLE-DESIGN.md): current Renogy and Hughes
+- [BLE connection reliability](docs/BLE-DESIGN.md): current Renogy, Hughes, and BeechLane
   lifecycle, configuration differences, cleanup, and known limitations.
 - [Concurrency and threading model](docs/CONCURRENCY.md): source polling,
   publication dispatch, backpressure, target workers, and shutdown.
@@ -337,7 +338,7 @@ Interrogate every enabled source to perform live reads and print all returned at
 rv-control --config config.ini interrogate
 ```
 
-Renogy interrogation connects once, reads every register block defined by the configured Renogy client type, and prints the decoded state. Hughes connects once, waits for a complete notification packet, and prints its decoded power attributes. RV-C listens for `interrogate_seconds` (10 by default), decodes received DGN frames, and prints the latest state for each DGN/source combination. The command exits with status `1` if an enabled source cannot be interrogated.
+Renogy interrogation connects once, reads every register block defined by the configured Renogy client type, and prints the decoded state. Hughes connects once, waits for a complete notification packet, and prints its decoded power attributes. BeechLane connects once, reads device status and setup, waits for one tilt sample, and prints `status` and `state` (`state` is null when the device has not been set up). RV-C listens for `interrogate_seconds` (10 by default), decodes received DGN frames, and prints the latest state for each DGN/source combination. The command exits with status `1` if an enabled source cannot be interrogated.
 
 List the coach entities and command groups:
 
@@ -386,7 +387,7 @@ Stop a foreground process with `Ctrl+C`. The process stops source threads, disco
 
 ## Bluetooth discovery
 
-Use the lightweight discovery tool to find nearby devices that advertise names associated with Renogy or Hughes Power Watchdog hardware:
+Use the lightweight discovery tool to find nearby devices that advertise names associated with Renogy or Hughes Power Watchdog hardware, or the BeechLane leveler service UUID:
 
 ```sh
 .venv/bin/python tools/bt_discovery.py
@@ -530,6 +531,25 @@ write_enabled = false
 ```
 
 Set `circuit_amps = 50` for a split-phase Power Watchdog. The source then waits for both legacy line notifications and publishes them together using `voltage_line_1`, `current_line_1`, `power_line_1`, `energy_line_1`, and their `_line_2` counterparts. Leave this at `30` for a single-leg unit, which publishes each measurement immediately.
+
+The BeechLane wireless RV leveler source is read-only:
+
+```ini
+[leveler]
+type = beechlane
+adapter = hci0
+address = AA:BB:CC:DD:EE:FF
+topic = leveler
+display_unit =
+publish_interval = 1
+status_interval = 300
+notification_timeout = 60
+persistent_connection =
+poll_interval = 60
+sample_timeout = 15
+```
+
+It publishes two topics. `leveler/state` contains `roll` and `pitch` (height difference across the width and along the length, in `unit`), `roll_degrees`, `pitch_degrees`, `front_left_raise`, `front_right_raise`, `rear_left_raise`, `rear_right_raise` (how far to raise each corner to match the highest one), `level`, and `unit` (`in` or `cm`). Values use the vendor app's rounding: 0.25 in or 0.5 cm. `leveler/status` contains `battery` (%), `temperature_c`, `temperature_f`, `name`, `orientation`, `sensitivity_divisor`, `vehicle_type`, `length`, `width`, `geometry_unit`, and `configured`. Blank `display_unit` uses the unit stored on the device. A persistent connection publishes state when it changes, at most every `publish_interval` seconds, and re-reads status, calibration, and geometry every `status_interval`. With `persistent_connection = false` it connects, samples, and disconnects every `poll_interval`, which saves the leveler's battery and leaves it available to the phone app between polls. Complete orientation, calibration, and geometry setup in the BeechLane app first; until then only `status` is published, with `configured: false`.
 
 gpsd connects to its JSON TCP stream, enables JSON reports with the gpsd `WATCH` request, and publishes each received JSON object unchanged:
 
@@ -744,7 +764,7 @@ max_reconnect_delay = 300
 
 `max_retry = 0` means unlimited retries. `reconnect_delay`, `max_reconnect_delay`, and `max_retry` may be overridden in an individual Renogy, Hughes, or OBD section; blank source values inherit `[service]`. `max_reconnect_delay` caps exponential backoff. Renogy supports `discovery_timeout`, `read_timeout`, `request_interval`, `write_settle_delay`, and `reconnect_jitter` per source. `request_interval` spaces register reads, `write_settle_delay` gives the device time to receive a request, and `reconnect_jitter` prevents simultaneous adapter retries. Hughes uses `notification_timeout` to reconnect a session that remains connected but stops delivering telemetry, and `connect_settle_delay` (default 2 seconds) to pause after connecting before subscribing. Hughes connection setup shares the per-adapter lock with Renogy, and a session that delivered telemetry before stalling restarts backoff from `reconnect_delay`. Source supervision restarts a collector thread that exits unexpectedly.
 
-The MQTT `write_enabled` option is a global safety switch. RV-C, Renogy, and WLED also require their own source-level `write_enabled = true` before accepting commands. Hughes and OBD are telemetry-only.
+The MQTT `write_enabled` option is a global safety switch. RV-C, Renogy, and WLED also require their own source-level `write_enabled = true` before accepting commands. Hughes, BeechLane, and OBD are telemetry-only.
 
 Bluetooth access usually requires membership in the `bluetooth` group or appropriate Linux capabilities. RV-C requires a configured SocketCAN `can0` interface and the MCP2515 kernel overlay.
 
@@ -1030,6 +1050,7 @@ This project explicitly acknowledges and incorporates work from the following op
 
 - [linuxkidd/rvc-monitor-py](https://github.com/linuxkidd/rvc-monitor-py): RV-C protocol implementation and DGN specification. The project-owned specification copy is `src/rv_control/data/rvc-spec.yml`. The upstream project is licensed under the [Apache License 2.0](https://github.com/linuxkidd/rvc-monitor-py/blob/master/LICENSE).
 - [cyrils/renogy-bt](https://github.com/cyrils/renogy-bt): Renogy BLE clients, register definitions, and parsers. The project-owned client copy is `src/rv_control/sources/renogybt/`, with its license notice at `src/rv_control/sources/renogybt/LICENSE`. The upstream project is licensed under the [GNU General Public License v3.0](https://github.com/cyrils/renogy-bt/blob/main/LICENSE).
+- pyrvleveler: BeechLane wireless RV leveler BLE interface specification, byte codecs, and leveling math. The project-owned copy is `src/rv_control/sources/beechlanebt/`, with its license notice at `src/rv_control/sources/beechlanebt/LICENSE`. The upstream project is licensed under the MIT License.
 - [IAmTheMitchell/Hughes-Power-Watchdog](https://github.com/IAmTheMitchell/Hughes-Power-Watchdog): Hughes Power Watchdog BLE protocol reference and device-generation behavior. The standalone implementation in `src/rv_control/sources/hughes.py` follows that protocol documentation. The upstream project is licensed under the [MIT License](https://github.com/IAmTheMitchell/Hughes-Power-Watchdog/blob/main/LICENSE).
 
 The copied and derived components under `src/rv_control` retain the applicable upstream license notices. When redistributing this project, preserve those notices and continue to provide the upstream license terms for the corresponding components.

@@ -16,10 +16,11 @@ def stub_bluez_link_release(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, 
 
     import importlib
 
-    from rv_control.sources import hughes
+    from rv_control.sources import beechlane, hughes
 
     ble_manager_module = importlib.import_module("rv_control.sources.renogybt.BLEManager")
     monkeypatch.setattr(hughes, "release_stale_connection", release)
+    monkeypatch.setattr(beechlane, "release_stale_connection", release)
     monkeypatch.setattr(ble_manager_module, "release_stale_connection", release)
     return calls
 
